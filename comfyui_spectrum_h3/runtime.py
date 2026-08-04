@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +28,10 @@ class RuntimeStats:
     actual_transformer_calls: int = 0
     forecast_model_calls: int = 0
     forecast_fallbacks: int = 0
+    history_archive_seconds: float = 0.0
+    history_update_seconds: float = 0.0
+    forecast_prediction_seconds: float = 0.0
+    direct_history_updates: int = 0
     current_window: float = 0.0
     disabled: bool = False
     disable_reason: str | None = None
@@ -333,7 +338,11 @@ class SpectrumH3Runtime:
             raise RuntimeError(
                 f"actual H3 feature shape {tuple(feature.shape)} does not match {call.expected_shape}"
             )
-        archived = feature.detach().to(device="cpu", dtype=feature.dtype, copy=True).contiguous()
+        started = time.perf_counter()
+        try:
+            archived = feature.detach().to(device="cpu", dtype=feature.dtype, copy=True).contiguous()
+        finally:
+            self.stats.history_archive_seconds += time.perf_counter() - started
         call.observed_actual = True
         step.actual_records.append(_ActualRecord(archived, call.labels))
 
@@ -372,13 +381,17 @@ class SpectrumH3Runtime:
         if history_shape is None or tuple(call.expected_shape[1:]) != tuple(history_shape[1:]):
             self._fallback_or_retry(step, "target audio/video row count or hidden width changed")
             return None
-        predicted = self.forecaster.predict(
-            step.coordinate,
-            self.config.blend_weight,
-            rows=positions,
-            device=device,
-            dtype=dtype,
-        )
+        started = time.perf_counter()
+        try:
+            predicted = self.forecaster.predict(
+                step.coordinate,
+                self.config.blend_weight,
+                rows=positions,
+                device=device,
+                dtype=dtype,
+            )
+        finally:
+            self.stats.forecast_prediction_seconds += time.perf_counter() - started
         if tuple(predicted.shape) != call.expected_shape:
             self._fallback_or_retry(step, "predicted target feature shape is invalid")
             return None
@@ -432,8 +445,12 @@ class SpectrumH3Runtime:
             if set(labels) != set(canonical_labels) or len(labels) != len(canonical_labels):
                 self._disable_forecasting("conditional branch set changed across actual solver steps")
                 return None
-        row_map = {label: feature for label, feature in rows}
-        combined = torch.stack([row_map[label] for label in canonical_labels], dim=0).contiguous()
+        if len(step.actual_records) == 1 and step.actual_records[0].labels == canonical_labels:
+            combined = step.actual_records[0].feature
+            self.stats.direct_history_updates += 1
+        else:
+            row_map = {label: feature for label, feature in rows}
+            combined = torch.stack([row_map[label] for label in canonical_labels], dim=0).contiguous()
 
         if self._history_topology is None:
             self._history_topology = topology
@@ -468,12 +485,16 @@ class SpectrumH3Runtime:
         else:
             if any(call.used_forecast for call in step.calls):
                 raise RuntimeError("actual solver step retained a forecasted subcall")
-            combined = self._aggregate_actual(step)
-            if combined is not None and not self._disabled:
-                try:
-                    self.forecaster.update(step.coordinate, combined, take_ownership=True)
-                except ValueError as exc:
-                    self._disable_forecasting(f"actual H3 feature is incompatible with history: {exc}")
+            started = time.perf_counter()
+            try:
+                combined = self._aggregate_actual(step)
+                if combined is not None and not self._disabled:
+                    try:
+                        self.forecaster.update(step.coordinate, combined, take_ownership=True)
+                    except ValueError as exc:
+                        self._disable_forecasting(f"actual H3 feature is incompatible with history: {exc}")
+            finally:
+                self.stats.history_update_seconds += time.perf_counter() - started
             self._consecutive_forecasts = 0
             self._required_actual_refreshes = max(0, self._required_actual_refreshes - 1)
             self.stats.actual_steps += 1
@@ -507,5 +528,10 @@ class SpectrumH3Runtime:
             f"actual_transformer_calls={self.stats.actual_transformer_calls} "
             f"forecast_calls={self.stats.forecast_model_calls} "
             f"fallbacks={self.stats.forecast_fallbacks} disabled={self.stats.disabled} "
+            f"history_archive_s={self.stats.history_archive_seconds:.3f} "
+            f"history_update_s={self.stats.history_update_seconds:.3f} "
+            f"forecast_predict_s={self.stats.forecast_prediction_seconds:.3f} "
+            f"direct_history_updates={self.stats.direct_history_updates} "
+            f"history_mib={self.forecaster.history_tensor_bytes / (1024 * 1024):.1f} "
             f"reason={self.stats.disable_reason!r}"
         )

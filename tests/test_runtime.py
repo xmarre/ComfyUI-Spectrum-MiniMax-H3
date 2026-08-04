@@ -102,6 +102,49 @@ def test_split_branches_are_canonicalized_and_reordered_transactionally():
     assert predictions[negative].mean() < 0
 
 
+def test_single_call_actual_history_takes_ownership_without_restaking_rows():
+    runtime = _runtime(force_actual=True)
+    runtime.start_run(torch.linspace(1.0, 0.0, 3), "sample_euler", supported_sampler=True)
+    decision = runtime.begin_step(torch.tensor([1.0]))
+    feature = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=tuple(feature.shape),
+    )
+    assert actual
+    runtime.observe_actual(decision["run_id"], decision["step_id"], call_id, feature)
+    archived_ptr = runtime._step.actual_records[0].feature.data_ptr()
+
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert runtime.stats.direct_history_updates == 1
+    assert runtime.forecaster._history[-1].feature_flat.data_ptr() == archived_ptr
+    torch.testing.assert_close(runtime.forecaster._history[-1].feature_flat.reshape_as(feature), feature)
+
+
+def test_split_call_actual_history_still_canonicalizes_rows():
+    runtime = _runtime(force_actual=True)
+    runtime.start_run(torch.linspace(1.0, 0.0, 3), "sample_euler", supported_sampler=True)
+    negative = ((1, "negative"),)
+    positive = ((0, "positive"),)
+    _actual_step(
+        runtime,
+        1.0,
+        [
+            (negative, torch.full((1, 3, 4), -1.0)),
+            (positive, torch.ones(1, 3, 4)),
+        ],
+    )
+
+    assert runtime.stats.direct_history_updates == 0
+    history = runtime.forecaster._history[-1].feature_flat.reshape(2, 3, 4)
+    assert history[0].mean() > 0
+    assert history[1].mean() < 0
+
+
 def test_incomplete_forecast_requires_whole_step_actual_retry():
     runtime = _runtime()
     runtime.start_run(torch.linspace(1.0, 0.0, 5), "sample_euler", supported_sampler=True)

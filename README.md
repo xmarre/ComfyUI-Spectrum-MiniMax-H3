@@ -139,7 +139,7 @@ branch_count * max_history * (target_audio_rows + target_video_rows)
 
 At the native 1344x768, 124-frame example, the reviewed layout has about 37,710 target rows. With hidden width 5,376 and BF16/FP16 history, one snapshot is roughly 387 MiB per branch. Eight conditional/unconditional snapshots can therefore approach 6.1 GiB of CPU RAM. Reference tokens do not enter the cached target, while longer duration and larger target geometry increase the cost. Lower `max_history` is valid only while it remains at least `degree + 1`.
 
-Forecast VRAM includes one model-dtype target feature for the current model call plus a bounded FP32 accumulation chunk. Cached history does not remain on the GPU. Actual-step device-to-CPU history transfers can reduce the theoretical speedup.
+Forecast VRAM includes one model-dtype target feature for the current model call plus a bounded FP32 accumulation chunk. Cached history does not remain on the GPU. Actual-step device-to-CPU history transfers can reduce the theoretical speedup. The native single-call path archives the already-contiguous audio/video target view directly and transfers ownership of that snapshot into history without assembling a second full CPU tensor. Debug run summaries report archive, history-update, and forecast-prediction wall time separately; CUDA synchronization can be charged to the archive counter, so these counters diagnose the runtime path rather than serving as isolated kernel benchmarks.
 
 ## Fallback and transaction behavior
 

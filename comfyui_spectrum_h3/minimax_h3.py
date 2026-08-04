@@ -290,11 +290,14 @@ def _execute_actual(
         output = existing(args, replacement_context) if existing is not None else replacement_context["original_block"](args)
         if not isinstance(output, dict) or "img" not in output or not torch.is_tensor(output["img"]):
             raise RuntimeError("final MiniMax H3 block replacement did not return {'img': tensor}")
-        (aa, ab), (va, vb) = target_segments(layout)
+        (aa, _), (_, vb) = target_segments(layout)
         hidden = output["img"]
         if hidden.ndim != 2 or hidden.shape[0] < vb:
             raise RuntimeError("final MiniMax H3 hidden feature is incompatible with the packed layout")
-        target = torch.cat((hidden[aa:ab], hidden[va:vb]), dim=0).unsqueeze(0)
+        # Native H3 guarantees contiguous [audio | video] target rows at the
+        # packed tail. Keep a view here; materializing torch.cat would create a
+        # second full target tensor on the GPU before the required CPU archive.
+        target = hidden[aa:vb].unsqueeze(0)
         runtime.observe_actual(run_id, step_id, call_id, target)
         observed = True
         return output

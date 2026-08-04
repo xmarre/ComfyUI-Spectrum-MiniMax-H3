@@ -52,3 +52,5 @@ The forecaster stores at most `max_history` detached model-dtype snapshots on CP
 `w(t*) = phi(t*) (Phi^T Phi + lambda I)^-1 Phi^T`
 
 Spectral and two-point linear weights are combined before feature streaming. Prediction reads one bounded chunk from one history snapshot at a time, accumulates that chunk in FP32 on the output device, and writes the final model-dtype feature. No persistent full-feature FP32 right-hand side or coefficient tensor is created.
+
+Native H3 lays out target rows as one contiguous `[audio | video]` packed tail. Actual capture archives a view of that tail instead of materializing a same-size GPU concatenation. When one model call contains the complete canonical branch set, the archived tensor is transferred directly into forecaster history; split conditional calls retain the transactional canonicalization path and assemble rows only after all calls complete. Debug summaries expose wall-clock archive, history-update, and forecast-prediction counters. Because the device-to-host archive synchronizes outstanding CUDA work, archive time can include the wait for preceding transformer kernels.

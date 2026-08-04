@@ -17,6 +17,7 @@ Stabilizes deterministic Euler and RES multistep audio-video forecasting and add
 - Keeps runtime and history state isolated per model clone and rolls incomplete split-branch transactions back to a complete native step.
 - Supports deterministic Euler and RES multistep sampling with sampler-specific post-forecast refresh and tail policies, plus explicit native fallback for stochastic samplers, unsupported samplers, incompatible topology, invalid forecasts, and multi-GPU parallel sampling.
 - Bounds retained history on CPU and streams forecast accumulation in chunks to avoid persistent full-feature FP32 coefficient or right-hand-side tensors.
+- Avoids redundant full-target GPU concatenation and CPU restacking on native single-call actual steps, and reports history/forecast timing counters in debug summaries.
 - Leaves the separate FLUX-focused ComfyUI-Spectrum-Proper repository unchanged.
 
 ## Validation

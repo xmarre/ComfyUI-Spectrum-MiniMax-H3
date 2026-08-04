@@ -116,6 +116,32 @@ def test_forced_actual_wrapper_is_native_equivalent_and_does_not_mutate_options(
     runtime.end_run(run_id)
 
 
+def test_actual_capture_avoids_full_audio_video_concatenation(monkeypatch):
+    _, _, PackedLayout = _native_imports()
+    model, _ = _tiny_model()
+    x, context, payload = _inputs(PackedLayout)
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(degree=1, max_history=4, force_actual=True, warmup_steps=0, tail_actual_steps=0)
+    )
+    run_id = runtime.start_run(torch.tensor([1.0, 0.5, 0.0]), "sample_euler", supported_sampler=True)
+    original_cat = torch.cat
+
+    def guarded_cat(tensors, *args, **kwargs):
+        values = tuple(tensors)
+        if len(values) == 2 and all(
+            value.ndim == 2 and value.shape[-1] == model.hidden_size for value in values
+        ):
+            pytest.fail("actual target capture materialized a full audio/video concatenation")
+        return original_cat(values, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", guarded_cat)
+    wrapped, _ = _wrapped_call(model, runtime, 1.0, 500.0, x, context, payload)
+
+    assert isinstance(wrapped, list) and len(wrapped) == 2
+    assert runtime.stats.direct_history_updates == 1
+    runtime.end_run(run_id)
+
+
 def test_forecast_step_skips_every_transformer_block_and_preserves_output_shapes():
     _, _, PackedLayout = _native_imports()
     model, block = _tiny_model()
