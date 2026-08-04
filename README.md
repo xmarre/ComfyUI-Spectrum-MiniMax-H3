@@ -57,8 +57,9 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | `flex_window` | `0.75` | Amount added to the interval after a scheduled post-warmup actual step. |
 | `warmup_steps` | `5` | Initial solver steps forced to native transformer evaluation. |
 | `tail_actual_steps` | `1` | Requested final native tail. Deterministic RES enforces a sampler-safe minimum of `3`. |
-| `max_history` | `8` | Maximum model-dtype actual feature snapshots retained on CPU. |
+| `max_history` | `8` | Maximum model-dtype actual feature snapshots retained. |
 | `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
+| `history_storage` | `system_ram` | Stores history in `system_ram`, or in `vram` to avoid transfer overhead when sufficient accelerator memory is free. |
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
@@ -73,6 +74,7 @@ flex_window = 0.75
 warmup_steps = 5
 tail_actual_steps = 1
 max_history = 8
+history_storage = system_ram
 ```
 
 ### Provisional aggressive preset
@@ -86,6 +88,7 @@ flex_window = 3.0
 warmup_steps = 5
 tail_actual_steps = 1
 max_history = 8
+history_storage = system_ram
 ```
 
 Both presets remain provisional pending broader prompt, sampler, and quality coverage.
@@ -128,18 +131,22 @@ w(t*) = phi(t*) (Phi^T Phi + lambda I)^-1 Phi^T
 H_hat(t*) = w(t*) H
 ```
 
-Spectral and linear history weights are combined before reading feature history. Persistent large tensors are limited to `max_history` detached model-dtype snapshots on CPU. Design, Gram, Cholesky, and history-weight tensors are small FP32 matrices. Prediction streams one bounded slice from one history snapshot at a time, accumulates that slice in FP32 on the prediction device, then writes model dtype. There is no persistent full-feature FP32 regression right-hand side or coefficient tensor.
+Spectral and linear history weights are combined before reading feature history. Persistent large tensors are limited to `max_history` detached model-dtype snapshots in the selected `history_storage`. Design, Gram, Cholesky, and history-weight tensors remain small FP32 CPU matrices. Prediction streams one bounded slice from one history snapshot at a time, accumulates that slice in FP32 on the prediction device, then writes model dtype. There is no persistent full-feature FP32 regression right-hand side or coefficient tensor.
 
-CPU history cost is approximately:
+History storage cost is approximately:
 
 ```text
 branch_count * max_history * (target_audio_rows + target_video_rows)
 * hidden_width * model_dtype_bytes
 ```
 
-At the native 1344x768, 124-frame example, the reviewed layout has about 37,710 target rows. With hidden width 5,376 and BF16/FP16 history, one snapshot is roughly 387 MiB per branch. Eight conditional/unconditional snapshots can therefore approach 6.1 GiB of CPU RAM. Reference tokens do not enter the cached target, while longer duration and larger target geometry increase the cost. Lower `max_history` is valid only while it remains at least `degree + 1`.
+At the native 1344x768, 124-frame example, the reviewed layout has about 37,710 target rows. With hidden width 5,376 and BF16/FP16 history, one snapshot is roughly 387 MiB per branch. Eight conditional/unconditional snapshots can therefore approach 6.1 GiB in the selected storage. Reference tokens do not enter the cached target, while longer duration and larger target geometry increase the cost. Lower `max_history` is valid only while it remains at least `degree + 1`.
 
-Forecast VRAM includes one model-dtype target feature for the current model call plus a bounded FP32 accumulation chunk. Cached history does not remain on the GPU. Actual-step device-to-CPU history transfers can reduce the theoretical speedup. The native single-call path archives the already-contiguous audio/video target view directly and transfers ownership of that snapshot into history without assembling a second full CPU tensor. Debug run summaries report archive, history-update, and forecast-prediction wall time separately; CUDA synchronization can be charged to the archive counter, so these counters diagnose the runtime path rather than serving as isolated kernel benchmarks.
+With `history_storage=system_ram`, forecast VRAM includes one model-dtype target feature for the current model call plus a bounded FP32 accumulation chunk. Actual steps copy each new snapshot to CPU, and forecasts stream the retained snapshots back to the prediction device. These transfers can reduce the theoretical speedup.
+
+With `history_storage=vram`, the same model-dtype history remains on the device that produced it. This avoids the device-to-host archive and repeated host-to-device forecast reads. The captured target is cloned into compact owned storage; retaining its native view would keep the complete final-block hidden tensor alive. The mode needs the full history allocation plus transient headroom for the current snapshot, prediction result, FP32 chunk, allocator fragmentation, and native H3 execution. At the native example above, use it only with materially more than 6.1 GiB of VRAM free at the native generation peak. An explicit VRAM selection can raise an out-of-memory error when that headroom is unavailable.
+
+Debug run summaries report the selected storage and resolved history device together with archive, history-update, and forecast-prediction wall time. CPU archiving can synchronize preceding CUDA work, while GPU cloning can be asynchronously enqueued, so the component counters diagnose the runtime path rather than serving as isolated kernel benchmarks. End-to-end wall time and peak allocated VRAM are the authoritative comparison.
 
 ## Fallback and transaction behavior
 

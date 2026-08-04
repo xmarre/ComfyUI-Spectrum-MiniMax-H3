@@ -1,42 +1,31 @@
-# Spectrum MiniMax H3 v0.1.3
+# Spectrum MiniMax H3 v0.1.4
 
-Stabilizes deterministic Euler and RES multistep audio-video forecasting and adds Comfy Registry publishing metadata.
+Adds optional device-resident history storage for systems with spare VRAM.
 
-## Changed
+## Added
 
-- Require one completed actual H3 evaluation after every RES multistep forecast so its retained `old_denoised` state is native before forecasting resumes.
-- Enforce a three-step actual tail for deterministic RES, including saved workflows that request a smaller tail.
-- Require one completed actual H3 evaluation after every Euler forecast to prevent late forecast streaks from accumulating temporal audio/video errors on short schedules.
-- Keep ancestral Euler and RES variants on the native path because their injected noise breaks the forecaster's smooth deterministic trajectory assumption.
-- Keep `tail_actual_steps=1` as the configurable Euler default while applying the sampler-specific RES floor internally.
-- Add the xmarre Comfy Registry publisher metadata and publishing workflow.
+- Add `history_storage=system_ram|vram` to the Spectrum node, defaulting to the existing system-RAM behavior.
+- Keep model-dtype history on the producing device in VRAM mode, avoiding actual-step device-to-host copies and repeated forecast-time host-to-device reads.
+- Clone the target view into compact owned device storage so cached history does not retain the complete final-block hidden tensor.
+- Report the configured storage and resolved history device in debug summaries.
 
 ## Highlights
 
-- Forecasts selected post-transformer H3 features while preserving the native current-step output heads, reconstruction, sigma mapping, and return structure.
-- Keeps runtime and history state isolated per model clone and rolls incomplete split-branch transactions back to a complete native step.
-- Supports deterministic Euler and RES multistep sampling with sampler-specific post-forecast refresh and tail policies, plus explicit native fallback for stochastic samplers, unsupported samplers, incompatible topology, invalid forecasts, and multi-GPU parallel sampling.
-- Bounds retained history on CPU and streams forecast accumulation in chunks to avoid persistent full-feature FP32 coefficient or right-hand-side tensors.
-- Avoids redundant full-target GPU concatenation and CPU restacking on native single-call actual steps, and reports history/forecast timing counters in debug summaries.
-- Leaves the separate FLUX-focused ComfyUI-Spectrum-Proper repository unchanged.
+- System-RAM mode remains the default and preserves existing saved-workflow behavior.
+- VRAM mode preserves the forecasting math, model dtype, FP32 accumulation order, scheduler, and fallback semantics.
+- History is still bounded by `max_history` and released at run teardown.
 
-## Measured 0.5 MP results
+## Memory guidance
 
-Supplied full-checkpoint, 20-step runs:
-
-| Sampler | Native | Spectrum | Schedule | Time saved | Wall-time reduction | Speedup |
-|---|---:|---:|---:|---:|---:|---:|
-| RES multistep | `2:42` | `1:54` | 14 actual / 6 forecast | `48 s` | `29.6%` | `1.42x` |
-| Euler | `2:38` | `1:59` | 13 actual / 7 forecast | `39 s` | `24.7%` | `1.33x` |
-
-The tested Euler artifacts appeared fixed. The remaining slight RES artifacts appeared gone after enforcing the three-step actual tail.
+- At the supplied 0.5 MP layout, one two-branch history point is about 568 MiB: roughly 2.78 GiB at `max_history=5` or 4.44 GiB at `max_history=8`.
+- At the native 1344x768, 124-frame example, eight two-branch snapshots approach 6.1 GiB.
+- VRAM mode also needs headroom for native model execution, the current snapshot, the prediction result, an FP32 accumulation chunk, and allocator fragmentation.
 
 ## Validation
 
-- The local suite passes against native ComfyUI commit `e377e263049f9338b4d12a3dd417b36ae62948ff`.
-- Automated tests cover forecasting mathematics, scheduling, rollback, clone isolation, the actual ComfyUI loader shape, native-path equivalence, and zero transformer-block execution on forecast steps.
-- Sampler contract tests verify one model call per deterministic solver step, RES's current/previous-denoised recurrence and update ordering, ancestral noise injection, rollback-safe refresh state, and sampler-specific forecast spacing and tails.
+- Automated tests cover setting validation, default compatibility, compact owned storage, storage-device tracking, and CPU/CUDA prediction equivalence.
+- Existing native-path equivalence, transaction, sampler-contract, scheduler, and bounded-memory tests remain in place.
 
 ## Current limits
 
-The automated environment cannot decode a full MiniMax H3 generation. Broader prompts, durations, resolutions, CFG settings, reference modes, memory peaks, and audiovisual synchronization remain real-generation validation items. Timings can vary with model warmup and GPU state.
+End-to-end speedup and real-checkpoint peak VRAM remain hardware-dependent validation items. Selecting VRAM storage with insufficient headroom can raise an out-of-memory error.

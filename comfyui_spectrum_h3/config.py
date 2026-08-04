@@ -15,6 +15,7 @@ class SpectrumH3Config:
     warmup_steps: int = 5
     tail_actual_steps: int = 1
     max_history: int = 8
+    history_storage: str = "system_ram"
     debug: bool = False
     force_actual: bool = False
 
@@ -59,6 +60,11 @@ class SpectrumH3Config:
             raise ValueError(
                 f"max_history must be an integer >= {self.min_fit_points} for degree {self.degree}"
             )
+        if not isinstance(self.history_storage, str) or self.history_storage not in {
+            "system_ram",
+            "vram",
+        }:
+            raise ValueError("history_storage must be 'system_ram' or 'vram'")
         return self
 
 

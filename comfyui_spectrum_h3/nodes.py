@@ -22,7 +22,10 @@ class SpectrumApplyMiniMaxH3:
                 "tail_actual_steps": ("INT", {"default": 1, "min": 0, "max": 64, "step": 1}),
                 "max_history": ("INT", {"default": 8, "min": 2, "max": 64, "step": 1}),
                 "debug": ("BOOLEAN", {"default": False}),
-            }
+            },
+            "optional": {
+                "history_storage": (["system_ram", "vram"], {"default": "system_ram"}),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -43,6 +46,7 @@ class SpectrumApplyMiniMaxH3:
         tail_actual_steps,
         max_history,
         debug,
+        history_storage="system_ram",
     ):
         if not enabled:
             return (model,)
@@ -57,6 +61,7 @@ class SpectrumApplyMiniMaxH3:
             warmup_steps=int(warmup_steps),
             tail_actual_steps=int(tail_actual_steps),
             max_history=int(max_history),
+            history_storage=str(history_storage),
             debug=bool(debug),
         ).validate()
         patched = model.clone()

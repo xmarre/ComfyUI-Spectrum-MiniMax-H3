@@ -47,10 +47,10 @@ Coordinates are derived from the actual supplied sigma sequence. Evaluated sigma
 
 ## Forecast memory model
 
-The forecaster stores at most `max_history` detached model-dtype snapshots on CPU. It solves only for history weights:
+The forecaster stores at most `max_history` detached model-dtype snapshots in the configured history storage: system RAM by default, or the producing model device when the opt-in VRAM mode is selected. It solves only for history weights:
 
 `w(t*) = phi(t*) (Phi^T Phi + lambda I)^-1 Phi^T`
 
 Spectral and two-point linear weights are combined before feature streaming. Prediction reads one bounded chunk from one history snapshot at a time, accumulates that chunk in FP32 on the output device, and writes the final model-dtype feature. No persistent full-feature FP32 right-hand side or coefficient tensor is created.
 
-Native H3 lays out target rows as one contiguous `[audio | video]` packed tail. Actual capture archives a view of that tail instead of materializing a same-size GPU concatenation. When one model call contains the complete canonical branch set, the archived tensor is transferred directly into forecaster history; split conditional calls retain the transactional canonicalization path and assemble rows only after all calls complete. Debug summaries expose wall-clock archive, history-update, and forecast-prediction counters. Because the device-to-host archive synchronizes outstanding CUDA work, archive time can include the wait for preceding transformer kernels.
+Native H3 lays out target rows as one contiguous `[audio | video]` packed tail. Actual capture archives that tail without materializing an audio/video concatenation. System-RAM mode copies the view directly to CPU. VRAM mode must clone it into compact owned device storage, because retaining the view would pin the complete final-block hidden tensor. When one model call contains the complete canonical branch set, the archived tensor transfers directly into forecaster history; split conditional calls retain the transactional canonicalization path and assemble rows only after all calls complete. Debug summaries expose the storage location and wall-clock archive, history-update, and forecast-prediction counters. Device-to-host archiving can synchronize outstanding CUDA work, while device cloning can be asynchronously enqueued.

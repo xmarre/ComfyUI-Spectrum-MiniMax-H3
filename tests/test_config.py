@@ -17,3 +17,8 @@ from comfyui_spectrum_h3.config import SpectrumH3Config
 def test_count_fields_reject_fractional_values(field, value):
     with pytest.raises(ValueError, match="integer"):
         SpectrumH3Config(**{field: value}).validate()
+
+
+def test_history_storage_rejects_unknown_locations():
+    with pytest.raises(ValueError, match="history_storage"):
+        SpectrumH3Config(history_storage="automatic").validate()

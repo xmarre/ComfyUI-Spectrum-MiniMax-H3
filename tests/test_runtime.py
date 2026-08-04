@@ -61,6 +61,7 @@ def _forecast_step(runtime, timestep, labels=LABEL):
 
 def test_default_tail_actual_steps_is_one():
     assert SpectrumH3Config().tail_actual_steps == 1
+    assert SpectrumH3Config().history_storage == "system_ram"
 
 
 def test_scheduler_counts_warmup_forecasts_recomputes_and_window_growth():
@@ -123,6 +124,31 @@ def test_single_call_actual_history_takes_ownership_without_restaking_rows():
     assert runtime.stats.direct_history_updates == 1
     assert runtime.forecaster._history[-1].feature_flat.data_ptr() == archived_ptr
     torch.testing.assert_close(runtime.forecaster._history[-1].feature_flat.reshape_as(feature), feature)
+
+
+def test_vram_archive_is_compact_owned_storage():
+    runtime = _runtime(force_actual=True, history_storage="vram")
+    runtime.start_run(torch.linspace(1.0, 0.0, 3), "sample_euler", supported_sampler=True)
+    decision = runtime.begin_step(torch.tensor([1.0]))
+    backing = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    feature = backing[1:].unsqueeze(0).reshape(1, 3, 4)
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=tuple(feature.shape),
+    )
+    assert actual
+    expected = feature.clone()
+    runtime.observe_actual(decision["run_id"], decision["step_id"], call_id, feature)
+    archived = runtime._step.actual_records[0].feature
+    backing.fill_(-1.0)
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert archived.data_ptr() != feature.data_ptr()
+    assert archived.untyped_storage().nbytes() == archived.numel() * archived.element_size()
+    torch.testing.assert_close(runtime.forecaster._history[-1].feature_flat.reshape_as(expected), expected)
 
 
 def test_split_call_actual_history_still_canonicalizes_rows():

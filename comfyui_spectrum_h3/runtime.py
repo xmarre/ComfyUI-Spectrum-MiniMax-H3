@@ -86,6 +86,7 @@ class SpectrumH3Runtime:
             degree=self.config.degree,
             ridge_lambda=self.config.ridge_lambda,
             max_history=self.config.max_history,
+            history_storage=self.config.history_storage,
         )
         self.stats = RuntimeStats(current_window=self.config.window_size)
         self._run_counter = 0
@@ -340,7 +341,14 @@ class SpectrumH3Runtime:
             )
         started = time.perf_counter()
         try:
-            archived = feature.detach().to(device="cpu", dtype=feature.dtype, copy=True).contiguous()
+            detached = feature.detach()
+            if self.config.history_storage == "vram":
+                # The observed target is a view into the complete final-block
+                # hidden state. A forced clone keeps only the compact target
+                # storage alive and prevents later reuse of the backing tensor.
+                archived = detached.clone(memory_format=torch.contiguous_format)
+            else:
+                archived = detached.to(device="cpu", dtype=feature.dtype, copy=True).contiguous()
         finally:
             self.stats.history_archive_seconds += time.perf_counter() - started
         call.observed_actual = True
@@ -532,6 +540,8 @@ class SpectrumH3Runtime:
             f"history_update_s={self.stats.history_update_seconds:.3f} "
             f"forecast_predict_s={self.stats.forecast_prediction_seconds:.3f} "
             f"direct_history_updates={self.stats.direct_history_updates} "
+            f"history_storage={self.config.history_storage} "
+            f"history_device={str(self.forecaster.history_device)!r} "
             f"history_mib={self.forecaster.history_tensor_bytes / (1024 * 1024):.1f} "
             f"reason={self.stats.disable_reason!r}"
         )

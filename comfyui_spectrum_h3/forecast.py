@@ -15,8 +15,9 @@ class _HistoryEntry:
 class HistoryWeightForecaster:
     """Chebyshev ridge forecasting without full-feature FP32 coefficients.
 
-    Persistent large tensors are model-dtype CPU history snapshots. Regression
-    work is limited to K x (M + 1) design data and a (M + 1)^2 factorization.
+    Persistent large tensors are model-dtype history snapshots on the configured
+    storage device. Regression work is limited to K x (M + 1) design data and a
+    (M + 1)^2 factorization.
     """
 
     def __init__(
@@ -25,11 +26,13 @@ class HistoryWeightForecaster:
         ridge_lambda: float = 0.1,
         max_history: int = 8,
         chunk_bytes: int = 32 * 1024 * 1024,
+        history_storage: str = "system_ram",
     ) -> None:
         self.degree = int(degree)
         self.ridge_lambda = float(ridge_lambda)
         self.max_history = int(max_history)
         self.chunk_bytes = int(chunk_bytes)
+        self.history_storage = str(history_storage)
         if self.degree < 1:
             raise ValueError("degree must be >= 1")
         if self.ridge_lambda < 0.0:
@@ -38,12 +41,15 @@ class HistoryWeightForecaster:
             raise ValueError("max_history is too small for the requested polynomial degree")
         if self.chunk_bytes < 4096:
             raise ValueError("chunk_bytes must be >= 4096")
+        if self.history_storage not in {"system_ram", "vram"}:
+            raise ValueError("history_storage must be 'system_ram' or 'vram'")
         self.reset()
 
     def reset(self) -> None:
         self._history: list[_HistoryEntry] = []
         self._feature_shape: tuple[int, ...] | None = None
         self._feature_dtype: torch.dtype | None = None
+        self._history_device: torch.device | None = None
         self._generation = 0
         self._factor_generation = -1
         self._design: torch.Tensor | None = None
@@ -64,6 +70,10 @@ class HistoryWeightForecaster:
     @property
     def feature_dtype(self) -> torch.dtype | None:
         return self._feature_dtype
+
+    @property
+    def history_device(self) -> torch.device | None:
+        return self._history_device
 
     @property
     def factorization_count(self) -> int:
@@ -112,10 +122,20 @@ class HistoryWeightForecaster:
             raise ValueError(f"feature dtype changed from {self._feature_dtype} to {feature.dtype}")
 
         detached = feature.detach()
-        if take_ownership and detached.device.type == "cpu" and detached.is_contiguous():
+        storage_device = torch.device("cpu") if self.history_storage == "system_ram" else detached.device
+        if self._history_device is None:
+            self._history_device = storage_device
+        elif storage_device != self._history_device:
+            raise ValueError(f"history device changed from {self._history_device} to {storage_device}")
+
+        if take_ownership and detached.device == storage_device and detached.is_contiguous():
             archived = detached.reshape(-1)
         else:
-            archived = detached.to(device="cpu", dtype=self._feature_dtype, copy=True).contiguous().reshape(-1)
+            archived = (
+                detached.to(device=storage_device, dtype=self._feature_dtype, copy=True)
+                .contiguous()
+                .reshape(-1)
+            )
         self._history.append(_HistoryEntry(float(coordinate), archived))
         if len(self._history) > self.max_history:
             self._history.pop(0)

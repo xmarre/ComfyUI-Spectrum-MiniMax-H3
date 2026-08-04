@@ -97,3 +97,50 @@ def test_persistent_storage_has_no_full_fp32_rhs_or_coefficients():
     assert forecaster.persistent_tensor_bytes <= forecaster.history_tensor_bytes + small_matrix_ceiling
     assert not hasattr(forecaster, "_rhs")
     assert not hasattr(forecaster, "_coeff")
+
+
+def test_vram_storage_uses_the_feature_device_and_can_take_ownership():
+    forecaster = HistoryWeightForecaster(
+        degree=1,
+        ridge_lambda=0.1,
+        max_history=2,
+        history_storage="vram",
+    )
+    first = torch.zeros(1, 2, 3).contiguous()
+    forecaster.update(-1.0, first, take_ownership=True)
+    forecaster.update(0.0, torch.ones(1, 2, 3).contiguous(), take_ownership=True)
+
+    assert forecaster.history_device == first.device
+    assert forecaster._history[0].feature_flat.data_ptr() == first.data_ptr()
+    assert torch.isfinite(forecaster.predict(0.5, blend_weight=0.5)).all()
+
+
+def test_vram_storage_rejects_a_device_change_within_history():
+    forecaster = HistoryWeightForecaster(
+        degree=1,
+        ridge_lambda=0.1,
+        max_history=2,
+        history_storage="vram",
+    )
+    forecaster.update(-1.0, torch.zeros(1, 2, 3), take_ownership=True)
+
+    with pytest.raises(ValueError, match="history device changed"):
+        forecaster.update(0.0, torch.empty(1, 2, 3, device="meta"), take_ownership=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_vram_and_system_ram_predictions_match_on_cuda():
+    torch.manual_seed(31)
+    features = [torch.randn(2, 7, 11, device="cuda", dtype=torch.float16) for _ in range(3)]
+    system_ram = HistoryWeightForecaster(degree=2, max_history=3, history_storage="system_ram")
+    vram = HistoryWeightForecaster(degree=2, max_history=3, history_storage="vram")
+    for coordinate, feature in zip((-1.0, -0.25, 0.5), features, strict=True):
+        system_ram.update(coordinate, feature)
+        vram.update(coordinate, feature)
+
+    cpu_cached = system_ram.predict(0.75, blend_weight=0.5, device="cuda", dtype=torch.float16)
+    gpu_cached = vram.predict(0.75, blend_weight=0.5, device="cuda", dtype=torch.float16)
+    torch.testing.assert_close(gpu_cached, cpu_cached, rtol=0.0, atol=0.0)
+    assert system_ram.history_device == torch.device("cpu")
+    assert vram.history_device is not None
+    assert vram.history_device.type == "cuda"
