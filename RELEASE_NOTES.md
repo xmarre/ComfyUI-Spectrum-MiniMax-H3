@@ -20,12 +20,23 @@ Stabilizes deterministic Euler and RES multistep audio-video forecasting and add
 - Avoids redundant full-target GPU concatenation and CPU restacking on native single-call actual steps, and reports history/forecast timing counters in debug summaries.
 - Leaves the separate FLUX-focused ComfyUI-Spectrum-Proper repository unchanged.
 
+## Measured 0.5 MP results
+
+Supplied full-checkpoint, 20-step runs:
+
+| Sampler | Native | Spectrum | Schedule | Time saved | Wall-time reduction | Speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| RES multistep | `2:42` | `1:54` | 14 actual / 6 forecast | `48 s` | `29.6%` | `1.42x` |
+| Euler | `2:38` | `1:59` | 13 actual / 7 forecast | `39 s` | `24.7%` | `1.33x` |
+
+The tested Euler artifacts appeared fixed. The remaining slight RES artifacts appeared gone after enforcing the three-step actual tail.
+
 ## Validation
 
 - The local suite passes against native ComfyUI commit `e377e263049f9338b4d12a3dd417b36ae62948ff`.
 - Automated tests cover forecasting mathematics, scheduling, rollback, clone isolation, the actual ComfyUI loader shape, native-path equivalence, and zero transformer-block execution on forecast steps.
-- Sampler contract tests verify one model call per deterministic solver step, RES's current/previous-denoised recurrence, ancestral noise injection, rollback-safe refresh state, and sampler-specific forecast spacing and tails.
+- Sampler contract tests verify one model call per deterministic solver step, RES's current/previous-denoised recurrence and update ordering, ancestral noise injection, rollback-safe refresh state, and sampler-specific forecast spacing and tails.
 
 ## Current limits
 
-The supplied full-checkpoint RES A/B indicates that a three-step actual tail removes the remaining slight artifacts. That measured 20-step run completed in `1:50` with 14 actual and 6 forecast steps, compared with the supplied `2:06` native baseline. The automated environment cannot decode a full MiniMax H3 generation, so broader prompt coverage and audiovisual quality remain real-generation validation items; timings can also vary with model warmup and GPU state.
+The automated environment cannot decode a full MiniMax H3 generation. Broader prompts, durations, resolutions, CFG settings, reference modes, memory peaks, and audiovisual synchronization remain real-generation validation items. Timings can vary with model warmup and GPU state.
