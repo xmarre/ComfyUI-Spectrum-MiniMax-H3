@@ -17,9 +17,13 @@ Adds optional device-resident history storage for systems with spare VRAM.
 
 ## Memory guidance
 
-- At the supplied 0.5 MP layout, one two-branch history point is about 568 MiB: roughly 2.78 GiB at `max_history=5` or 4.44 GiB at `max_history=8`.
+- The supplied 0.5 MP single-branch workflow retained about 2.22-2.27 GiB at `max_history=8`; a two-branch topology at the same shape would use roughly twice that amount.
 - At the native 1344x768, 124-frame example, eight two-branch snapshots approach 6.1 GiB.
 - VRAM mode also needs headroom for native model execution, the current snapshot, the prediction result, an FP32 accumulation chunk, and allocator fragmentation.
+
+## Measured 0.5 MP A/B results
+
+Three supplied full-checkpoint Euler pairs measured total times of 112.43/105.55 s, 115.60/116.08 s, and 109.80/107.26 s for system RAM/VRAM respectively. The combined means were 112.61 s and 109.63 s, a 2.6% advantage for VRAM mode. Individual pairs ranged from 6.1% faster to 0.4% slower, so the performance benefit is workload- and system-dependent.
 
 ## Validation
 
@@ -28,4 +32,4 @@ Adds optional device-resident history storage for systems with spare VRAM.
 
 ## Current limits
 
-End-to-end speedup and real-checkpoint peak VRAM remain hardware-dependent validation items. Selecting VRAM storage with insufficient headroom can raise an out-of-memory error.
+The supplied 0.5 MP tests verify the expected additional allocation and show a small, variable timing benefit. Other resolutions, durations, CFG topologies, reference modes, and hardware remain unverified. Selecting VRAM storage with insufficient headroom can raise an out-of-memory error.
