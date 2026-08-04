@@ -140,13 +140,26 @@ branch_count * max_history * (target_audio_rows + target_video_rows)
 * hidden_width * model_dtype_bytes
 ```
 
-At the native 1344x768, 124-frame example, the reviewed layout has about 37,710 target rows. With hidden width 5,376 and BF16/FP16 history, one snapshot is roughly 387 MiB per branch. Eight conditional/unconditional snapshots can therefore approach 6.1 GiB in the selected storage. Reference tokens do not enter the cached target, while longer duration and larger target geometry increase the cost. Lower `max_history` is valid only while it remains at least `degree + 1`.
+In the supplied 0.5 MP workflow, the effective single-branch topology had 27,075-27,702 target rows, hidden width 5,376, and 16-bit history. At `max_history=8`, it retained 2,273.5-2,324.9 MiB (about 2.22-2.27 GiB). A two-branch topology at the same shape would use roughly twice that amount. At the native 1344x768, 124-frame example, the reviewed layout has about 37,710 target rows; eight conditional/unconditional snapshots can approach 6.1 GiB. Reference tokens do not enter the cached target, while longer duration and larger target geometry increase the cost. Lower `max_history` is valid only while it remains at least `degree + 1`.
 
 With `history_storage=system_ram`, forecast VRAM includes one model-dtype target feature for the current model call plus a bounded FP32 accumulation chunk. Actual steps copy each new snapshot to CPU, and forecasts stream the retained snapshots back to the prediction device. These transfers can reduce the theoretical speedup.
 
 With `history_storage=vram`, the same model-dtype history remains on the device that produced it. This avoids the device-to-host archive and repeated host-to-device forecast reads. The captured target is cloned into compact owned storage; retaining its native view would keep the complete final-block hidden tensor alive. The mode needs the full history allocation plus transient headroom for the current snapshot, prediction result, FP32 chunk, allocator fragmentation, and native H3 execution. At the native example above, use it only with materially more than 6.1 GiB of VRAM free at the native generation peak. An explicit VRAM selection can raise an out-of-memory error when that headroom is unavailable.
 
 Debug run summaries report the selected storage and resolved history device together with archive, history-update, and forecast-prediction wall time. CPU archiving can synchronize preceding CUDA work, while GPU cloning can be asynchronously enqueued, so the component counters diagnose the runtime path rather than serving as isolated kernel benchmarks. End-to-end wall time and peak allocated VRAM are the authoritative comparison.
+
+### Measured VRAM-history results
+
+Three supplied full-checkpoint, 20-step Euler A/B pairs at approximately 0.5 MP compared otherwise identical `system_ram` and `vram` runs:
+
+| Pair | System RAM | VRAM | VRAM difference |
+|---|---:|---:|---:|
+| 1 | 112.43 s | 105.55 s | -6.1% |
+| 2 | 115.60 s | 116.08 s | +0.4% |
+| 3 | 109.80 s | 107.26 s | -2.3% |
+| Mean | 112.61 s | 109.63 s | -2.6% |
+
+The VRAM runs used about 2.22-2.27 GiB more peak memory, matching the retained history reported by Spectrum. The timing benefit was small and variable, so VRAM history should be treated as an optional optimization for systems with spare VRAM rather than a guaranteed speedup. OS-level GPU monitors can hide the live-allocation increase when PyTorch satisfies it from an already-reserved CUDA memory pool.
 
 ## Fallback and transaction behavior
 
@@ -171,7 +184,7 @@ Automated tests cover:
 - exact native versus wrapped forced-actual video/audio output on a deterministic tiny native H3 fixture;
 - proof that a forecast fixture invokes zero H3 transformer blocks.
 
-No full MiniMax H3 checkpoint is available in the automated environment. Real text-to-video/audio generation, reference modes, long-duration memory behavior, wall-clock speedup, VRAM/RSS peaks, decoded video metrics, audio metrics, and audiovisual synchronization remain unverified by the automated suite. No claim of lossless quality is made.
+No full MiniMax H3 checkpoint is available in the automated environment. The supplied real-checkpoint A/B runs validate the 0.5 MP VRAM allocation and show a small, variable timing benefit. Other resolutions, durations, CFG topologies, reference modes, hardware, decoded video metrics, audio metrics, and audiovisual synchronization remain unverified. No claim of lossless quality is made.
 
 ## Tests
 
