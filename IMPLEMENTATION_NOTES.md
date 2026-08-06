@@ -17,12 +17,12 @@ The separate `ComfyUI-Spectrum-Proper` repository was inspected only for ComfyUI
 3. A stock k-diffusion sampler calls `KSamplerX0Inpaint`, then `CFGGuider.outer_predict_noise` invokes `PREDICT_NOISE` wrappers around `CFGGuider.predict_noise`.
 4. `sampling_function` and `calc_cond_batch` form conditional/unconditional model calls. Each call receives copied/merged transformer options containing `cond_or_uncond`, `uuids`, the current `sigmas`, the full `sample_sigmas`, user patches, replacement patches, hooks, and model-management data.
 5. `comfy.model_base.MiniMaxH3._apply_model` converts the flat sampler latent back to the native pair `[video, audio]`, maps sampler sigma through `model_sampling.timestep`, copies transformer options, and calls `MiniMaxH3Model.forward`.
-6. `MiniMaxH3Model.forward` invokes ComfyUI `DIFFUSION_MODEL` wrappers around `MiniMaxH3Model._forward`.
+6. `MiniMaxH3Model.forward` invokes ComfyUI `DIFFUSION_MODEL` wrappers around `MiniMaxH3Model._forward`. On cores with `ModelSamplingAV` the sampler carries the audio stream scaled onto the video schedule; `forward` removes that scale before the wrappers run and restores it after, so wrappers always observe the stream's own latent and velocity.
 7. `_forward` pads video to the model patch geometry, resolves or constructs `PackedLayout`, derives video and audio timesteps from the current video sigma and both sigma shifts, builds modality/timestep modulation segments, embeds target and conditioning rows, builds RoPE, and runs every transformer block. Per-block replacement patches and the native prefetch queue are applied inside this loop.
 8. The packed sequence is `[text | optional keyframe/reference segments | target audio | target video]`. `PackedLayout.segments` proves that the target audio and target video spans are the final two contiguous segments, in that order.
 9. Immediately after the final transformer block, the packed hidden tensor contains the desired forecast target. Only the target audio and target video rows are cached, as a compact tensor ordered `[target audio rows | target video rows]`. Text, keyframe, image-reference, video-reference, and audio-reference rows are excluded.
 10. `FinalLayer.forward` consumes the current hidden rows plus the current exact timestep embeddings. It independently normalizes/modulates target video and target audio rows, then executes the checkpoint's FP32 output heads.
-11. Native reconstruction unpatchifies video, unpacks stereo channel-major audio, applies the video-to-audio sigma-map derivative, and returns `[-video_velocity, -audio_slope * audio_velocity]`. `BaseModel._apply_model` packs this native pair again for the sampler and applies the native denoised conversion.
+11. Native reconstruction unpatchifies video and unpacks stereo channel-major audio. The audio velocity convention is core-dependent and is detected from the presence of `time_shift_slope` in `comfy.ldm.minimax.model`: cores that expose it expect `_forward` to apply the video-to-audio sigma-map derivative and return `[-video_velocity, -audio_slope * audio_velocity]`; cores that removed it perform the schedule conversion in `forward` instead, so `_forward` returns the unscaled `[-video_velocity, -audio_velocity]`. `BaseModel._apply_model` packs this native pair again for the sampler and applies the native denoised conversion.
 
 ## Integration invariant
 
@@ -31,7 +31,7 @@ The acceleration boundary is the post-final-block hidden feature immediately bef
 This preserves:
 
 - current video and audio timestep conditioning;
-- sigma-shift mapping and audio derivative scaling;
+- sigma-shift mapping, and whichever audio velocity convention the installed core uses;
 - output-head weights and FP32 islands;
 - video unpatchification and audio unpacking;
 - native return structure;

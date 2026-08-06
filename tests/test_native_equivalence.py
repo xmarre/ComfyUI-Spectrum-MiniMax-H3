@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from comfyui_spectrum_h3.config import SpectrumH3Config
+from comfyui_spectrum_h3.forecast import HistoryWeightForecaster
 from comfyui_spectrum_h3.minimax_h3 import diffusion_model_wrapper
 from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
 from comfyui_spectrum_h3.sampling import (
@@ -139,6 +140,59 @@ def test_actual_capture_avoids_full_audio_video_concatenation(monkeypatch):
 
     assert isinstance(wrapped, list) and len(wrapped) == 2
     assert runtime.stats.direct_history_updates == 1
+    runtime.end_run(run_id)
+
+
+def test_exact_forecast_reproduces_the_native_audio_video_velocity(monkeypatch):
+    """A forecast that recovers the true final-block feature must equal native _forward.
+
+    This pins the audio-velocity convention: cores that expose time_shift_slope want
+    the forecast pre-scaled by d(sigma_a)/d(sigma_v), newer cores convert outside the
+    wrapper and want it unscaled. Getting it wrong only shows up as audio drift.
+    """
+    _, _, PackedLayout = _native_imports()
+    model, _ = _tiny_model()
+    x, context, payload = _inputs(PackedLayout)
+    native = model._forward(x, torch.tensor([500.0]), context, {}, minimax_payload=payload)
+
+    captured = {}
+    original_observe = SpectrumH3Runtime.observe_actual
+
+    def recording_observe(self, run_id, step_id, call_id, target):
+        captured["target"] = target.detach().clone()
+        return original_observe(self, run_id, step_id, call_id, target)
+
+    monkeypatch.setattr(SpectrumH3Runtime, "observe_actual", recording_observe)
+    capture_runtime = SpectrumH3Runtime(
+        SpectrumH3Config(degree=1, max_history=4, force_actual=True, warmup_steps=0, tail_actual_steps=0)
+    )
+    capture_run = capture_runtime.start_run(torch.tensor([1.0, 0.0]), "sample_euler", supported_sampler=True)
+    _wrapped_call(model, capture_runtime, 1.0, 500.0, x, context, payload)
+    capture_runtime.end_run(capture_run)
+    monkeypatch.setattr(SpectrumH3Runtime, "observe_actual", original_observe)
+    assert "target" in captured
+
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(degree=1, max_history=4, warmup_steps=2, tail_actual_steps=0, window_size=2.0)
+    )
+    run_id = runtime.start_run(torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]), "sample_euler", supported_sampler=True)
+    _wrapped_call(model, runtime, 1.0, 1000.0, x, context, payload)
+    _wrapped_call(model, runtime, 0.75, 750.0, x, context, payload)
+
+    # Patch the forecaster, not the runtime, so all step bookkeeping still runs.
+    monkeypatch.setattr(
+        HistoryWeightForecaster,
+        "predict",
+        lambda self, coordinate, blend_weight, *, rows, device, dtype: captured["target"].to(
+            device=device, dtype=dtype
+        ),
+    )
+    forecast, forecast_decision = _wrapped_call(model, runtime, 0.5, 500.0, x, context, payload)
+    assert not forecast_decision["actual"]
+    for native_part, forecast_part in zip(native, forecast, strict=True):
+        assert native_part.shape == forecast_part.shape
+        assert native_part.dtype == forecast_part.dtype
+        torch.testing.assert_close(native_part, forecast_part, rtol=1e-5, atol=1e-5)
     runtime.end_run(run_id)
 
 

@@ -100,7 +100,9 @@ def target_segments(layout: Any) -> tuple[tuple[int, int], tuple[int, int]]:
 
 def _native_module(inner: Any):
     module = importlib.import_module(type(inner).__module__)
-    required = ("PackedLayout", "unpatchify_video", "unpack_audio", "time_shift_sigma", "time_shift_slope")
+    # time_shift_slope is deliberately absent: cores that still expose it want the
+    # audio velocity pre-scaled here, newer ones convert outside this wrapper.
+    required = ("PackedLayout", "unpatchify_video", "unpack_audio", "time_shift_sigma")
     missing = [name for name in required if not hasattr(module, name)]
     if missing:
         raise RuntimeError(f"native MiniMax H3 module is missing required helpers: {', '.join(missing)}")
@@ -349,9 +351,14 @@ def _execute_forecast(
     )
     original_t, original_h, original_w = state.original_video_shape
     video_out = video_out[:, :, :original_t, :original_h, :original_w]
-    audio_out = module.unpack_audio(audio_projected)
-    slope = module.time_shift_slope(state.sigma_v, state.shift_v, state.shift_a).to(audio_out.dtype)
-    return [-video_out.to(video_x.dtype), (-slope) * audio_out.to(audio_x.dtype)]
+    audio_out = -module.unpack_audio(audio_projected).to(audio_x.dtype)
+    # Older cores return the audio velocity scaled by d(sigma_a)/d(sigma_v) from
+    # _forward; newer ones carry the audio on the video schedule and undo the
+    # scale in forward(), outside this wrapper, so _forward stays unscaled.
+    slope_fn = getattr(module, "time_shift_slope", None)
+    if slope_fn is not None:
+        audio_out = audio_out * slope_fn(state.sigma_v, state.shift_v, state.shift_a).to(audio_out.dtype)
+    return [-video_out.to(video_x.dtype), audio_out]
 
 
 def diffusion_model_wrapper(
