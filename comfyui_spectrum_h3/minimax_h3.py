@@ -100,7 +100,7 @@ def target_segments(layout: Any) -> tuple[tuple[int, int], tuple[int, int]]:
 
 def _native_module(inner: Any):
     module = importlib.import_module(type(inner).__module__)
-    required = ("PackedLayout", "unpatchify_video", "unpack_audio", "time_shift_sigma", "time_shift_slope")
+    required = ("PackedLayout", "unpatchify_video", "unpack_audio", "time_shift_sigma")
     missing = [name for name in required if not hasattr(module, name)]
     if missing:
         raise RuntimeError(f"native MiniMax H3 module is missing required helpers: {', '.join(missing)}")
@@ -333,25 +333,24 @@ def _execute_forecast(
     audio_segment = (0, audio_rows, state.audio_timestep_row)
     video_segment = (audio_rows, audio_rows + video_rows, state.video_timestep_row)
     video_projected, audio_projected = inner.final_layer(
-        compact,
-        state.t_emb,
-        video_segment,
+        compact, 
+        state.t_emb, 
+        video_segment, 
         audio_segment,
     )
     latent_t, latent_h, latent_w = state.padded_video_shape
     video_out = module.unpatchify_video(
-        video_projected,
-        latent_t,
-        latent_h // inner.patch_size[1],
+        video_projected, 
+        latent_t, 
+        latent_h // inner.patch_size[1], 
         latent_w // inner.patch_size[2],
-        inner.latents_dim,
+        inner.latents_dim, 
         inner.patch_size,
     )
     original_t, original_h, original_w = state.original_video_shape
     video_out = video_out[:, :, :original_t, :original_h, :original_w]
     audio_out = module.unpack_audio(audio_projected)
-    slope = module.time_shift_slope(state.sigma_v, state.shift_v, state.shift_a).to(audio_out.dtype)
-    return [-video_out.to(video_x.dtype), (-slope) * audio_out.to(audio_x.dtype)]
+    return [-video_out.to(video_x.dtype), -audio_out.to(audio_x.dtype)]
 
 
 def diffusion_model_wrapper(
