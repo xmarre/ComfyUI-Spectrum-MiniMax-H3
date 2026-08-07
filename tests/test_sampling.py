@@ -4,10 +4,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from comfyui_spectrum_h3.config import SpectrumH3Config
+from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
 from comfyui_spectrum_h3.sampling import (
+    BINDING_KEY,
+    SpectrumH3Binding,
     max_consecutive_forecasts,
     min_actual_steps_after_forecast,
     min_tail_actual_steps,
+    outer_sample_wrapper,
     sampler_is_supported,
     sampler_name,
 )
@@ -84,3 +89,40 @@ def test_unsupported_sampler_has_no_forecast_streak_policy():
     assert max_consecutive_forecasts(sampler) is None
     assert min_actual_steps_after_forecast(sampler) == 0
     assert min_tail_actual_steps(sampler) == 0
+
+
+def test_easycache_on_same_model_bypasses_spectrum_run(caplog):
+    runtime = SpectrumH3Runtime(SpectrumH3Config())
+    guider = SimpleNamespace(
+        model_options={
+            BINDING_KEY: SpectrumH3Binding(runtime),
+            "transformer_options": {"easycache": object()},
+        }
+    )
+    calls = []
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return "native-cache-result"
+
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            "noise",
+            "latent",
+            _sampler("sample_euler"),
+            "sigmas",
+            denoise_mask="mask",
+            callback="callback",
+            disable_pbar=True,
+            seed=7,
+            latent_shapes=("video", "audio"),
+        )
+
+    assert result == "native-cache-result"
+    assert len(calls) == 1
+    assert runtime.active_run_id is None
+    assert "EasyCache or LazyCache is active" in caplog.text

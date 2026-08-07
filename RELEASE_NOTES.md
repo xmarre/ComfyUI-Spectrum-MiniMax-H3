@@ -1,26 +1,24 @@
-# Spectrum MiniMax H3 v0.1.5
+# Spectrum MiniMax H3 v0.1.6
 
-Fixes MiniMax H3 sampling on Apple MPS and includes the documentation and licensing corrections made since v0.1.4.
+Restores Spectrum on current ComfyUI after the native MiniMax H3 `ModelSamplingAV` update and makes native cache conflicts fail safe.
 
 ## Fixed
 
-- Move detached solver timestep tensors to CPU before converting them to `float64`, avoiding the unsupported MPS `float64` conversion that stopped sampling at step 0.
-- Apply the same transfer-before-cast ordering to sigma-schedule normalization, which contained the same latent defect.
-- Centralize the conversion path so run initialization and per-step coordinate calculation cannot diverge.
-- Correct the repository's GPL-3.0-or-later licensing files and package metadata.
+- Remove `time_shift_slope` from the unconditional native-helper requirement after ComfyUI removed it in `bdcb886a`.
+- Match both native MiniMax H3 audio-velocity contracts: derivative-scaled output on the original core and raw `_forward` output when `ModelSamplingAV` performs the schedule conversion outside Spectrum's wrapper boundary.
+- Detect native EasyCache or LazyCache on the same model branch before opening a Spectrum transaction. Spectrum remains inactive for that run and the cache continues normally, avoiding `Spectrum H3 solver step completed without an H3 model call`.
 
 ## Validation
 
-- Add regression coverage that explicitly enforces `detach -> CPU transfer -> float64 cast -> flatten`.
-- Preserve CPU values, output shape, device, and dtype through the shared conversion helper.
-- Confirm the fix on a physical Apple M4 Max system with a complete 20-step RES multistep run: 14 actual H3 transformer evaluations, 6 forecasted evaluations, and zero fallbacks.
-- Retain the existing native MiniMax H3 fixture, scheduler, transaction, fallback, and forecasting test coverage.
+- Add an exact reconstruction test that feeds a captured native final-block feature through the forecast output path and compares both video and audio velocity with native `_forward`.
+- Run native-equivalence CI against the original H3 integration commit and current ComfyUI commit `0dd9b154a1654fc699dcdc3af066c7cce096045a`.
+- Add regression coverage proving EasyCache/LazyCache presence bypasses Spectrum without starting or advancing runtime state.
+- Validate the full CPU suite locally on both sides of the upstream `ModelSamplingAV` change: 80 passed and one CUDA-only equivalence test skipped on each core.
 
 ## Documentation
 
-- Clarify that Spectrum can produce trajectory deviations and localized degradation during fast or brief motion.
-- Record the community-tested Radeon AI PRO R9700 / ROCm configuration and its measured warm-run result as a scoped compatibility datapoint.
+- Document the supported native contract range and the mutual exclusion between Spectrum and native EasyCache/LazyCache on one model branch.
 
 ## Scope
 
-The MPS hardware confirmation covers the reported Apple M4 Max, PyTorch 2.10.0, ComfyUI 0.30.0, RES multistep configuration. It does not establish compatibility for every Apple Silicon model, PyTorch release, sampler, workflow topology, or MiniMax H3 configuration.
+The automated native tests use tiny CPU fixtures. Contributor testing reported four successful full MiniMax H3 generations with the ComfyUI compatibility patch on an AMD Radeon AI PRO R9700 / ROCm system. Exact-seed full-checkpoint A/B validation of the new ComfyUI audio path remains outstanding.

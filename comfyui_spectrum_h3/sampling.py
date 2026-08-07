@@ -109,6 +109,23 @@ def outer_sample_wrapper(
             latent_shapes=latent_shapes,
         )
 
+    transformer_options = (getattr(guider, "model_options", None) or {}).get("transformer_options") or {}
+    if transformer_options.get("easycache") is not None:
+        LOG.warning(
+            "Spectrum H3 disabled for this run because EasyCache or LazyCache is active on the same model"
+        )
+        return executor(
+            noise,
+            latent_image,
+            sampler,
+            sigmas,
+            denoise_mask,
+            callback,
+            disable_pbar,
+            seed,
+            latent_shapes=latent_shapes,
+        )
+
     runtime = binding.runtime
     name = sampler_name(sampler)
     run_id = runtime.start_run(

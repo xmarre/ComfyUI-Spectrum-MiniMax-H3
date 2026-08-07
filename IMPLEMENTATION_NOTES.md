@@ -1,8 +1,8 @@
 # MiniMax H3 integration notes
 
-Source review date: 2026-08-03
+Source review date: 2026-08-07
 
-Reviewed native ComfyUI commit: `e377e263049f9338b4d12a3dd417b36ae62948ff`
+Reviewed native ComfyUI commits: `e377e263049f9338b4d12a3dd417b36ae62948ff` and `0dd9b154a1654fc699dcdc3af066c7cce096045a`
 
 Reviewed Spectrum paper: arXiv `2603.01623v1`
 
@@ -44,6 +44,8 @@ This preserves:
 Solver-step IDs are assigned by a `PREDICT_NOISE` wrapper inside an `OUTER_SAMPLE` run transaction. Forecasting is allowlisted only for deterministic native `sample_euler`, `sample_res_multistep`, and `sample_res_multistep_cfg_pp`, whose reviewed implementations perform exactly one `predict_noise` call per solver iteration. Euler requires one completed actual H3 evaluation after every forecast. RES stores each current denoised result for the following second-order update. The actual step after a forecast consumes that forecast-derived value, then replaces `old_denoised` with its native result; one completed actual evaluation therefore clears the retained forecast before forecasting resumes. RES also enforces a three-step actual tail. These sampler floors are applied at run time and cannot be weakened by an older saved workflow. Ancestral variants remain native because they inject noise between model evaluations. Other samplers remain native and report a debug fallback reason.
 
 Coordinates are derived from the actual supplied sigma sequence. Evaluated sigma values are affinely normalized between the run's evaluated minimum and maximum into `[-1, 1]`; no fixed step count is assumed.
+
+Native EasyCache and LazyCache may terminate a diffusion-model wrapper chain without an H3 call. Their shared `transformer_options["easycache"]` holder is therefore detected before Spectrum opens a run transaction. Spectrum remains inactive for that run and the cache owns the acceleration path.
 
 ## Forecast memory model
 

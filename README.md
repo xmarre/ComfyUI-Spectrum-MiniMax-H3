@@ -21,7 +21,7 @@ Use Spectrum when the speed benefit is worth possible output differences. Disabl
 
 ## Supported native path
 
-The integration targets `comfy.ldm.minimax.model.MiniMaxH3Model` in native ComfyUI. It requires the MiniMax H3 and packed-latent sampler APIs present at ComfyUI commit `e377e263049f9338b4d12a3dd417b36ae62948ff` from August 3, 2026, including the `latent_shapes` argument on `outer_sample`. Older ComfyUI revisions are unsupported. Development and native-equivalence tests are pinned to that commit. Later revisions are unverified; required H3 attributes are checked when the node is applied, and replacement output shape is checked on actual steps so incompatible native changes fail with an explicit contract error.
+The integration targets `comfy.ldm.minimax.model.MiniMaxH3Model` in native ComfyUI. It requires the MiniMax H3 and packed-latent sampler APIs introduced by ComfyUI commit `e377e263049f9338b4d12a3dd417b36ae62948ff`, including the `latent_shapes` argument on `outer_sample`. Older ComfyUI revisions are unsupported. Native-equivalence CI covers that original integration and current ComfyUI commit `0dd9b154a1654fc699dcdc3af066c7cce096045a`, including the `ModelSamplingAV` audio-schedule contract introduced in `bdcb886a4705a03cf40f4a7226de9fc7c059fc90`. Required H3 attributes are checked when the node is applied, and replacement output shape is checked on actual steps so incompatible native changes fail with an explicit contract error.
 
 The forecast target is the packed hidden feature immediately after the final H3 transformer block and before `FinalLayer`, ordered as:
 
@@ -134,6 +134,8 @@ Forecasting is currently allowlisted for:
 - RES multistep CFG++ (`sample_res_multistep_cfg_pp`)
 
 The reviewed implementations make one `predict_noise` call per solver iteration. Euler feeds each approximate denoised result into the latent used by the next evaluation, so it requires one completed actual H3 evaluation after every forecast. RES multistep stores each current denoised result as `old_denoised` for the following second-order update. The actual evaluation immediately after a forecast still consumes forecast-derived history, then replaces `old_denoised` with its native result before another forecast is allowed. This prevents any RES update from combining two forecasted denoised results. RES also keeps its final three solver steps native; this tail floor applies even when a saved workflow supplies a smaller `tail_actual_steps` value. Ancestral samplers execute native MiniMax H3 because injected noise invalidates the smooth deterministic feature trajectory used by the forecaster. Debug mode logs the exact fallback, tail, or post-forecast refresh reason. Multi-GPU parallel sampling also remains native because distributed forecast-row transactions are not yet validated.
+
+Native EasyCache and LazyCache must not accelerate the same model branch as Spectrum. Either cache can return an approximate diffusion result without invoking MiniMax H3, so Spectrum cannot capture the actual post-transformer feature required by its solver-step transaction. If both are attached, Spectrum now logs one warning and remains inactive for that run while the cache continues normally. Use one of these accelerators on a model branch.
 
 ## Memory design
 
