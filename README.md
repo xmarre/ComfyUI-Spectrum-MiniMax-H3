@@ -60,15 +60,15 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 
 ## Parameters
 
-| Parameter | Conservative default | Meaning |
+| Parameter | Preliminary default | Meaning |
 |---|---:|---|
 | `enabled` | `true` | Enables the clone-local Spectrum runtime. |
 | `blend_weight` | `0.50` | Spectral share of the prediction. The remainder is a two-point local linear forecast. |
-| `degree` | `4` | Maximum Chebyshev polynomial degree. At least `degree + 1` actual points are required. |
+| `degree` | `1` | Maximum Chebyshev polynomial degree. At least `degree + 1` actual points are required. |
 | `ridge_lambda` | `0.10` | Ridge regularization applied to the small Gram matrix. |
 | `window_size` | `2.0` | Initial adaptive interval. |
 | `flex_window` | `0.75` | Amount added to the interval after a scheduled post-warmup actual step. |
-| `warmup_steps` | `5` | Initial solver steps forced to native transformer evaluation. |
+| `warmup_steps` | `1` | Initial solver steps forced to native transformer evaluation. |
 | `tail_actual_steps` | `1` | Requested final native tail. Deterministic RES enforces a sampler-safe minimum of `3`. |
 | `max_history` | `8` | Maximum model-dtype actual feature snapshots retained. |
 | `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
@@ -77,15 +77,15 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
-### Conservative preset
+### Preliminary default preset
 
 ```text
 blend_weight = 0.50
-degree = 4
+degree = 1
 ridge_lambda = 0.10
 window_size = 2.0
 flex_window = 0.75
-warmup_steps = 5
+warmup_steps = 1
 tail_actual_steps = 1
 max_history = 8
 history_storage = system_ram
@@ -105,7 +105,7 @@ max_history = 8
 history_storage = system_ram
 ```
 
-Both presets remain provisional pending broader prompt, sampler, and quality coverage.
+The default degree, warmup, and tail are preliminary pending broader prompt, sampler, and quality coverage. Existing workflows retain their saved input values. The aggressive preset remains an explicit alternative.
 
 ## Adaptive schedule
 
@@ -117,14 +117,7 @@ Warmup and final-tail steps are actual. After warmup, with current interval `W`,
 
 After a successfully completed scheduled actual step, `W` increases by `flex_window`. A fallback actual step does not increase it. Forecasting also waits until at least `max(2, degree + 1)` actual history points exist.
 
-For a 20-step run with the conservative settings, the sampler-aware scheduler currently produces:
-
-| Sampler | Actual H3 solver steps | Forecasted solver steps | Forecast indices | Transformer-step reduction |
-|---|---:|---:|---|---:|
-| Euler | 13 | 7 | `5, 7, 9, 11, 13, 15, 17` | 35% |
-| RES multistep / CFG++ | 14 | 6 | `5, 7, 9, 11, 13, 15` | 30% |
-
-These counts are solver-step counts. CFG can execute separate conditional and unconditional H3 transformer calls on each actual solver step. End-to-end wall-clock speedup depends on output-head cost, CPU transfers, model offload, references, CFG branching, latent size, and hardware.
+Schedule counts depend on the sampler safeguards and whether the experimental one-point bootstrap is enabled. CFG can execute separate conditional and unconditional H3 transformer calls on each actual solver step. End-to-end wall-clock speedup depends on output-head cost, CPU transfers, model offload, references, CFG branching, latent size, and hardware.
 
 ### Experimental one-point bootstrap
 

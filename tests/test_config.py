@@ -31,6 +31,18 @@ def test_bootstrap_first_forecast_defaults_to_false():
     assert SpectrumH3Config().bootstrap_first_forecast is False
 
 
+def test_preliminary_scheduler_defaults():
+    config = SpectrumH3Config()
+    required = SpectrumApplyMiniMaxH3.INPUT_TYPES()["required"]
+
+    assert config.degree == 1
+    assert config.warmup_steps == 1
+    assert config.tail_actual_steps == 1
+    assert required["degree"][1]["default"] == 1
+    assert required["warmup_steps"][1]["default"] == 1
+    assert required["tail_actual_steps"][1]["default"] == 1
+
+
 @pytest.mark.parametrize("value", [0, 1, "true", None])
 def test_bootstrap_first_forecast_rejects_non_boolean_values(value):
     with pytest.raises(TypeError, match="bootstrap_first_forecast must be a boolean"):

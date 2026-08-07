@@ -8,11 +8,11 @@ from dataclasses import dataclass
 class SpectrumH3Config:
     enabled: bool = True
     blend_weight: float = 0.50
-    degree: int = 4
+    degree: int = 1
     ridge_lambda: float = 0.10
     window_size: float = 2.0
     flex_window: float = 0.75
-    warmup_steps: int = 5
+    warmup_steps: int = 1
     tail_actual_steps: int = 1
     max_history: int = 8
     history_storage: str = "system_ram"
@@ -78,6 +78,8 @@ class SpectrumH3Config:
 CONSERVATIVE_PRESET = SpectrumH3Config()
 AGGRESSIVE_PRESET = SpectrumH3Config(
     blend_weight=0.75,
+    degree=4,
     flex_window=3.0,
+    warmup_steps=5,
     tail_actual_steps=1,
 )

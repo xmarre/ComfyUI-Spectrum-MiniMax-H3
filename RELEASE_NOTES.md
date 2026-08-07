@@ -1,24 +1,42 @@
-# Spectrum MiniMax H3 v0.1.6
+# Spectrum MiniMax H3 v0.1.7
 
-Restores Spectrum on current ComfyUI after the native MiniMax H3 `ModelSamplingAV` update and makes native cache conflicts fail safe.
+Adds an experimental one-point bootstrap forecast for degree-1 schedules and adopts the validated degree-1 setup as the preliminary default for new node instances.
 
-## Fixed
+## Added
 
-- Remove `time_shift_slope` from the unconditional native-helper requirement after ComfyUI removed it in `bdcb886a`.
-- Match both native MiniMax H3 audio-velocity contracts: derivative-scaled output on the original core and raw `_forward` output when `ModelSamplingAV` performs the schedule conversion outside Spectrum's wrapper boundary.
-- Detect native EasyCache or LazyCache on the same model branch before opening a Spectrum transaction. Spectrum remains inactive for that run and the cache continues normally, avoiding `Spectrum H3 solver step completed without an H3 model call`.
+- Add optional `bootstrap_first_forecast`, disabled by default, which can forecast solver step 1 from the actual step-0 packed H3 hidden feature.
+- Route the explicit one-point `[1.0]` hold through the existing bounded prediction engine while preserving current-step timestep conditioning, output heads, branch mapping, shape checks, retry behavior, and accounting.
+- Keep ordinary degree-1 regression unchanged: it still requires two actual history samples, never factorizes a one-point system, and never inserts forecasts into actual history.
 
-## Validation
+## Preliminary defaults
 
-- Add an exact reconstruction test that feeds a captured native final-block feature through the forecast output path and compares both video and audio velocity with native `_forward`.
-- Run native-equivalence CI against the original H3 integration commit and current ComfyUI commit `0dd9b154a1654fc699dcdc3af066c7cce096045a`.
-- Add regression coverage proving EasyCache/LazyCache presence bypasses Spectrum without starting or advancing runtime state.
-- Validate the full CPU suite locally on both sides of the upstream `ModelSamplingAV` change: 80 passed and one CUDA-only equivalence test skipped on each core.
+- Set `degree=1` for new node instances.
+- Set `warmup_steps=1` for new node instances.
+- Keep `tail_actual_steps=1` as the requested native tail. Deterministic RES still enforces its sampler-safe three-step minimum.
+- Keep `bootstrap_first_forecast=false`; enable it explicitly to use the new step-1 hold.
 
-## Documentation
+Existing workflows retain their saved input values.
 
-- Document the supported native contract range and the mutual exclusion between Spectrum and native EasyCache/LazyCache on one model branch.
+## Full-checkpoint validation
 
-## Scope
+A same-seed 20-step Euler run with `degree=1`, `warmup_steps=1`, `tail_actual_steps=1`, `bootstrap_first_forecast=true`, `window_size=2.0`, and `flex_window=0.75` completed with:
 
-The automated native tests use tiny CPU fixtures. Contributor testing reported four successful full MiniMax H3 generations with the ComfyUI compatibility patch on an AMD Radeon AI PRO R9700 / ROCm system. Exact-seed full-checkpoint A/B validation of the new ComfyUI audio path remains outstanding.
+```text
+A F A F A F A F A F A F A F A F A F A A
+```
+
+- 11 actual transformer calls and 9 forecasts.
+- Zero fallbacks.
+- 177.80 s sampler time, down from 324.98 s native: 45.29% reduction and 1.83x sampler throughput.
+- 200.32 s full-prompt time, down from 340.59 s native: 41.19% reduction. The Spectrum run also included 5.65 s of upstream `MiniMaxH3ImageToVideo` work, so the full-prompt comparison is less controlled than the sampler measurement.
+- 0.141 s total forecast prediction time and 3221.5 MiB of history in VRAM.
+
+The bootstrap run was 6.52 s faster than an earlier non-bootstrap Spectrum run with the same 11 actual calls and 9 forecasts. That 3.54% difference is treated as run variance and/or sigma-position cost, since bootstrap did not reduce the transformer-call count at 20 steps. Odd step counts such as 17 or 19 are where the shifted schedule can remove one additional actual call.
+
+## Automated validation
+
+- Exact 17-step and 20-step Euler bootstrap schedules.
+- Whole-step abort, retry, fallback, reordered-label, topology, shape, final-tail, refresh, and accounting invariants.
+- One-point prediction exactness with no regression factorization or history mutation.
+- Native H3 proof that the bootstrap skips transformer blocks while running the current step's output path.
+- 106 tests passed with one CUDA-only VRAM/system-RAM parity test skipped on current ComfyUI `2340099d`, original H3 integration commit `e377e263`, and compatibility commit `0dd9b154`.

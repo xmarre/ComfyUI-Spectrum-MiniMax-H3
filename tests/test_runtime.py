@@ -88,9 +88,13 @@ def _complete_step(runtime, timestep, *, labels=LABEL):
     return decision
 
 
-def test_default_tail_actual_steps_is_one():
-    assert SpectrumH3Config().tail_actual_steps == 1
-    assert SpectrumH3Config().history_storage == "system_ram"
+def test_preliminary_runtime_defaults():
+    config = SpectrumH3Config()
+
+    assert config.degree == 1
+    assert config.warmup_steps == 1
+    assert config.tail_actual_steps == 1
+    assert config.history_storage == "system_ram"
 
 
 @pytest.mark.parametrize(
@@ -572,9 +576,16 @@ def test_adaptive_window_is_capped_by_the_history_bound():
         (3.0, 1, 8, [0, 1, 2, 3, 4, 6, 11, 19]),
     ],
 )
-def test_twenty_step_preset_schedule_counts(flex_window, tail_actual_steps, expected_actual, expected_indices):
+def test_twenty_step_degree_four_schedule_counts(
+    flex_window, tail_actual_steps, expected_actual, expected_indices
+):
     runtime = SpectrumH3Runtime(
-        SpectrumH3Config(flex_window=flex_window, tail_actual_steps=tail_actual_steps)
+        SpectrumH3Config(
+            degree=4,
+            warmup_steps=5,
+            flex_window=flex_window,
+            tail_actual_steps=tail_actual_steps,
+        )
     )
     runtime.start_run(torch.linspace(1.0, 0.0, 21), "sample_euler", supported_sampler=True)
     actual_indices = []
@@ -691,9 +702,9 @@ def test_twenty_step_res_schedule_refreshes_once_and_enforces_three_step_tail():
         previous_was_forecast = not actual
         runtime.finalize_step(decision["run_id"], decision["step_id"])
 
-    assert forecast_indices == [5, 7, 9, 11, 13, 15]
-    assert runtime.stats.actual_steps == 14
-    assert runtime.stats.forecast_steps == 6
+    assert forecast_indices == [2, 4, 6, 8, 10, 12, 14, 16]
+    assert runtime.stats.actual_steps == 12
+    assert runtime.stats.forecast_steps == 8
 
 
 def test_aborted_res_refresh_does_not_consume_refresh_state():
@@ -760,6 +771,6 @@ def test_twenty_step_euler_schedule_refreshes_between_forecasts():
         previous_was_forecast = not actual
         runtime.finalize_step(decision["run_id"], decision["step_id"])
 
-    assert forecast_indices == [5, 7, 9, 11, 13, 15, 17]
-    assert runtime.stats.actual_steps == 13
-    assert runtime.stats.forecast_steps == 7
+    assert forecast_indices == [2, 4, 6, 8, 10, 12, 14, 16, 18]
+    assert runtime.stats.actual_steps == 11
+    assert runtime.stats.forecast_steps == 9
