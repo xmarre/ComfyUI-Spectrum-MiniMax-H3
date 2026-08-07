@@ -4,7 +4,7 @@ import inspect
 
 import pytest
 
-from comfyui_spectrum_h3.config import SpectrumH3Config
+from comfyui_spectrum_h3.config import AGGRESSIVE_PRESET, SpectrumH3Config
 from comfyui_spectrum_h3.nodes import SpectrumApplyMiniMaxH3
 
 
@@ -27,20 +27,27 @@ def test_history_storage_rejects_unknown_locations():
         SpectrumH3Config(history_storage="automatic").validate()
 
 
-def test_bootstrap_first_forecast_defaults_to_false():
-    assert SpectrumH3Config().bootstrap_first_forecast is False
-
-
 def test_preliminary_scheduler_defaults():
     config = SpectrumH3Config()
     required = SpectrumApplyMiniMaxH3.INPUT_TYPES()["required"]
+    optional = SpectrumApplyMiniMaxH3.INPUT_TYPES()["optional"]
+    apply_parameters = inspect.signature(SpectrumApplyMiniMaxH3.apply).parameters
 
     assert config.degree == 1
     assert config.warmup_steps == 1
     assert config.tail_actual_steps == 1
+    assert config.bootstrap_first_forecast is True
     assert required["degree"][1]["default"] == 1
     assert required["warmup_steps"][1]["default"] == 1
     assert required["tail_actual_steps"][1]["default"] == 1
+    assert optional["bootstrap_first_forecast"] == ("BOOLEAN", {"default": True})
+    assert apply_parameters["bootstrap_first_forecast"].default is True
+
+
+def test_aggressive_preset_explicitly_disables_degree_one_bootstrap():
+    assert AGGRESSIVE_PRESET.degree == 4
+    assert AGGRESSIVE_PRESET.bootstrap_first_forecast is False
+    AGGRESSIVE_PRESET.validate()
 
 
 @pytest.mark.parametrize("value", [0, 1, "true", None])
@@ -71,11 +78,3 @@ def test_bootstrap_first_forecast_accepts_degree_one_and_one_warmup_step():
     ).validate()
 
     assert config.bootstrap_first_forecast is True
-
-
-def test_node_exposes_bootstrap_as_an_optional_boolean():
-    optional = SpectrumApplyMiniMaxH3.INPUT_TYPES()["optional"]
-    apply_parameters = inspect.signature(SpectrumApplyMiniMaxH3.apply).parameters
-
-    assert optional["bootstrap_first_forecast"] == ("BOOLEAN", {"default": False})
-    assert apply_parameters["bootstrap_first_forecast"].default is False

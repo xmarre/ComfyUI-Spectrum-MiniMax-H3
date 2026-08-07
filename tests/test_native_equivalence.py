@@ -184,7 +184,14 @@ def test_exact_forecast_reproduces_the_native_audio_video_velocity(monkeypatch):
     assert "target" in captured
 
     runtime = SpectrumH3Runtime(
-        SpectrumH3Config(degree=1, max_history=4, warmup_steps=2, tail_actual_steps=0, window_size=2.0)
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            warmup_steps=2,
+            tail_actual_steps=0,
+            window_size=2.0,
+            bootstrap_first_forecast=False,
+        )
     )
     run_id = runtime.start_run(torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]), "sample_euler", supported_sampler=True)
     _wrapped_call(model, runtime, 1.0, 1000.0, x, context, payload)
@@ -212,7 +219,14 @@ def test_forecast_step_skips_every_transformer_block_and_preserves_output_shapes
     model, block = _tiny_model()
     x, context, payload = _inputs(PackedLayout)
     runtime = SpectrumH3Runtime(
-        SpectrumH3Config(degree=1, max_history=4, warmup_steps=2, tail_actual_steps=0, window_size=2.0)
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            warmup_steps=2,
+            tail_actual_steps=0,
+            window_size=2.0,
+            bootstrap_first_forecast=False,
+        )
     )
     run_id = runtime.start_run(torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]), "sample_euler", supported_sampler=True)
     _first, first_decision = _wrapped_call(model, runtime, 1.0, 1000.0, x, context, payload)

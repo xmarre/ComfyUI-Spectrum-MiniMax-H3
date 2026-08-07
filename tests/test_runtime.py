@@ -17,6 +17,7 @@ def _runtime(**overrides):
         "warmup_steps": 2,
         "tail_actual_steps": 0,
         "window_size": 2.0,
+        "bootstrap_first_forecast": False,
     }
     values.update(overrides)
     return SpectrumH3Runtime(SpectrumH3Config(**values))
@@ -95,6 +96,7 @@ def test_preliminary_runtime_defaults():
     assert config.warmup_steps == 1
     assert config.tail_actual_steps == 1
     assert config.history_storage == "system_ram"
+    assert config.bootstrap_first_forecast is True
 
 
 @pytest.mark.parametrize(
@@ -585,6 +587,7 @@ def test_twenty_step_degree_four_schedule_counts(
             warmup_steps=5,
             flex_window=flex_window,
             tail_actual_steps=tail_actual_steps,
+            bootstrap_first_forecast=False,
         )
     )
     runtime.start_run(torch.linspace(1.0, 0.0, 21), "sample_euler", supported_sampler=True)
@@ -702,7 +705,7 @@ def test_twenty_step_res_schedule_refreshes_once_and_enforces_three_step_tail():
         previous_was_forecast = not actual
         runtime.finalize_step(decision["run_id"], decision["step_id"])
 
-    assert forecast_indices == [2, 4, 6, 8, 10, 12, 14, 16]
+    assert forecast_indices == [1, 3, 5, 7, 9, 11, 13, 15]
     assert runtime.stats.actual_steps == 12
     assert runtime.stats.forecast_steps == 8
 
@@ -771,6 +774,6 @@ def test_twenty_step_euler_schedule_refreshes_between_forecasts():
         previous_was_forecast = not actual
         runtime.finalize_step(decision["run_id"], decision["step_id"])
 
-    assert forecast_indices == [2, 4, 6, 8, 10, 12, 14, 16, 18]
+    assert forecast_indices == [1, 3, 5, 7, 9, 11, 13, 15, 17]
     assert runtime.stats.actual_steps == 11
     assert runtime.stats.forecast_steps == 9

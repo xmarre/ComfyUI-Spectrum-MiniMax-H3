@@ -73,7 +73,7 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | `max_history` | `8` | Maximum model-dtype actual feature snapshots retained. |
 | `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
 | `history_storage` | `system_ram` | Stores history in `system_ram`, or in `vram` to avoid transfer overhead when sufficient accelerator memory is free. |
-| `bootstrap_first_forecast` | `false` | Experimental degree-1 one-point hold that can forecast solver step 1 from the actual step-0 hidden feature. |
+| `bootstrap_first_forecast` | `true` | Experimental degree-1 one-point hold that can forecast solver step 1 from the actual step-0 hidden feature. |
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
@@ -89,6 +89,7 @@ warmup_steps = 1
 tail_actual_steps = 1
 max_history = 8
 history_storage = system_ram
+bootstrap_first_forecast = true
 ```
 
 ### Provisional aggressive preset
@@ -103,9 +104,10 @@ warmup_steps = 5
 tail_actual_steps = 1
 max_history = 8
 history_storage = system_ram
+bootstrap_first_forecast = false
 ```
 
-The default degree, warmup, and tail are preliminary pending broader prompt, sampler, and quality coverage. Existing workflows retain their saved input values. The aggressive preset remains an explicit alternative.
+The default degree, warmup, tail, and one-point bootstrap are preliminary pending broader prompt, sampler, and quality coverage. Existing workflows retain their saved input values. The aggressive preset remains an explicit alternative and disables the degree-1-only bootstrap.
 
 ## Adaptive schedule
 
@@ -121,7 +123,7 @@ Schedule counts depend on the sampler safeguards and whether the experimental on
 
 ### Experimental one-point bootstrap
 
-`bootstrap_first_forecast=true` enables an H3-specific zero-order hold for solver step 1. It requires:
+`bootstrap_first_forecast=true` (the preliminary default) enables an H3-specific zero-order hold for solver step 1. It requires:
 
 ```text
 degree = 1

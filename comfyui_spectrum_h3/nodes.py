@@ -25,7 +25,7 @@ class SpectrumApplyMiniMaxH3:
             },
             "optional": {
                 "history_storage": (["system_ram", "vram"], {"default": "system_ram"}),
-                "bootstrap_first_forecast": ("BOOLEAN", {"default": False}),
+                "bootstrap_first_forecast": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -48,7 +48,7 @@ class SpectrumApplyMiniMaxH3:
         max_history,
         debug,
         history_storage="system_ram",
-        bootstrap_first_forecast=False,
+        bootstrap_first_forecast=True,
     ):
         if not enabled:
             return (model,)

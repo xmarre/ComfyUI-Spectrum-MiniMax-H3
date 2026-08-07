@@ -18,7 +18,7 @@ class SpectrumH3Config:
     history_storage: str = "system_ram"
     debug: bool = False
     force_actual: bool = False
-    bootstrap_first_forecast: bool = False
+    bootstrap_first_forecast: bool = True
 
     @property
     def min_fit_points(self) -> int:
@@ -82,4 +82,5 @@ AGGRESSIVE_PRESET = SpectrumH3Config(
     flex_window=3.0,
     warmup_steps=5,
     tail_actual_steps=1,
+    bootstrap_first_forecast=False,
 )
