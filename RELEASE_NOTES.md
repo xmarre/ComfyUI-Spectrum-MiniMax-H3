@@ -1,12 +1,13 @@
-# Spectrum MiniMax H3 v0.1.8
+# Spectrum MiniMax H3 v0.1.9
 
-Corrects the preliminary one-point-bootstrap configuration introduced in v0.1.7.
+Prevents incompatible one-point-bootstrap settings from turning a valid ComfyUI workflow into an execution-time error.
 
 ## Fixed
 
-- Set `bootstrap_first_forecast=true` for new node instances, alongside the existing preliminary defaults `degree=1`, `warmup_steps=1`, and `tail_actual_steps=1`.
-- Align the runtime configuration default, ComfyUI input metadata, and `apply()` fallback so every new or unserialized node path receives the same setting.
-- Keep the explicit degree-4 aggressive preset at `bootstrap_first_forecast=false`, because the one-point bootstrap is valid only for degree 1.
-- Add regression coverage for all four preliminary defaults and for validation of the aggressive preset.
+- When `bootstrap_first_forecast` is enabled with `warmup_steps > 1`, keep the requested warmup and automatically disable only the one-point bootstrap for that execution.
+- Apply the same normalization when `degree != 1`, since the bootstrap is defined only for degree 1.
+- Emit a console warning with the supplied degree and warmup values whenever normalization occurs.
+- Add inline ComfyUI tooltips for `degree`, `warmup_steps`, and `bootstrap_first_forecast`, and document the effective behavior in the README.
+- Preserve strict `SpectrumH3Config` validation for direct programmatic callers outside the ComfyUI node boundary.
 
-Existing workflows retain serialized input values. Deterministic RES continues to enforce its sampler-safe three-step minimum.
+Compatible settings and explicitly disabled bootstrap configurations are unchanged. Normal history-based forecasting continues with the requested degree and warmup values.
