@@ -70,6 +70,7 @@ class _StepState:
     adaptive_recompute: bool
     mode: str
     reason: str
+    bootstrap_forecast: bool = False
     calls: list[_CallState] = field(default_factory=list)
     actual_records: list[_ActualRecord] = field(default_factory=list)
     used_history_rows: set[int] = field(default_factory=set)
@@ -164,7 +165,9 @@ class SpectrumH3Runtime:
         schedule_valid = finite_schedule and math.isfinite(sigma_min) and math.isfinite(sigma_max) and sigma_max > sigma_min
 
         self._run_counter += 1
-        effective_supported = bool(supported_sampler and schedule_valid and total_steps > 0)
+        effective_supported = bool(
+            self.config.enabled and supported_sampler and schedule_valid and total_steps > 0
+        )
         self._run = _RunState(
             run_id=self._run_counter,
             sampler_name=str(sampler_name),
@@ -184,7 +187,9 @@ class SpectrumH3Runtime:
         self._consecutive_forecasts = 0
         self._required_actual_refreshes = 0
         self._disabled = not effective_supported
-        if not supported_sampler:
+        if not self.config.enabled:
+            self._disable_reason = "forecasting disabled by configuration"
+        elif not supported_sampler:
             self._disable_reason = f"sampler {sampler_name!r} is not allowlisted for one-call solver-step tracking"
         elif not schedule_valid:
             self._disable_reason = "supplied sigma schedule is empty, nonfinite, or has no usable range"
@@ -243,6 +248,7 @@ class SpectrumH3Runtime:
         effective_tail = max(self.config.tail_actual_steps, self._run.min_tail_actual_steps)
         tail_start = max(0, self._run.total_steps - effective_tail)
         advances_window = False
+        bootstrap_forecast = False
         if self.config.force_actual:
             actual, reason = True, "forced-actual validation mode"
         elif self._disabled:
@@ -251,6 +257,14 @@ class SpectrumH3Runtime:
             actual, reason = True, "warmup"
         elif step_id >= tail_start:
             actual, reason = True, "final actual tail"
+        elif (
+            self.config.bootstrap_first_forecast
+            and self.config.degree == 1
+            and step_id == 1
+            and self.forecaster.history_length == 1
+        ):
+            actual, reason = False, "one-point bootstrap forecast"
+            bootstrap_forecast = True
         elif not self.forecaster.ready(self.config.min_fit_points):
             actual, reason = True, "insufficient actual history"
         else:
@@ -264,10 +278,12 @@ class SpectrumH3Runtime:
             actual = True
             reason = "post-forecast sampler refresh"
             advances_window = False
+            bootstrap_forecast = False
         if not actual and self._required_actual_refreshes > 0:
             actual = True
             reason = "post-forecast sampler refresh"
             advances_window = False
+            bootstrap_forecast = False
 
         self._step = _StepState(
             step_id=step_id,
@@ -275,6 +291,7 @@ class SpectrumH3Runtime:
             adaptive_recompute=advances_window,
             mode="actual" if actual else "forecast",
             reason=reason,
+            bootstrap_forecast=bootstrap_forecast,
         )
         self._run.next_step_id += 1
         return {
@@ -308,6 +325,7 @@ class SpectrumH3Runtime:
             raise ForecastRetryActual(reason)
         step.mode = "actual"
         step.reason = reason
+        step.bootstrap_forecast = False
         step.fallback = True
 
     def fallback_current_step(self, run_id: int, step_id: int, reason: str) -> None:
@@ -400,15 +418,28 @@ class SpectrumH3Runtime:
         if history_shape is None or tuple(call.expected_shape[1:]) != tuple(history_shape[1:]):
             self._fallback_or_retry(step, "target audio/video row count or hidden width changed")
             return None
+        if step.bootstrap_forecast and self.forecaster.history_length != 1:
+            self._fallback_or_retry(
+                step,
+                "one-point bootstrap forecast requires exactly one actual history entry",
+            )
+            return None
         started = time.perf_counter()
         try:
-            predicted = self.forecaster.predict(
-                step.coordinate,
-                self.config.blend_weight,
-                rows=positions,
-                device=device,
-                dtype=dtype,
-            )
+            if step.bootstrap_forecast:
+                predicted = self.forecaster.predict_one_point_hold(
+                    rows=positions,
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                predicted = self.forecaster.predict(
+                    step.coordinate,
+                    self.config.blend_weight,
+                    rows=positions,
+                    device=device,
+                    dtype=dtype,
+                )
         finally:
             self.stats.forecast_prediction_seconds += time.perf_counter() - started
         if tuple(predicted.shape) != call.expected_shape:
@@ -422,6 +453,7 @@ class SpectrumH3Runtime:
         step = self._require_step(run_id, step_id)
         step.mode = "actual"
         step.reason = str(reason)
+        step.bootstrap_forecast = False
         step.fallback = True
         step.calls.clear()
         step.actual_records.clear()

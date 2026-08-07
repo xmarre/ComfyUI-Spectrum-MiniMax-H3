@@ -241,12 +241,38 @@ class HistoryWeightForecaster:
     ) -> torch.Tensor:
         if self._feature_shape is None or self._feature_dtype is None:
             raise RuntimeError("Spectrum forecaster has no actual history")
+        weights = self.combined_weights(coordinate, blend_weight)
+        return self._predict_with_weights(weights, rows=rows, device=device, dtype=dtype)
+
+    def predict_one_point_hold(
+        self,
+        *,
+        rows: Sequence[int] | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        if len(self._history) != 1:
+            raise RuntimeError("one-point hold requires exactly one actual history entry")
+        weights = torch.ones(1, dtype=torch.float32)
+        return self._predict_with_weights(weights, rows=rows, device=device, dtype=dtype)
+
+    def _predict_with_weights(
+        self,
+        weights: torch.Tensor,
+        *,
+        rows: Sequence[int] | None,
+        device: torch.device | str | None,
+        dtype: torch.dtype | None,
+    ) -> torch.Tensor:
+        if self._feature_shape is None or self._feature_dtype is None:
+            raise RuntimeError("Spectrum forecaster has no actual history")
+        if weights.ndim != 1 or weights.numel() != len(self._history):
+            raise ValueError("prediction weights must match actual history length")
         resolved_rows = self._normalize_rows(rows)
         target_device = torch.device(device or "cpu")
         target_dtype = dtype or self._feature_dtype
         if not target_dtype.is_floating_point:
             raise ValueError("prediction dtype must be floating point")
-        weights = self.combined_weights(coordinate, blend_weight)
         weight_scalars = tuple(float(weight) for weight in weights.tolist())
 
         tail_shape = self._feature_shape[1:]

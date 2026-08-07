@@ -40,6 +40,17 @@ class _CountingBlock(torch.nn.Module):
         return x + t_emb[0].mean().to(x.dtype) * 0.01
 
 
+class _CountingFinalLayer(torch.nn.Module):
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+        self.calls = 0
+
+    def forward(self, *args, **kwargs):
+        self.calls += 1
+        return self.inner(*args, **kwargs)
+
+
 def _tiny_model():
     _, MiniMaxH3Model, _ = _native_imports()
     torch.manual_seed(3)
@@ -213,5 +224,44 @@ def test_forecast_step_skips_every_transformer_block_and_preserves_output_shapes
     assert block.calls == calls_before
     assert [part.shape for part in forecast] == [part.shape for part in second]
     assert [part.dtype for part in forecast] == [part.dtype for part in second]
+    assert all(torch.isfinite(part).all() for part in forecast)
+    runtime.end_run(run_id)
+
+
+def test_bootstrap_forecast_skips_transformers_and_runs_the_current_output_head():
+    _, _, PackedLayout = _native_imports()
+    model, block = _tiny_model()
+    final_layer = _CountingFinalLayer(model.final_layer)
+    model.final_layer = final_layer
+    x, context, payload = _inputs(PackedLayout)
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            warmup_steps=1,
+            tail_actual_steps=0,
+            window_size=2.0,
+            bootstrap_first_forecast=True,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+
+    actual, actual_decision = _wrapped_call(model, runtime, 1.0, 1000.0, x, context, payload)
+    block_calls = block.calls
+    head_calls = final_layer.calls
+    forecast, forecast_decision = _wrapped_call(model, runtime, 0.5, 500.0, x, context, payload)
+
+    assert actual_decision["actual"]
+    assert not forecast_decision["actual"]
+    assert forecast_decision["reason"] == "one-point bootstrap forecast"
+    assert block.calls == block_calls
+    assert final_layer.calls == head_calls + 1
+    assert [part.shape for part in forecast] == [part.shape for part in actual]
     assert all(torch.isfinite(part).all() for part in forecast)
     runtime.end_run(run_id)

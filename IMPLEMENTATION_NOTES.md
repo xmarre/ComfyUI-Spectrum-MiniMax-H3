@@ -45,6 +45,8 @@ Solver-step IDs are assigned by a `PREDICT_NOISE` wrapper inside an `OUTER_SAMPL
 
 Coordinates are derived from the actual supplied sigma sequence. Evaluated sigma values are affinely normalized between the run's evaluated minimum and maximum into `[-1, 1]`; no fixed step count is assumed.
 
+The optional `bootstrap_first_forecast` path is evaluated after configured warmup and final-tail enforcement and before ordinary forecaster readiness. It is eligible only at solver step 1 with degree 1 and exactly one actual history entry. The step carries an explicit bootstrap flag through the existing branch-label transaction; sampler refresh limits and whole-step retry semantics are identical to an ordinary forecast. A successful bootstrap is counted only at finalization and requires the following actual solver step, while aborting it rolls the solver-step ID back without changing forecast or refresh accounting.
+
 Native EasyCache and LazyCache may terminate a diffusion-model wrapper chain without an H3 call. Their shared `transformer_options["easycache"]` holder is therefore detected before Spectrum opens a run transaction. Spectrum remains inactive for that run and the cache owns the acceleration path.
 
 ## Forecast memory model
@@ -54,5 +56,7 @@ The forecaster stores at most `max_history` detached model-dtype snapshots in th
 `w(t*) = phi(t*) (Phi^T Phi + lambda I)^-1 Phi^T`
 
 Spectral and two-point linear weights are combined before feature streaming. Prediction reads one bounded chunk from one history snapshot at a time, accumulates that chunk in FP32 on the output device, and writes the final model-dtype feature. No persistent full-feature FP32 right-hand side or coefficient tensor is created.
+
+The one-point bootstrap bypasses spectral and linear weight construction and supplies the same chunk engine with the explicit weight `[1.0]`. It requires exactly one history entry, performs no Chebyshev/ridge factorization, and does not modify history or ordinary `ready()` semantics. The held object remains the compact pre-`FinalLayer` `[target audio | target video]` hidden feature; current-step output-head conditioning and reconstruction still run normally.
 
 Native H3 lays out target rows as one contiguous `[audio | video]` packed tail. Actual capture archives that tail without materializing an audio/video concatenation. System-RAM mode copies the view directly to CPU. VRAM mode must clone it into compact owned device storage, because retaining the view would pin the complete final-block hidden tensor. When one model call contains the complete canonical branch set, the archived tensor transfers directly into forecaster history; split conditional calls retain the transactional canonicalization path and assemble rows only after all calls complete. Debug summaries expose the storage location and wall-clock archive, history-update, and forecast-prediction counters. Device-to-host archiving can synchronize outstanding CUDA work, while device cloning can be asynchronously enqueued.

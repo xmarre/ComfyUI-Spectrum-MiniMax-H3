@@ -59,9 +59,331 @@ def _forecast_step(runtime, timestep, labels=LABEL):
     return prediction
 
 
+def _complete_step(runtime, timestep, *, labels=LABEL):
+    decision = runtime.begin_step(torch.tensor([timestep]))
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=labels,
+        expected_shape=(len(labels), 3, 4),
+    )
+    if actual:
+        runtime.observe_actual(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            torch.full((len(labels), 3, 4), float(decision["step_id"])),
+        )
+    else:
+        prediction = runtime.predict(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert prediction is not None
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+    return decision
+
+
 def test_default_tail_actual_steps_is_one():
     assert SpectrumH3Config().tail_actual_steps == 1
     assert SpectrumH3Config().history_storage == "system_ram"
+
+
+@pytest.mark.parametrize(
+    ("steps", "expected_actual", "expected_forecast"),
+    [
+        (17, [0, 2, 4, 6, 8, 10, 12, 14, 16], [1, 3, 5, 7, 9, 11, 13, 15]),
+        (20, [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 19], [1, 3, 5, 7, 9, 11, 13, 15, 17]),
+    ],
+)
+def test_bootstrap_degree_one_euler_schedule(steps, expected_actual, expected_forecast):
+    runtime = _runtime(
+        bootstrap_first_forecast=True,
+        warmup_steps=1,
+        tail_actual_steps=1,
+        window_size=2.0,
+        flex_window=0.75,
+    )
+    runtime.start_run(
+        torch.linspace(1.0, 0.0, steps + 1),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+
+    decisions = [
+        _complete_step(runtime, float(sigma))
+        for sigma in torch.linspace(1.0, 1.0 / steps, steps)
+    ]
+    actual_indices = [decision["step_id"] for decision in decisions if decision["actual"]]
+    forecast_indices = [decision["step_id"] for decision in decisions if not decision["actual"]]
+
+    assert actual_indices == expected_actual
+    assert forecast_indices == expected_forecast
+    assert runtime.stats.actual_steps == len(expected_actual)
+    assert runtime.stats.forecast_steps == len(expected_forecast)
+    assert decisions[1]["reason"] == "one-point bootstrap forecast"
+    assert decisions[2]["reason"] == "insufficient actual history"
+
+
+def test_max_consecutive_forecasts_forces_a_correction_after_bootstrap_scheduling():
+    runtime = _runtime(
+        bootstrap_first_forecast=True,
+        warmup_steps=1,
+        tail_actual_steps=0,
+        window_size=4.0,
+        flex_window=0.0,
+    )
+    runtime.start_run(
+        torch.linspace(1.0, 0.0, 6),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=0,
+    )
+
+    decisions = [_complete_step(runtime, float(sigma)) for sigma in torch.linspace(1.0, 0.2, 5)]
+
+    assert [decision["actual"] for decision in decisions] == [True, False, True, False, True]
+    assert decisions[4]["reason"] == "post-forecast sampler refresh"
+
+
+def test_disabling_bootstrap_preserves_degree_one_startup_schedule():
+    runtime = _runtime(warmup_steps=1, bootstrap_first_forecast=False)
+    runtime.start_run(
+        torch.linspace(1.0, 0.0, 5),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+
+    decisions = [_complete_step(runtime, float(sigma)) for sigma in torch.linspace(1.0, 0.25, 4)]
+
+    assert [decision["actual"] for decision in decisions] == [True, True, False, True]
+    assert decisions[1]["reason"] == "insufficient actual history"
+
+
+def test_final_tail_precedes_bootstrap_on_a_two_step_run():
+    runtime = _runtime(
+        bootstrap_first_forecast=True,
+        warmup_steps=1,
+        tail_actual_steps=1,
+    )
+    runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+
+    _complete_step(runtime, 1.0)
+    decision = _complete_step(runtime, 0.5)
+
+    assert decision["actual"]
+    assert decision["reason"] == "final actual tail"
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "supported_sampler", "expected_reason"),
+    [
+        ({"force_actual": True}, True, "forced-actual validation mode"),
+        ({"enabled": False}, True, "forecasting disabled by configuration"),
+        ({}, False, "not allowlisted"),
+    ],
+)
+def test_native_path_precedence_overrides_bootstrap(
+    config_overrides,
+    supported_sampler,
+    expected_reason,
+):
+    runtime = _runtime(
+        bootstrap_first_forecast=True,
+        warmup_steps=1,
+        **config_overrides,
+    )
+    runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_euler" if supported_sampler else "sample_heun",
+        supported_sampler=supported_sampler,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+
+    _complete_step(runtime, 1.0)
+    second = runtime.begin_step(torch.tensor([0.5]))
+
+    assert second["actual"]
+    assert expected_reason in second["reason"]
+    runtime.abort_step(second["run_id"], second["step_id"])
+
+
+def test_bootstrap_reordered_branch_calls_hold_the_matching_canonical_rows():
+    positive = ((0, "positive"),)
+    negative = ((1, "negative"),)
+    both = (negative[0], positive[0])
+    feature = torch.stack((torch.full((3, 4), -2.0), torch.full((3, 4), 3.0)))
+    runtime = _runtime(bootstrap_first_forecast=True, warmup_steps=1)
+    runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    _actual_step(runtime, 1.0, [(both, feature)])
+
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    predictions = {}
+    for labels in (positive, negative):
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=labels,
+            expected_shape=(1, 3, 4),
+        )
+        assert not actual
+        predictions[labels] = runtime.predict(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    torch.testing.assert_close(predictions[positive], torch.full((1, 3, 4), 3.0))
+    torch.testing.assert_close(predictions[negative], torch.full((1, 3, 4), -2.0))
+    assert runtime.forecaster.history_length == 1
+    assert runtime.forecaster.factorization_count == 0
+
+
+def test_incomplete_bootstrap_forecast_retries_the_whole_step_as_actual():
+    labels = ((0, "a"), (1, "b"))
+    runtime = _runtime(bootstrap_first_forecast=True, warmup_steps=1)
+    runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    _actual_step(runtime, 1.0, [(labels, torch.ones(2, 3, 4))])
+
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=(labels[0],),
+        expected_shape=(1, 3, 4),
+    )
+    assert not actual
+    assert runtime.predict(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    ) is not None
+    with pytest.raises(ForecastRetryActual, match="incomplete"):
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    runtime.prepare_actual_retry(decision["run_id"], decision["step_id"], "incomplete branch set")
+    for label in reversed(labels):
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=(label,),
+            expected_shape=(1, 3, 4),
+        )
+        assert actual
+        runtime.observe_actual(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            torch.full((1, 3, 4), 2.0),
+        )
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert runtime.stats.forecast_fallbacks == 1
+    assert runtime.stats.actual_steps == 2
+    assert runtime.stats.forecast_steps == 0
+    assert runtime.forecaster.history_length == 2
+
+
+def test_aborted_bootstrap_prediction_retries_step_one_without_scheduler_corruption():
+    runtime = _runtime(bootstrap_first_forecast=True, warmup_steps=1)
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    _actual_step(runtime, 1.0, [(LABEL, torch.ones(1, 3, 4))])
+
+    first = runtime.begin_step(torch.tensor([0.5]))
+    call_id, _ = runtime.begin_model_call(
+        first["run_id"],
+        first["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    runtime.predict(
+        first["run_id"],
+        first["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    runtime.abort_step(run_id, first["step_id"])
+
+    repeated = _complete_step(runtime, 0.5)
+
+    assert repeated["step_id"] == first["step_id"] == 1
+    assert repeated["reason"] == "one-point bootstrap forecast"
+    assert runtime.stats.actual_steps == 1
+    assert runtime.stats.forecast_steps == 1
+    assert runtime.forecaster.history_length == 1
+
+
+def test_inconsistent_bootstrap_history_uses_native_fallback():
+    runtime = _runtime(bootstrap_first_forecast=True, warmup_steps=1)
+    runtime.start_run(torch.tensor([1.0, 0.5, 0.0]), "sample_euler", supported_sampler=True)
+    _actual_step(runtime, 1.0, [(LABEL, torch.ones(1, 3, 4))])
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    runtime.forecaster.update(0.75, torch.full((1, 3, 4), 2.0))
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert not actual
+
+    prediction = runtime.predict(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert prediction is None
+    assert runtime._step.mode == "actual"
+    assert not runtime._step.bootstrap_forecast
+    assert "requires exactly one actual history entry" in runtime.disabled_reason
 
 
 def test_scheduler_counts_warmup_forecasts_recomputes_and_window_growth():

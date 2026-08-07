@@ -73,6 +73,7 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | `max_history` | `8` | Maximum model-dtype actual feature snapshots retained. |
 | `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
 | `history_storage` | `system_ram` | Stores history in `system_ram`, or in `vram` to avoid transfer overhead when sufficient accelerator memory is free. |
+| `bootstrap_first_forecast` | `false` | Experimental degree-1 one-point hold that can forecast solver step 1 from the actual step-0 hidden feature. |
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
@@ -124,6 +125,30 @@ For a 20-step run with the conservative settings, the sampler-aware scheduler cu
 | RES multistep / CFG++ | 14 | 6 | `5, 7, 9, 11, 13, 15` | 30% |
 
 These counts are solver-step counts. CFG can execute separate conditional and unconditional H3 transformer calls on each actual solver step. End-to-end wall-clock speedup depends on output-head cost, CPU transfers, model offload, references, CFG branching, latent size, and hardware.
+
+### Experimental one-point bootstrap
+
+`bootstrap_first_forecast=true` enables an H3-specific zero-order hold for solver step 1. It requires:
+
+```text
+degree = 1
+warmup_steps <= 1
+```
+
+After actual step 0, the bootstrap reuses that step's packed final-transformer-block hidden feature as the prediction for step 1. The current step still computes its native H3 timestep conditioning, runs `FinalLayer`, performs the video and audio projections and reconstruction, and applies the current sigma-dependent audio processing. It does not copy the previous step's final video or audio output.
+
+This bootstrap is separate from polynomial regression. Ordinary degree-1 forecasting still requires at least two actual history entries, no factorization is attempted with one entry, and a bootstrap result is never inserted into actual history. Consequently, step 2 is actual because history still contains only step 0; after step 2, ordinary degree-1 forecasts can proceed.
+
+With Euler, `window_size=2.0`, `flex_window=0.75`, `tail_actual_steps=1`, and `max_consecutive_forecasts=1`, the intended schedules are:
+
+| Steps | Schedule | Actual indices | Forecast indices | Totals |
+|---:|---|---|---|---|
+| 17 | `A F A F A F A F A F A F A F A F A` | `0, 2, 4, 6, 8, 10, 12, 14, 16` | `1, 3, 5, 7, 9, 11, 13, 15` | 9 actual / 8 forecast |
+| 20 | `A F A F A F A F A F A F A F A F A F A A` | `0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 19` | `1, 3, 5, 7, 9, 11, 13, 15, 17` | 11 actual / 9 forecast |
+
+The second actual step at the end of the 20-step schedule preserves the configured native tail after the mandatory post-forecast refresh. Force-actual mode, unsupported or disabled forecasting, warmup, the final actual tail, sampler refresh requirements, and transactional fallbacks all retain precedence over the bootstrap.
+
+This option changes the denoising trajectory and is experimental. Validate video and audio with exact-seed Spectrum-on/Spectrum-off comparisons for the intended prompt, checkpoint, sampler, resolution, duration, and branch topology. It is not lossless, output-equivalent, or established as universally safe.
 
 ## Supported samplers
 
