@@ -176,7 +176,7 @@ def test_predict_noise_passthrough_survives_a_downstream_model_bypass(caplog):
         runtime.end_run(run_id)
 
 
-def test_default_offline_outer_sample_restarts_from_cloned_inputs_and_callbacks_only_replay():
+def test_default_offline_outer_sample_reports_both_passes_and_callbacks_only_replay(monkeypatch):
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(
             degree=1,
@@ -193,8 +193,29 @@ def test_default_offline_outer_sample_restarts_from_cloned_inputs_and_callbacks_
     )
     starts = []
     callback_arguments = []
+    progress_totals = []
+    progress_updates = []
     topology = (("tiny", 1),)
     labels = ((0, "positive"),)
+
+    class ProgressBar:
+        def __init__(self, total):
+            progress_totals.append(total)
+
+        def update_absolute(self, value, total=None, preview=None):
+            progress_updates.append((value, total, preview))
+
+    fake_utils = ModuleType("comfy.utils")
+    fake_utils.ProgressBar = ProgressBar
+    fake_comfy = ModuleType("comfy")
+    fake_comfy.utils = fake_utils
+    monkeypatch.setitem(sys.modules, "comfy", fake_comfy)
+    monkeypatch.setitem(sys.modules, "comfy.utils", fake_utils)
+    callback_progress = ProgressBar(2)
+
+    def callback(*args):
+        callback_arguments.append(args)
+        callback_progress.update_absolute(args[0] + 1, args[3])
 
     class Executor:
         class_obj = guider
@@ -213,7 +234,15 @@ def test_default_offline_outer_sample_restarts_from_cloned_inputs_and_callbacks_
             latent_shapes=None,
         ):
             assert guider.conds["positive"][0]["nested"]["marker"] == "original"
-            starts.append((runtime.offline_phase, run_noise.clone(), run_latent.clone(), run_callback))
+            starts.append(
+                (
+                    runtime.offline_phase,
+                    run_noise.clone(),
+                    run_latent.clone(),
+                    run_callback,
+                    _disable_pbar,
+                )
+            )
             for index, sigma in enumerate(run_sigmas[:-1]):
                 decision = runtime.begin_step(sigma)
                 call_id, actual = runtime.begin_model_call(
@@ -255,19 +284,87 @@ def test_default_offline_outer_sample_restarts_from_cloned_inputs_and_callbacks_
         latent,
         _sampler("sample_euler"),
         sigmas,
-        callback=lambda *args: callback_arguments.append(args),
+        callback=callback,
         seed=7,
         latent_shapes=((1,),),
     )
 
     assert [phase for phase, *_rest in starts] == ["first_pass", "replay"]
-    assert starts[0][3] is None
+    assert starts[0][3] is not None
     assert starts[1][3] is not None
+    assert [entry[4] for entry in starts] == [False, True]
     torch.testing.assert_close(starts[0][1], torch.ones(1))
     torch.testing.assert_close(starts[1][1], torch.ones(1))
     torch.testing.assert_close(starts[1][2], torch.full((1,), 2.0))
+    assert progress_totals == [2, 4]
+    assert progress_updates == [
+        (1, 4, None),
+        (2, 4, None),
+        (3, 4, None),
+        (4, 4, None),
+    ]
     assert len(callback_arguments) == 2
+    assert [(args[0], args[3]) for args in callback_arguments] == [(2, 4), (3, 4)]
     torch.testing.assert_close(result, torch.full((1,), 3.0))
+    assert runtime.active_run_id is None
+    assert runtime.offline_archive is None
+
+
+def test_offline_progress_finishes_when_capture_cannot_be_replayed(monkeypatch):
+    runtime = SpectrumH3Runtime(SpectrumH3Config())
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}},
+        conds={},
+    )
+    progress_updates = []
+    callback_arguments = []
+
+    class ProgressBar:
+        def __init__(self, total):
+            assert total == 4
+
+        def update_absolute(self, value, total=None, preview=None):
+            progress_updates.append((value, total, preview))
+
+    fake_utils = ModuleType("comfy.utils")
+    fake_utils.ProgressBar = ProgressBar
+    fake_comfy = ModuleType("comfy")
+    fake_comfy.utils = fake_utils
+    monkeypatch.setitem(sys.modules, "comfy", fake_comfy)
+    monkeypatch.setitem(sys.modules, "comfy.utils", fake_utils)
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(
+            self,
+            run_noise,
+            run_latent,
+            _sampler,
+            _sigmas,
+            _mask,
+            run_callback,
+            _disable_pbar,
+            _seed,
+            *,
+            latent_shapes=None,
+        ):
+            run_callback(0, run_noise, run_latent, 2)
+            return "valid-first-pass"
+
+    result = outer_sample_wrapper(
+        Executor(),
+        torch.ones(1),
+        torch.zeros(1),
+        _sampler("sample_euler"),
+        torch.tensor([1.0, 0.5, 0.0]),
+        callback=lambda *args: callback_arguments.append(args),
+        seed=7,
+    )
+
+    assert result == "valid-first-pass"
+    assert progress_updates == [(1, 4, None), (4, 4, None)]
+    assert callback_arguments == []
     assert runtime.active_run_id is None
     assert runtime.offline_archive is None
 

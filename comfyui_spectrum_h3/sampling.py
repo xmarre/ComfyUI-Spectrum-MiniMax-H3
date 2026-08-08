@@ -80,6 +80,32 @@ def _copy_condition_structure(value: Any) -> Any:
     return value
 
 
+def _offline_progress_callbacks(callback, total_steps: int):
+    """Report both passes while keeping previews and callback side effects replay-only."""
+    if callback is None or total_steps <= 0:
+        return None, callback, None
+
+    import comfy.utils
+
+    total_work = total_steps * 2
+    progress = comfy.utils.ProgressBar(total_work)
+    replay_finished = False
+
+    def capture_callback(step, _x0, _x, _pass_steps):
+        progress.update_absolute(step + 1, total_work)
+
+    def replay_callback(step, x0, x, _pass_steps):
+        nonlocal replay_finished
+        callback(total_steps + step, x0, x, total_work)
+        replay_finished = step + 1 >= total_steps
+
+    def complete_progress():
+        if not replay_finished:
+            progress.update_absolute(total_work, total_work)
+
+    return capture_callback, replay_callback, complete_progress
+
+
 def copy_model_options_with_step(
     model_options: dict[str, Any] | None,
     runtime: SpectrumH3Runtime,
@@ -249,19 +275,26 @@ def outer_sample_wrapper(
     replay_sigmas = sigmas.detach().clone()
     replay_mask = denoise_mask.detach().clone() if torch.is_tensor(denoise_mask) else denoise_mask
     initial_conds = _copy_condition_structure(guider.conds) if hasattr(guider, "conds") else None
-    runtime.begin_offline_capture(total_steps=max(0, sigmas.numel() - 1), sampler_name=name)
+    offline_steps = max(0, sigmas.numel() - 1)
+    capture_callback, replay_callback, complete_progress = _offline_progress_callbacks(
+        callback,
+        offline_steps,
+    )
+    runtime.begin_offline_capture(total_steps=offline_steps, sampler_name=name)
     try:
         first_result, capture_complete = execute_run(
             noise,
             latent_image,
             sigmas,
             denoise_mask,
-            None,
-            True,
+            capture_callback,
+            disable_pbar,
             phase="offline_first_pass",
             complete_offline_capture=True,
         )
         if not capture_complete:
+            if complete_progress is not None:
+                complete_progress()
             reason = (
                 runtime.offline_archive.failure_reason
                 if runtime.offline_archive is not None
@@ -285,11 +318,15 @@ def outer_sample_wrapper(
                 replay_latent,
                 replay_sigmas,
                 replay_mask,
-                callback,
-                disable_pbar,
+                replay_callback,
+                True,
                 phase="offline_replay",
             )
+            if complete_progress is not None:
+                complete_progress()
         except OfflineReplayAbort as exc:
+            if complete_progress is not None:
+                complete_progress()
             LOG.warning(
                 "Spectrum H3 offline replay aborted; returning the valid first-pass result: %s",
                 exc,
