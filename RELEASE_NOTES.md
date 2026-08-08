@@ -1,21 +1,18 @@
-# Spectrum MiniMax H3 v0.2.2
+# Spectrum MiniMax H3 v0.2.3
 
-Fixes ComfyUI progress reporting for the default offline smoothing replay path.
+Restores installation through ComfyUI Manager's default channel.
 
-## Progress reporting
+## Registry packaging
 
-- The compute-heavy capture pass now reports live progress to ComfyUI instead of running with no visible progress bar.
-- Capture and replay share one continuous two-pass range. For a 20-step sampler run, capture reports steps 1–20 and replay completes steps 21–40.
-- The normal terminal sampler bar follows capture. The transformer-free replay suppresses its own terminal bar, avoiding a second bar that appears and completes almost instantly.
-- External callbacks and previews remain replay-only, so accepted output side effects still occur once per logical sampler step.
-- If capture cannot be replayed or replay aborts recoverably, the combined progress range is completed before the valid first-pass result is returned.
+- Adds a root `.comfyignore` so Comfy Registry packages contain the runtime node and exclude `.github/` workflows and `tests/`.
+- Earlier Registry versions were automatically flagged because the published archives included development-only code that reads the test environment, launches an isolated test subprocess, and reads the package version in the release workflow.
+- The runtime node contains none of those flagged operations; they were packaging false positives from files that are never imported or executed by ComfyUI.
 
 ## Compatibility
 
-This release changes progress reporting only. Node inputs, saved workflows, sampling schedules, generated-result handling, and the v0.2.1 audio-quality defaults are unchanged.
+This release changes Registry packaging only. Node code, inputs, saved workflows, sampling behavior, generated results, and the v0.2.2 progress reporting fix are unchanged.
 
 ## Validation
 
-- Confirmed in a live ComfyUI GPU generation: progress is visible during capture and completes through replay.
-- 173 tests pass against ComfyUI commit `00d02f2`; the two CUDA-only tests are skipped in the CPU test environment.
-- Tests cover successful capture/replay progress, replay-only callback forwarding, incomplete capture, recoverable replay abort, result retention, and runtime cleanup.
+- Verified the Registry archive file set excludes `.github/` and `tests/` while retaining every runtime Python module, `pyproject.toml`, README, and license file.
+- Verified the excluded files cover every finding reported by the Comfy Registry scanner for v0.2.1.
