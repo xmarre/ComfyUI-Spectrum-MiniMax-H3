@@ -11,6 +11,7 @@ from comfyui_spectrum_h3.runtime import OfflineReplayAbort, SpectrumH3Runtime
 from comfyui_spectrum_h3.sampling import (
     BINDING_KEY,
     SpectrumH3Binding,
+    install_sampler_wrappers,
     max_consecutive_forecasts,
     min_actual_steps_after_forecast,
     min_tail_actual_steps,
@@ -93,6 +94,79 @@ def test_unsupported_sampler_has_no_forecast_streak_policy():
     assert max_consecutive_forecasts(sampler) is None
     assert min_actual_steps_after_forecast(sampler) == 0
     assert min_tail_actual_steps(sampler) == 0
+
+
+class _WrapperTestModel:
+    def __init__(self, outer_wrappers):
+        self.model_options = {}
+        self.wrappers = {"outer_sample": outer_wrappers}
+        self.callbacks = {}
+
+    def get_wrappers(self, wrapper_type, key):
+        return self.wrappers.get(wrapper_type, {}).get(key, [])
+
+    def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+        self.wrappers.setdefault(wrapper_type, {}).setdefault(key, []).append(wrapper)
+
+    def get_callbacks(self, callback_type, key):
+        return self.callbacks.get(callback_type, {}).get(key, [])
+
+    def add_callback_with_key(self, callback_type, key, callback):
+        self.callbacks.setdefault(callback_type, {}).setdefault(key, []).append(callback)
+
+
+def _install_with_fake_patcher_extension(monkeypatch, model, runtime):
+    fake_extension = ModuleType("comfy.patcher_extension")
+    fake_extension.WrappersMP = SimpleNamespace(
+        OUTER_SAMPLE="outer_sample",
+        PREDICT_NOISE="predict_noise",
+        SAMPLER_SAMPLE="sampler_sample",
+    )
+    fake_extension.CallbacksMP = SimpleNamespace(ON_CLONE="on_clone")
+    fake_comfy = ModuleType("comfy")
+    fake_comfy.patcher_extension = fake_extension
+    monkeypatch.setitem(sys.modules, "comfy", fake_comfy)
+    monkeypatch.setitem(sys.modules, "comfy.patcher_extension", fake_extension)
+    install_sampler_wrappers(model, runtime)
+
+
+def test_offline_install_places_kj_preview_inside_spectrum_wrapper(monkeypatch):
+    kj_preview = object()
+    upstream = object()
+    model = _WrapperTestModel(
+        {
+            "kj_preview_override": [kj_preview],
+            "upstream_sampling_wrapper": [upstream],
+        }
+    )
+
+    _install_with_fake_patcher_extension(monkeypatch, model, SpectrumH3Runtime(SpectrumH3Config()))
+
+    assert list(model.wrappers["outer_sample"]) == [
+        "upstream_sampling_wrapper",
+        "spectrum_minimax_h3",
+        "kj_preview_override",
+    ]
+    assert model.wrappers["outer_sample"]["kj_preview_override"] == [kj_preview]
+    assert model.wrappers["outer_sample"]["upstream_sampling_wrapper"] == [upstream]
+
+
+def test_single_pass_install_preserves_kj_preview_wrapper_order(monkeypatch):
+    model = _WrapperTestModel(
+        {
+            "kj_preview_override": [object()],
+            "upstream_sampling_wrapper": [object()],
+        }
+    )
+    runtime = SpectrumH3Runtime(SpectrumH3Config(offline_smoothing_replay=False))
+
+    _install_with_fake_patcher_extension(monkeypatch, model, runtime)
+
+    assert list(model.wrappers["outer_sample"]) == [
+        "kj_preview_override",
+        "upstream_sampling_wrapper",
+        "spectrum_minimax_h3",
+    ]
 
 
 def test_easycache_on_same_model_bypasses_spectrum_run(caplog):

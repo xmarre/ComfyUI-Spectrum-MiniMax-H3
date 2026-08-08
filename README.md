@@ -83,6 +83,12 @@ MiniMax H3 model loader
 
 The node accepts and returns `MODEL`. Disabled mode returns the original model object unchanged. Enabled mode clones the model and rejects anything other than the exact native MiniMax H3 model type with a precise error.
 
+### Live previews with MiniMax H3 TAE
+
+[Kijai's MiniMax H3 TAE](https://huggingface.co/Kijai/MiniMax-H3-TAE) currently requires KJNodes' `Model Preview Override`. With offline smoothing enabled, Spectrum keeps that observational wrapper inside its two-pass sampler wrapper regardless of whether the preview node appears before or after Spectrum in the model chain. The KJ preview widget therefore updates during the compute-heavy capture pass and again during replay. Capture frames show the provisional local-only trajectory; replay frames show the accepted smoothed trajectory.
+
+Other external sampler callbacks remain replay-only. Spectrum does not invoke arbitrary callback side effects twice merely to obtain a preview.
+
 ## Parameters
 
 | Parameter | Current default | Meaning |

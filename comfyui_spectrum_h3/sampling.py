@@ -20,6 +20,7 @@ COORDINATE_KEY = "spectrum_h3_coordinate"
 ACTUAL_KEY = "spectrum_h3_actual"
 REASON_KEY = "spectrum_h3_reason"
 WRAPPER_KEY = "spectrum_minimax_h3"
+KJ_PREVIEW_WRAPPER_KEY = "kj_preview_override"
 
 SUPPORTED_SINGLE_CALL_SAMPLERS = frozenset(
     {
@@ -494,6 +495,27 @@ def model_clone_callback(source_model: Any, cloned_model: Any) -> None:
     )
 
 
+def _place_kj_preview_inside_offline_wrapper(model: Any, outer_wrapper_type: str) -> None:
+    """Ensure KJ's observational preview wrapper is entered once for each offline pass."""
+    outer_wrappers = (getattr(model, "wrappers", None) or {}).get(outer_wrapper_type)
+    if not isinstance(outer_wrappers, dict):
+        return
+    keys = list(outer_wrappers)
+    if KJ_PREVIEW_WRAPPER_KEY not in outer_wrappers or WRAPPER_KEY not in outer_wrappers:
+        return
+    if keys.index(KJ_PREVIEW_WRAPPER_KEY) > keys.index(WRAPPER_KEY):
+        return
+
+    preview_wrappers = outer_wrappers.pop(KJ_PREVIEW_WRAPPER_KEY)
+    reordered = {}
+    for key, wrappers in outer_wrappers.items():
+        reordered[key] = wrappers
+        if key == WRAPPER_KEY:
+            reordered[KJ_PREVIEW_WRAPPER_KEY] = preview_wrappers
+    outer_wrappers.clear()
+    outer_wrappers.update(reordered)
+
+
 def install_sampler_wrappers(model: Any, runtime: SpectrumH3Runtime) -> None:
     import comfy.patcher_extension
 
@@ -506,6 +528,8 @@ def install_sampler_wrappers(model: Any, runtime: SpectrumH3Runtime) -> None:
     existing_outer = model.get_wrappers(wrapper_types.OUTER_SAMPLE, WRAPPER_KEY)
     if not existing_outer:
         model.add_wrapper_with_key(wrapper_types.OUTER_SAMPLE, WRAPPER_KEY, outer_sample_wrapper)
+    if runtime.config.offline_smoothing_replay:
+        _place_kj_preview_inside_offline_wrapper(model, wrapper_types.OUTER_SAMPLE)
     existing_predict = model.get_wrappers(wrapper_types.PREDICT_NOISE, WRAPPER_KEY)
     if not existing_predict:
         model.add_wrapper_with_key(wrapper_types.PREDICT_NOISE, WRAPPER_KEY, predict_noise_wrapper)
