@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from comfyui_spectrum_h3.config import SpectrumH3Config
-from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
+from comfyui_spectrum_h3.runtime import OfflineReplayAbort, SpectrumH3Runtime
 from comfyui_spectrum_h3.sampling import (
     BINDING_KEY,
     SpectrumH3Binding,
@@ -364,6 +364,87 @@ def test_offline_progress_finishes_when_capture_cannot_be_replayed(monkeypatch):
 
     assert result == "valid-first-pass"
     assert progress_updates == [(1, 4, None), (4, 4, None)]
+    assert callback_arguments == []
+    assert runtime.active_run_id is None
+    assert runtime.offline_archive is None
+
+
+def test_offline_progress_finishes_when_replay_aborts(monkeypatch):
+    runtime = SpectrumH3Runtime(SpectrumH3Config())
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}},
+        conds={},
+    )
+    progress_updates = []
+    callback_arguments = []
+    topology = (("tiny", 1),)
+    labels = ((0, "positive"),)
+
+    class ProgressBar:
+        def __init__(self, total):
+            assert total == 4
+
+        def update_absolute(self, value, total=None, preview=None):
+            progress_updates.append((value, total, preview))
+
+    fake_utils = ModuleType("comfy.utils")
+    fake_utils.ProgressBar = ProgressBar
+    fake_comfy = ModuleType("comfy")
+    fake_comfy.utils = fake_utils
+    monkeypatch.setitem(sys.modules, "comfy", fake_comfy)
+    monkeypatch.setitem(sys.modules, "comfy.utils", fake_utils)
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(
+            self,
+            run_noise,
+            run_latent,
+            _sampler,
+            run_sigmas,
+            _mask,
+            run_callback,
+            _disable_pbar,
+            _seed,
+            *,
+            latent_shapes=None,
+        ):
+            if runtime.offline_phase == "replay":
+                raise OfflineReplayAbort("test replay failure")
+
+            for index, sigma in enumerate(run_sigmas[:-1]):
+                decision = runtime.begin_step(sigma)
+                call_id, actual = runtime.begin_model_call(
+                    decision["run_id"],
+                    decision["step_id"],
+                    topology=topology,
+                    labels=labels,
+                    expected_shape=(1, 1, 1),
+                )
+                assert actual
+                runtime.observe_actual(
+                    decision["run_id"],
+                    decision["step_id"],
+                    call_id,
+                    torch.full((1, 1, 1), float(index)),
+                )
+                runtime.finalize_step(decision["run_id"], decision["step_id"])
+                run_callback(index, run_noise, run_latent, len(run_sigmas) - 1)
+            return "valid-first-pass"
+
+    result = outer_sample_wrapper(
+        Executor(),
+        torch.ones(1),
+        torch.zeros(1),
+        _sampler("sample_euler"),
+        torch.tensor([1.0, 0.5, 0.0]),
+        callback=lambda *args: callback_arguments.append(args),
+        seed=7,
+    )
+
+    assert result == "valid-first-pass"
+    assert progress_updates == [(1, 4, None), (2, 4, None), (4, 4, None)]
     assert callback_arguments == []
     assert runtime.active_run_id is None
     assert runtime.offline_archive is None
