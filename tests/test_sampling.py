@@ -34,6 +34,7 @@ def _sampler(function_name: str) -> SimpleNamespace:
 @pytest.mark.parametrize(
     "function_name",
     (
+        "_turbo_sampler",
         "sample_euler",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
@@ -55,6 +56,7 @@ def test_reviewed_single_call_samplers_are_supported(function_name):
         "res_multistep",
         "sample_res_multistep_experimental",
         "sample_heun",
+        "_turbo_sampler_ancestral",
     ),
 )
 def test_unreviewed_sampler_names_do_not_match_by_prefix(function_name):
@@ -64,6 +66,7 @@ def test_unreviewed_sampler_names_do_not_match_by_prefix(function_name):
 @pytest.mark.parametrize(
     "function_name",
     (
+        "_turbo_sampler",
         "sample_euler",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
@@ -81,8 +84,9 @@ def test_res_multistep_policy_refreshes_once_and_protects_tail(function_name):
     assert min_tail_actual_steps(sampler) == 3
 
 
-def test_euler_policy_keeps_one_refresh_and_user_tail():
-    sampler = _sampler("sample_euler")
+@pytest.mark.parametrize("function_name", ("sample_euler", "_turbo_sampler"))
+def test_euler_policy_keeps_one_refresh_and_user_tail(function_name):
+    sampler = _sampler(function_name)
 
     assert min_actual_steps_after_forecast(sampler) == 1
     assert min_tail_actual_steps(sampler) == 0
@@ -250,7 +254,10 @@ def test_predict_noise_passthrough_survives_a_downstream_model_bypass(caplog):
         runtime.end_run(run_id)
 
 
-def test_default_offline_outer_sample_reports_both_passes_and_callbacks_only_replay(monkeypatch):
+@pytest.mark.parametrize("function_name", ("sample_euler", "_turbo_sampler"))
+def test_default_offline_outer_sample_reports_both_passes_and_callbacks_only_replay(
+    monkeypatch, function_name
+):
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(
             degree=1,
@@ -356,7 +363,7 @@ def test_default_offline_outer_sample_reports_both_passes_and_callbacks_only_rep
         Executor(),
         noise,
         latent,
-        _sampler("sample_euler"),
+        _sampler(function_name),
         sigmas,
         callback=callback,
         seed=7,
