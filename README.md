@@ -63,7 +63,7 @@ The node adds no third-party Python dependency. It uses PyTorch and ComfyUI modu
 
 ### Updating
 
-Use v0.2.1 or newer for the corrected default audio path. Use v0.2.2 or newer for live two-pass progress reporting. Use v0.2.4 or newer for live KJNodes MiniMax H3 TAE previews during offline replay. Update a Git clone with:
+Use v0.2.1 or newer for the corrected default audio path. Use v0.2.2 or newer for live two-pass progress reporting. Use v0.2.4 or newer for live KJNodes MiniMax H3 TAE previews during offline replay. Use v0.2.5 or newer for bounded default replay VRAM and MiniMax H3 Turbo sampler support. Update a Git clone with:
 
 ```bash
 cd ComfyUI/custom_nodes/ComfyUI-Spectrum-MiniMax-H3
@@ -136,7 +136,7 @@ Offline smoothing replay is the standard default-on H3 path because it removed t
 |---|---|---|---:|---|
 | `anchor_residual_feedback` | Experimental / off | Euler, RES multistep, RES multistep CFG++ | 1 | Ordinary Spectrum/native fallback rules remain active. |
 | `selective_rollback_correction` | Experimental / off | Exact deterministic `sample_euler`, with `s_churn=0` | 1, with local replay on a trigger | RES, CFG++, churned, ancestral, unknown, intercepted, and multi-GPU paths log once and run ordinary Spectrum. |
-| `offline_smoothing_replay` | Standard / on | Euler, RES multistep, RES multistep CFG++ | 2 | Unsupported samplers run one valid native pass. An incomplete first-pass archive returns the valid local-only first-pass result. |
+| `offline_smoothing_replay` | Standard / on | Euler, Larryvrh MiniMax H3 Turbo, RES multistep, RES multistep CFG++ | 2 | Unsupported samplers run one valid native pass. An incomplete first-pass archive returns the valid local-only first-pass result. |
 
 ### Shared anchor residual
 
@@ -305,10 +305,11 @@ This option changes the denoising trajectory and is experimental. Validate video
 Forecasting is currently allowlisted for:
 
 - Euler (`sample_euler`)
+- Larryvrh MiniMax H3 Turbo (`_turbo_sampler`)
 - RES multistep (`sample_res_multistep`)
 - RES multistep CFG++ (`sample_res_multistep_cfg_pp`)
 
-The reviewed implementations make one `predict_noise` call per solver iteration. Euler feeds each approximate denoised result into the latent used by the next evaluation, so it requires one completed actual H3 evaluation after every forecast. RES multistep stores each current denoised result as `old_denoised` for the following second-order update. The actual evaluation immediately after a forecast still consumes forecast-derived history, then replaces `old_denoised` with its native result before another forecast is allowed. This prevents any RES update from combining two forecasted denoised results. RES also keeps its final three solver steps native; this tail floor applies even when a saved workflow supplies a smaller `tail_actual_steps` value. Ancestral samplers execute native MiniMax H3 because injected noise invalidates the smooth deterministic feature trajectory used by the forecaster. Debug mode logs the exact fallback, tail, or post-forecast refresh reason. Multi-GPU parallel sampling also remains native because distributed forecast-row transactions are not yet validated.
+The reviewed implementations make one `predict_noise` call per solver iteration. Euler feeds each approximate denoised result into the latent used by the next evaluation, so it requires one completed actual H3 evaluation after every forecast. Larryvrh's reviewed MiniMax H3 Turbo sampler follows the same deterministic single-call contract and uses the same conservative limit of one consecutive forecast plus one completed actual refresh. RES multistep stores each current denoised result as `old_denoised` for the following second-order update. The actual evaluation immediately after a forecast still consumes forecast-derived history, then replaces `old_denoised` with its native result before another forecast is allowed. This prevents any RES update from combining two forecasted denoised results. RES also keeps its final three solver steps native; this tail floor applies even when a saved workflow supplies a smaller `tail_actual_steps` value. Ancestral samplers execute native MiniMax H3 because injected noise invalidates the smooth deterministic feature trajectory used by the forecaster. Debug mode logs the exact fallback, tail, or post-forecast refresh reason. Multi-GPU parallel sampling also remains native because distributed forecast-row transactions are not yet validated.
 
 Native EasyCache and LazyCache must not accelerate the same model branch as Spectrum. Either cache can return an approximate diffusion result without invoking MiniMax H3, so Spectrum cannot capture the actual post-transformer feature required by its solver-step transaction. If both are attached, Spectrum now logs one warning and remains inactive for that run while the cache continues normally. Use one of these accelerators on a model branch.
 
@@ -368,6 +369,7 @@ Automated tests cover:
 - direct coefficient, history-weight, chunked, blended, and row-subset equivalence;
 - FP32, FP16, and BF16 features;
 - history eviction, repeated coordinates, zero ridge, bounded Cholesky jitter, and factorization reuse;
+- independent causal-history and full replay-archive storage, including mixed CPU/CUDA device placement;
 - absence of persistent full-feature FP32 RHS/coefficient storage;
 - warmup, final tail, adaptive counts, fallback accounting, abort rollback, and teardown;
 - split, reordered, missing, and duplicate branch labels;
@@ -375,6 +377,7 @@ Automated tests cover:
 - model detection and clone runtime isolation;
 - exact native versus wrapped forced-actual video/audio output on a deterministic tiny native H3 fixture;
 - proof that a forecast fixture invokes zero H3 transformer blocks;
+- exact MiniMax H3 Turbo sampler recognition, prefix rejection, Euler-safe refresh policy, and complete offline capture/replay coverage;
 - refresh-only anchor feedback with video-only policy scoring, a `1.5` threshold, a three-refresh budget, and no retained/injected hidden residual;
 - terminal feedback-probe elimination while preserving the final rollback validation probe;
 - rollback threshold and three-correction budget enforcement;
@@ -383,7 +386,7 @@ Automated tests cover:
 - continuous two-pass ComfyUI progress, capture progress callbacks, capture-and-replay KJ preview updates, replay-only ordinary external callback side effects and previews, and clean progress completion on recoverable replay fallbacks;
 - downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release.
 
-The v0.2.4 suite passes 175 tests against the attached current ComfyUI source; two CUDA-only tests are skipped in the CPU test environment. GitHub Actions also passes the full test suite against the three reviewed ComfyUI revisions listed in the test matrix.
+The v0.2.5 suite passes 183 tests against the attached current ComfyUI source; four CUDA-only test cases are skipped in the CPU test environment. GitHub Actions also passes the full test suite against the three reviewed ComfyUI revisions listed in the test matrix.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).
 
