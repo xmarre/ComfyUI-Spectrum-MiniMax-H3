@@ -25,6 +25,9 @@ This default was introduced after earlier single-pass Spectrum releases were fou
 > [!IMPORTANT]
 > Workflows saved with v0.2.0 may retain `offline_smoothing_replay=false`. Turn it on once after updating. Workflows created before v0.2.0 did not store this input and receive the current default automatically. Keep `audio_blend_weight=0` unless intentionally testing spectral audio blending.
 
+> [!NOTE]
+> For constrained GPUs, keep both `history_storage=system_ram` and `offline_archive_storage=system_ram`. The bounded causal history and the full replay archive have separate storage controls. Selecting `vram` for the replay archive retains every actual anchor on the producing device until replay finishes and can consume several GiB independently of `max_history`.
+
 Visual and trajectory differences remain possible with the current default. Exact-seed A/B tests have shown changes in motion, pose, timing, gaze, and action paths, plus occasional malformed eyes, fingers, faces, limbs, or other articulated details during demanding motion. The cause and frequency of these visual changes have not been isolated across model precision, resolution, prompt complexity, sampler, early native-step count, bootstrap behavior, or total steps.
 
 For quality-critical work, compare the same prompt and seed with Spectrum enabled and disabled. For an audio issue on v0.2.1 or newer, first verify `offline_smoothing_replay=true` and `audio_blend_weight=0`. Increasing `degree`, `warmup_steps`, or total steps changes the forecast schedule and remains an optional A/B experiment, not a requirement of the corrected default. Include the exact version, checkpoint, generation mode, prompt, seed, sampler, scheduler, resolution, duration, step count, node settings, and audio reference in new reports.
@@ -103,12 +106,13 @@ Other external sampler callbacks remain replay-only. Spectrum does not invoke ar
 | `tail_actual_steps` | `1` | Requested final native tail. Deterministic RES enforces a sampler-safe minimum of `3`. |
 | `max_history` | `8` | Maximum model-dtype actual feature snapshots retained. |
 | `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
-| `history_storage` | `system_ram` | Stores history in `system_ram`, or in `vram` to avoid transfer overhead when sufficient accelerator memory is free. |
+| `history_storage` | `system_ram` | Stores the causal history, capped by `max_history`, in `system_ram` or `vram`. |
 | `bootstrap_first_forecast` | `true` | Experimental one-point hold for `degree=1` and `warmup_steps<=1`. Incompatible node settings disable it with a console warning. |
 | `anchor_residual_feedback` | `false` | Experimental video-scored actual-refresh guard. It never injects a hidden residual. Disable offline replay before enabling it. |
 | `selective_rollback_correction` | `false` | Experimental thresholded, budgeted rollback for the exact deterministic Euler sampler contract. Disable offline replay before enabling it. |
 | `offline_smoothing_replay` | `true` | Standard v0.2.1+ audio-fidelity path: local-only causal capture followed by cross-validated, transformer-free bidirectional replay. |
 | `audio_blend_weight` | `0.00` | Configured audio spectral share. Zero keeps replayed audio on local interpolation and prevents direct spectral mixing of audio rows. |
+| `offline_archive_storage` | `system_ram` | Stores every actual anchor retained until offline replay completes. This archive is not capped by `max_history`; `vram` is an explicit speed/memory tradeoff. |
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
@@ -179,7 +183,7 @@ Current deterministic RES stores solver-local `old_denoised`, `old_sigma_down`, 
 
 ### Offline smoothing replay
 
-The first pass runs the ordinary Spectrum schedule with both causal blend weights fixed at zero and the external callback suppressed. Audio and video therefore use the one-point hold or causal two-point predictor during capture, independent of the configured replay weights. Every completed actual anchor is retained independently of causal `max_history` eviction. Anchors use the selected `history_storage`: system-RAM history and the offline archive share immutable CPU tensors, while `vram` retains the full archive on the producing device and shares the most recent tensors with causal history. The wrapper also records the exact initial noise, latent, sigma sequence, seed, sampler, schedule decisions, labels, topology, and input shapes needed to restart the same deterministic sampler.
+The first pass runs the ordinary Spectrum schedule with both causal blend weights fixed at zero and the external callback suppressed. Audio and video therefore use the one-point hold or causal two-point predictor during capture, independent of the configured replay weights. Every completed actual anchor is retained independently of causal `max_history` eviction. `history_storage` controls only the bounded causal history. `offline_archive_storage` independently controls the full replay archive and defaults to system RAM. When both select the same resolved device, the archive and causal forecaster share immutable owned tensors while an anchor remains in both. When they differ, finalization keeps one compact copy on each selected device. The wrapper also records the exact initial noise, latent, sigma sequence, seed, sampler, schedule decisions, labels, topology, and input shapes needed to restart the same deterministic sampler.
 
 For a first-pass forecast step, the offline smoother combines:
 
@@ -200,9 +204,9 @@ First-pass actual coordinates reuse their stored feature exactly, and every smoo
 
 This is an anchor-reuse approximation. The stored actual anchors were evaluated on the first-pass trajectory, while replay generally follows a different trajectory. Future anchors improve the hidden-feature interpolation but do not make those anchors native-equivalent at the replay latent. The method is not lossless, fully corrected, or guaranteed to improve quality.
 
-Offline memory includes cloned initial sampling inputs plus every actual hidden anchor on the selected history device. With `max_history=8` and the observed 11-anchor schedule, shared ownership retains 11 unique feature tensors rather than an eight-entry causal history plus a separate eleven-entry archive. At the supplied 0.65 MP / 8-second shape, this changes explicit `vram` storage from approximately 2.90 GiB VRAM plus 3.89 GiB system RAM to approximately 3.89 GiB VRAM total for history/archive, excluding allocator overhead and input clones. System-RAM storage remains approximately 3.89 GiB and avoids duplicate anchor copies.
+Offline memory includes cloned initial sampling inputs plus every actual hidden anchor on the selected archive device. With `max_history=8` and the observed 11-anchor schedule at the supplied 0.65 MP / 8-second shape, the archive was approximately 3.89 GiB and the bounded eight-entry causal history was approximately 2.90 GiB. With both storage controls on system RAM, shared ownership retains approximately 3.89 GiB in system RAM. With both explicitly on VRAM, it retains approximately 3.89 GiB in VRAM. With `history_storage=vram` and the default `offline_archive_storage=system_ram`, it retains approximately 2.90 GiB in VRAM plus 3.89 GiB in system RAM. These figures exclude allocator overhead, current-step tensors, prediction buffers, and replay-input clones.
 
-Replay adds a second sampler pass and output-head work while eliminating H3 transformer calls only in that second pass. Debug summaries separately report configured replay weights, effective causal capture weights, archive time, smoother-build and validation time, retained archive size and device, hypothetical full-schedule size, held-out sample/anchor/stream counts, maximum audio/video validation scores, per-modality effective blend ranges and attenuation/local-only counts, archived-anchor replay steps, smoothed replay steps, and the smoother's real history/chunk counters. If the first pass is unsupported, intercepted, disabled, incomplete, or changes topology, replay is skipped and the valid local-only first-pass result is returned with one warning.
+Replay adds a second sampler pass and output-head work while eliminating H3 transformer calls only in that second pass. Debug summaries separately report configured replay weights, effective causal capture weights, both storage selections, archive time, smoother-build and validation time, retained archive size and resolved device, hypothetical full-schedule size, held-out sample/anchor/stream counts, maximum audio/video validation scores, per-modality effective blend ranges and attenuation/local-only counts, archived-anchor replay steps, smoothed replay steps, and the smoother's real history/chunk counters. If the first pass is unsupported, intercepted, disabled, incomplete, or changes topology, replay is skipped and the valid local-only first-pass result is returned with one warning.
 
 Across three supplied 0.65 MP / 8-second runs of the earlier fixed-blend implementation, the transformer-free replay added 8.49%, 8.63%, and 8.95% to its corresponding first-pass sampler time while retaining 11 first-pass H3 calls. A later VRAM-resident local-only replay completed in `0.441 s`, while the matched single-pass Spectrum run used the same 11-call schedule. Global `blend_weight=0.5` degraded audio in both paths; global `blend_weight=0` produced clean audio in the two matched runs. Direct modality splitting removed direct audio mixing and left the indirect joint-trajectory defect in single-pass `video=0.5, audio=0`. Revised isolated capture/replay at `video=0.5, audio=0` restored the affected seed's audio fidelity and stability, including the speech-stutter symptom. The evidence establishes the mechanism for that case and leaves broader quality and stability unproven.
 
@@ -227,6 +231,7 @@ warmup_steps = 1
 tail_actual_steps = 1
 max_history = 8
 history_storage = system_ram
+offline_archive_storage = system_ram
 bootstrap_first_forecast = true
 offline_smoothing_replay = true
 anchor_residual_feedback = false
@@ -246,6 +251,7 @@ warmup_steps = 5
 tail_actual_steps = 1
 max_history = 8
 history_storage = system_ram
+offline_archive_storage = system_ram
 bootstrap_first_forecast = false
 offline_smoothing_replay = true
 anchor_residual_feedback = false
@@ -315,7 +321,7 @@ w(t*) = phi(t*) (Phi^T Phi + lambda I)^-1 Phi^T
 H_hat(t*) = w(t*) H
 ```
 
-Spectral and linear history weights are combined before reading feature history. Persistent large tensors are limited to `max_history` detached model-dtype snapshots in the selected `history_storage`. Design, Gram, Cholesky, and history-weight tensors remain small FP32 CPU matrices. Prediction streams one bounded slice from one history snapshot at a time, accumulates that slice in FP32 on the prediction device, then writes model dtype. There is no persistent full-feature FP32 regression right-hand side or coefficient tensor.
+Spectral and linear history weights are combined before reading feature history. Outside the offline archive, persistent large tensors are limited to `max_history` detached model-dtype snapshots in the selected `history_storage`. Design, Gram, Cholesky, and history-weight tensors remain small FP32 CPU matrices. Prediction streams one bounded slice from one history snapshot at a time, accumulates that slice in FP32 on the prediction device, then writes model dtype. There is no persistent full-feature FP32 regression right-hand side or coefficient tensor.
 
 History storage cost is approximately:
 
@@ -328,9 +334,9 @@ In the supplied 0.5 MP workflow, the effective single-branch topology had 27,075
 
 With `history_storage=system_ram`, forecast VRAM includes one model-dtype target feature for the current model call plus a bounded FP32 accumulation chunk. Actual steps copy each new snapshot to CPU, and forecasts stream the retained snapshots back to the prediction device. These transfers can reduce the theoretical speedup.
 
-With `history_storage=vram`, the same model-dtype history remains on the device that produced it. This avoids the device-to-host archive and repeated host-to-device forecast reads. The captured target is cloned into compact owned storage; retaining its native view would keep the complete final-block hidden tensor alive. The mode needs the full history allocation plus transient headroom for the current snapshot, prediction result, FP32 chunk, allocator fragmentation, and native H3 execution. At the native example above, use it only with materially more than 6.1 GiB of VRAM free at the native generation peak. An explicit VRAM selection can raise an out-of-memory error when that headroom is unavailable.
+With `history_storage=vram`, the bounded model-dtype causal history remains on the device that produced it. This avoids the device-to-host archive and repeated host-to-device forecast reads. The captured target is cloned into compact owned storage; retaining its native view would keep the complete final-block hidden tensor alive. The mode needs the full bounded history allocation plus transient headroom for the current snapshot, prediction result, FP32 chunk, allocator fragmentation, and native H3 execution. At the native example above, use it only with materially more than 6.1 GiB of VRAM free at the native generation peak. An explicit VRAM selection can raise an out-of-memory error when that headroom is unavailable. Offline replay does not extend this causal allocation past `max_history` unless `offline_archive_storage=vram` is also selected.
 
-Debug run summaries report the selected storage and resolved history device together with archive, history-update, and forecast-prediction wall time. CPU archiving can synchronize preceding CUDA work, while GPU cloning can be asynchronously enqueued, so the component counters diagnose the runtime path rather than serving as isolated kernel benchmarks. End-to-end wall time and peak allocated VRAM are the authoritative comparison.
+Debug run summaries report both storage selections and the replay predictor's resolved history device together with archive, history-update, and forecast-prediction wall time. CPU archiving can synchronize preceding CUDA work, while GPU cloning can be asynchronously enqueued, so the component counters diagnose the runtime path rather than serving as isolated kernel benchmarks. End-to-end wall time and peak allocated VRAM are the authoritative comparison.
 
 ### Measured VRAM-history results
 

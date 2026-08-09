@@ -103,6 +103,7 @@ def test_preliminary_runtime_defaults():
     assert config.warmup_steps == 1
     assert config.tail_actual_steps == 1
     assert config.history_storage == "system_ram"
+    assert config.offline_archive_storage == "system_ram"
     assert config.bootstrap_first_forecast is True
 
 
@@ -1264,14 +1265,26 @@ def test_offline_capture_is_local_only_while_replay_keeps_configured_blends(
     offline.release_offline_archive()
 
 
-@pytest.mark.parametrize("history_storage", ["system_ram", "vram"])
-def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_calls(history_storage):
+@pytest.mark.parametrize(
+    ("history_storage", "offline_archive_storage"),
+    [
+        ("system_ram", "system_ram"),
+        ("vram", "system_ram"),
+        ("system_ram", "vram"),
+        ("vram", "vram"),
+    ],
+)
+def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_calls(
+    history_storage,
+    offline_archive_storage,
+):
     runtime = _runtime(
         offline_smoothing_replay=True,
         max_history=2,
         warmup_steps=2,
         tail_actual_steps=0,
         history_storage=history_storage,
+        offline_archive_storage=offline_archive_storage,
     )
     sigmas = torch.linspace(1.0, 0.0, 7)
     runtime.begin_offline_capture(total_steps=6, sampler_name="sample_euler")
@@ -1315,13 +1328,14 @@ def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_call
     archive = runtime.offline_archive
     assert archive is not None
     assert len(archive.anchors) == 4
-    assert archive.history_storage == history_storage
+    assert archive.history_storage == offline_archive_storage
     assert archive.history_device == torch.device("cpu")
-    assert {
-        anchor.feature.data_ptr() for anchor in archive.anchors[-2:]
-    } == {
-        entry.feature_flat.data_ptr() for entry in runtime.forecaster._history
-    }
+    if history_storage == offline_archive_storage:
+        assert {
+            anchor.feature.data_ptr() for anchor in archive.anchors[-2:]
+        } == {
+            entry.feature_flat.data_ptr() for entry in runtime.forecaster._history
+        }
     assert runtime.stats.offline_validation_samples_per_branch == 12
     assert runtime.stats.offline_validation_anchors == 2
     assert runtime.stats.offline_attenuated_predictions == 2
@@ -1388,7 +1402,53 @@ def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_call
     assert "offline_effective_video_blend_mean=" in summary
     assert "offline_local_only_audio_predictions=2" in summary
     assert "offline_full_schedule_estimated_mib=" in summary
+    assert f"offline_archive_storage={offline_archive_storage}" in summary
+    assert "offline_archive_device='cpu'" in summary
     assert "history_device='cpu'" in summary
     runtime.end_run(replay_id)
     runtime.release_offline_archive()
     assert runtime.offline_archive is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize(
+    ("history_storage", "offline_archive_storage", "history_device", "archive_device"),
+    [
+        ("vram", "system_ram", "cuda", "cpu"),
+        ("system_ram", "vram", "cpu", "cuda"),
+    ],
+)
+def test_offline_archive_storage_is_independent_on_cuda(
+    history_storage,
+    offline_archive_storage,
+    history_device,
+    archive_device,
+):
+    runtime = _runtime(
+        offline_smoothing_replay=True,
+        force_actual=True,
+        history_storage=history_storage,
+        offline_archive_storage=offline_archive_storage,
+    )
+    runtime.begin_offline_capture(total_steps=1, sampler_name="sample_euler")
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.0], device="cuda"),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    _actual_step(
+        runtime,
+        1.0,
+        [(LABEL, torch.ones((1, 3, 4), device="cuda"))],
+    )
+
+    archive = runtime.offline_archive
+    assert archive is not None
+    assert archive.anchors[0].feature.device.type == archive_device
+    assert runtime.forecaster.history_device is not None
+    assert runtime.forecaster.history_device.type == history_device
+
+    runtime.end_run(run_id)
+    runtime.release_offline_archive()

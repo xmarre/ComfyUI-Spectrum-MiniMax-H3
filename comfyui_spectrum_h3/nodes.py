@@ -76,7 +76,16 @@ class SpectrumApplyMiniMaxH3:
                 "debug": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "history_storage": (["system_ram", "vram"], {"default": "system_ram"}),
+                "history_storage": (
+                    ["system_ram", "vram"],
+                    {
+                        "default": "system_ram",
+                        "tooltip": (
+                            "Storage for the bounded causal history, capped by max_history. "
+                            "Offline replay uses the separate offline_archive_storage setting."
+                        ),
+                    },
+                ),
                 "bootstrap_first_forecast": (
                     "BOOLEAN",
                     {
@@ -132,6 +141,17 @@ class SpectrumApplyMiniMaxH3:
                         ),
                     },
                 ),
+                "offline_archive_storage": (
+                    ["system_ram", "vram"],
+                    {
+                        "default": "system_ram",
+                        "tooltip": (
+                            "Storage for every actual anchor retained until offline replay completes. "
+                            "This archive is not capped by max_history. Keep system_ram for constrained "
+                            "GPUs; vram is an explicit speed/memory tradeoff."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -159,6 +179,7 @@ class SpectrumApplyMiniMaxH3:
         selective_rollback_correction=False,
         offline_smoothing_replay=True,
         audio_blend_weight=0.0,
+        offline_archive_storage="system_ram",
     ):
         if not enabled:
             return (model,)
@@ -195,6 +216,7 @@ class SpectrumApplyMiniMaxH3:
             selective_rollback_correction=selective_rollback_correction,
             offline_smoothing_replay=offline_smoothing_replay,
             audio_blend_weight=float(audio_blend_weight),
+            offline_archive_storage=str(offline_archive_storage),
             debug=bool(debug),
         ).validate()
         patched = model.clone()

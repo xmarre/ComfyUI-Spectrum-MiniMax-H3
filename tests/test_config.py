@@ -32,6 +32,11 @@ def test_history_storage_rejects_unknown_locations():
         SpectrumH3Config(history_storage="automatic").validate()
 
 
+def test_offline_archive_storage_rejects_unknown_locations():
+    with pytest.raises(ValueError, match="offline_archive_storage"):
+        SpectrumH3Config(offline_archive_storage="automatic").validate()
+
+
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan"), float("inf")])
 def test_audio_blend_weight_requires_a_finite_unit_interval(value):
     with pytest.raises(ValueError, match="audio_blend_weight"):
@@ -51,6 +56,7 @@ def test_preliminary_scheduler_defaults():
     assert config.blend_weight == 0.5
     assert config.audio_blend_weight == 0.0
     assert config.offline_smoothing_replay is True
+    assert config.offline_archive_storage == "system_ram"
     assert required["degree"][1]["default"] == 1
     assert required["warmup_steps"][1]["default"] == 1
     assert required["tail_actual_steps"][1]["default"] == 1
@@ -67,6 +73,10 @@ def test_preliminary_scheduler_defaults():
     assert optional["offline_smoothing_replay"][0] == "BOOLEAN"
     assert optional["offline_smoothing_replay"][1]["default"] is True
     assert apply_parameters["offline_smoothing_replay"].default is True
+    assert optional["offline_archive_storage"][0] == ["system_ram", "vram"]
+    assert optional["offline_archive_storage"][1]["default"] == "system_ram"
+    assert "not capped by max_history" in optional["offline_archive_storage"][1]["tooltip"]
+    assert apply_parameters["offline_archive_storage"].default == "system_ram"
     for name in ("anchor_residual_feedback", "selective_rollback_correction"):
         assert getattr(config, name) is False
         assert optional[name][0] == "BOOLEAN"
@@ -272,6 +282,7 @@ def test_apply_normalizes_reported_warmup_conflict(monkeypatch, caplog):
             False,
             bootstrap_first_forecast=True,
             audio_blend_weight=0.25,
+            offline_archive_storage="vram",
         )
 
     assert isinstance(patched, FakeModel)
@@ -279,4 +290,5 @@ def test_apply_normalizes_reported_warmup_conflict(monkeypatch, caplog):
     assert captured["config"].warmup_steps == 2
     assert captured["config"].bootstrap_first_forecast is False
     assert captured["config"].audio_blend_weight == 0.25
+    assert captured["config"].offline_archive_storage == "vram"
     assert "Disabling bootstrap_first_forecast" in caplog.text

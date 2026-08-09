@@ -514,7 +514,7 @@ class SpectrumH3Runtime:
         self._offline_archive = OfflineFeatureArchive(
             total_steps=total_steps,
             sampler_name=sampler_name,
-            history_storage=self.config.history_storage,
+            history_storage=self.config.offline_archive_storage,
         )
 
     def complete_offline_capture(self) -> bool:
@@ -763,7 +763,16 @@ class SpectrumH3Runtime:
         started = time.perf_counter()
         try:
             detached = feature.detach()
-            if self.config.history_storage == "vram":
+            capture_storage = self.config.history_storage
+            if (
+                self._offline_phase == "first_pass"
+                and self.config.offline_archive_storage == "vram"
+            ):
+                # Preserve a compact device copy when either consumer needs it.
+                # Finalization can then transfer the bounded causal history to
+                # CPU while the full replay archive takes ownership on device.
+                capture_storage = "vram"
+            if capture_storage == "vram":
                 # The observed target is a view into the complete final-block
                 # hidden state. A forced clone keeps only the compact target
                 # storage alive and prevents later reuse of the backing tensor.
@@ -1444,6 +1453,11 @@ class SpectrumH3Runtime:
         self._rollback_replay_active = False
 
     def debug_summary(self) -> str:
+        offline_archive_device = (
+            self._offline_archive.history_device
+            if self._offline_archive is not None
+            else None
+        )
         return (
             f"run_id={self.stats.run_id} sampler={self.stats.sampler_name} "
             f"steps={self.stats.total_steps} actual_steps={self.stats.actual_steps} "
@@ -1513,6 +1527,8 @@ class SpectrumH3Runtime:
             f"offline_full_schedule_estimated_mib={self.stats.offline_estimated_archive_bytes / (1024 * 1024):.1f} "
             f"direct_history_updates={self.stats.direct_history_updates} "
             f"history_storage={self.config.history_storage} "
+            f"offline_archive_storage={self.config.offline_archive_storage} "
+            f"offline_archive_device={str(offline_archive_device)!r} "
             f"history_device={str(self.prediction_history_device)!r} "
             f"history_mib={self.prediction_history_tensor_bytes / (1024 * 1024):.1f} "
             f"reason={self.stats.disable_reason!r} "

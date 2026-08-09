@@ -23,6 +23,7 @@ class SpectrumH3Config:
     selective_rollback_correction: bool = False
     offline_smoothing_replay: bool = True
     audio_blend_weight: float = 0.0
+    offline_archive_storage: str = "system_ram"
 
     def __post_init__(self) -> None:
         trajectory_modes = {
@@ -115,6 +116,11 @@ class SpectrumH3Config:
             "vram",
         }:
             raise ValueError("history_storage must be 'system_ram' or 'vram'")
+        if not isinstance(self.offline_archive_storage, str) or self.offline_archive_storage not in {
+            "system_ram",
+            "vram",
+        }:
+            raise ValueError("offline_archive_storage must be 'system_ram' or 'vram'")
         return self
 
 
