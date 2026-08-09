@@ -1,26 +1,38 @@
-# Spectrum MiniMax H3 v0.2.4
+# Spectrum MiniMax H3 v0.2.5
 
-Restores useful live MiniMax H3 TAE previews while the default offline smoothing replay path is running.
+Reduces offline replay GPU memory pressure and enables Spectrum forecasting for Larryvrh's MiniMax H3 Turbo sampler.
 
-## Live preview repair
+## Offline replay memory fix
 
-- Restores KJNodes `Model Preview Override` updates during the compute-heavy capture pass and the accepted replay pass.
-- Supports either ordering of `Model Preview Override` and Spectrum in the model patch chain.
-- Capture previews show the provisional local-only trajectory. Replay previews update the widget with the accepted smoothed trajectory.
-- Keeps ordinary external sampler callbacks and their previews replay-only, so unrelated callback side effects still run once per logical step.
-- Preserves the existing wrapper order when offline smoothing is disabled.
+- Separates the causal forecast history from the full offline replay archive.
+- Keeps `history_storage` bounded by `max_history`, including when it is set to `vram`.
+- Adds `offline_archive_storage`, defaulting to `system_ram` for new and existing workflows.
+- Retains `offline_archive_storage=vram` as an explicit option for systems with sufficient headroom.
+- Reports both configured storage locations and the resolved archive device in debug summaries.
 
-## Root cause
+### Root cause
 
-Offline replay intentionally replaces the external callback during capture with a progress-only callback. When KJNodes' preview wrapper enclosed Spectrum's two-pass wrapper, it received callbacks only during the transformer-free replay, which usually completed too quickly to act as a useful live preview. Spectrum now places that observational wrapper immediately inside its own wrapper for offline runs, giving it one callback stream in each pass.
+Before offline replay, `history_storage=vram` retained at most `max_history` feature snapshots. Offline replay reused that setting for every actual anchor until its second pass completed. The meaning of the existing option therefore changed from a bounded causal history to an all-anchor CUDA archive. One recorded 20-step run retained about 4.3 GiB for that archive, enough to cause allocator pressure, severe slowdown, or an out-of-memory error on a 12 GB GPU.
+
+The archive now has its own storage policy. Existing workflows do not contain the new trailing input, so they receive the safe `system_ram` archive default automatically.
+
+## MiniMax H3 Turbo sampler support
+
+- Recognizes Larryvrh's exact `_turbo_sampler` contract.
+- Applies the existing conservative Euler safeguards: at most one consecutive forecast and one required actual refresh after a forecast.
+- Covers the standard offline capture and transformer-free replay path.
+- Keeps similarly named and otherwise unknown samplers on the native bypass.
+
+The reviewed Turbo implementation makes one denoiser call per scheduler step and does not inject ancestral noise, churn, or additional model evaluations.
 
 ## Compatibility
 
-This release does not change node inputs, saved workflows, forecast schedules, audio handling, progress accounting, or generated tensors. Kijai's MiniMax H3 TAE still requires KJNodes `Model Preview Override`.
+The new archive selector is a trailing optional node input, preserving existing saved workflows. Existing Euler and RES schedules, offline smoothing, audio handling, progress reporting, and generated-result processing are unchanged. Workflows that intentionally want the former all-anchor CUDA behavior can select `offline_archive_storage=vram`.
 
 ## Validation
 
-- A live user test of the PR confirmed that MiniMax H3 TAE previews work again.
-- Regression tests cover both wrapper orders and verify that single-pass ordering remains unchanged.
-- The full CPU suite passes with 175 tests; the two CUDA-only tests are skipped.
-- All three GitHub Actions ComfyUI compatibility jobs and the forecaster smoke test pass.
+- The revised default archive behavior was confirmed in a real H3 generation after the reported VRAM regression.
+- The combined CPU suite passes 183 tests; four CUDA-only test cases are skipped in the CPU environment.
+- Mixed-storage tests cover causal history on CUDA with the archive on CPU and the inverse placement.
+- Turbo tests cover exact-name recognition, prefix rejection, policy constraints, callbacks, and complete offline capture/replay.
+- Both feature PRs passed the three-version ComfyUI GitHub Actions matrix and CodeRabbit review.
