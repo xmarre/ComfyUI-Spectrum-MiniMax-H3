@@ -60,7 +60,7 @@ The node adds no third-party Python dependency. It uses PyTorch and ComfyUI modu
 
 ### Updating
 
-Use v0.2.1 or newer for the corrected default audio path. Use v0.2.2 or newer for live two-pass progress reporting. Update a Git clone with:
+Use v0.2.1 or newer for the corrected default audio path. Use v0.2.2 or newer for live two-pass progress reporting. Use v0.2.4 or newer for live KJNodes MiniMax H3 TAE previews during offline replay. Update a Git clone with:
 
 ```bash
 cd ComfyUI/custom_nodes/ComfyUI-Spectrum-MiniMax-H3
@@ -377,7 +377,7 @@ Automated tests cover:
 - continuous two-pass ComfyUI progress, capture progress callbacks, capture-and-replay KJ preview updates, replay-only ordinary external callback side effects and previews, and clean progress completion on recoverable replay fallbacks;
 - downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release.
 
-The v0.2.2 suite passes 173 tests against attached ComfyUI source at commit `00d02f2854892ee5b9808bc2f6348b972017886a`; two CUDA-only tests are skipped in the CPU test environment.
+The v0.2.4 suite passes 175 tests against the attached current ComfyUI source; two CUDA-only tests are skipped in the CPU test environment. GitHub Actions also passes the full test suite against the three reviewed ComfyUI revisions listed in the test matrix.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).
 
