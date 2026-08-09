@@ -24,6 +24,7 @@ KJ_PREVIEW_WRAPPER_KEY = "kj_preview_override"
 
 SUPPORTED_SINGLE_CALL_SAMPLERS = frozenset(
     {
+        "_turbo_sampler",
         "sample_euler",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
