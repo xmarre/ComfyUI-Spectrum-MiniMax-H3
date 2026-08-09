@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "comfyui-spectrum-minimax-h3"
 description = "A ComfyUI custom node implementing Spectrum spectral feature forecasting for native MiniMax H3 audio-video generation."
-version = "0.2.4"
+version = "0.2.5"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
