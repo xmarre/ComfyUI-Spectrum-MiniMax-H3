@@ -144,10 +144,16 @@ def test_full_applied_gain_is_exactly_generic_scalar_gain():
         (decision.video_correction_gain, decision.video_correction_telemetry),
     ):
         assert gain == pytest.approx(telemetry.generic_gain)
-        assert telemetry.model_gain == pytest.approx(telemetry.generic_gain)
-        assert telemetry.model_candidate_gain == pytest.approx(telemetry.generic_gain)
-        assert telemetry.diagonal_candidate_gain == pytest.approx(telemetry.generic_gain)
+        assert telemetry.diagonal_projection == 0.0
+        assert telemetry.model_projection == 0.0
+        assert telemetry.raw_diagonal_gain == 0.0
+        assert telemetry.raw_model_gain == 0.0
+        assert telemetry.diagonal_candidate_gain == 0.0
+        assert telemetry.model_candidate_gain == 0.0
+        assert telemetry.model_gain == 0.0
         assert telemetry.model_trust == 0.0
+        assert not telemetry.diagonal_bound_active
+        assert not telemetry.model_bound_active
     assert not decision.audio_subspace_telemetry.eligible
     assert not decision.video_subspace_telemetry.eligible
     assert decision.correction_anchor_ids == ()
@@ -226,7 +232,76 @@ def test_offline_replay_records_only_single_generic_scalar_coefficient():
     assert replay.correction_anchor_ids == ()
 
 
-def test_debug_summary_marks_all_rejected_feature3_runtime_retired():
+def test_debug_summary_exposes_only_live_generic_correction_telemetry():
+    runtime = SpectrumH3Runtime(SpectrumH3Config(model_aware_mode="full"))
+    summary = runtime.debug_summary()
+
+    assert (
+        "model_aware_correction_metric="
+        "generic_latest_delta_hidden_residual_projection"
+    ) in summary
+    assert "model_aware_correction_bound=rational_softsign_0.25" in summary
+    assert "generic_corrected_ratio_mean=" in summary
+    assert "model_aware_audio_generic_corrected_ratio_mean=" in summary
+    assert "model_aware_video_generic_corrected_ratio_mean=" in summary
+    assert "model_aware_audio_generic_bound_active=" in summary
+    assert "model_aware_video_generic_bound_active=" in summary
+
+    forbidden = (
+        "final_layer_exact_linear_head_space",
+        "model_aware_diagonal_ablation_metric=",
+        "model_aware_model_comparison_metric=",
+        "model_aware_correction_subspace=",
+        "model_aware_subspace_",
+        "model_aware_head_metric_available=",
+        "model_aware_audio_model_corrected_ratio_mean=",
+        "model_aware_video_model_corrected_ratio_mean=",
+        "model_corrected_ratio_mean=",
+        "model_aware_audio_diagonal_candidate_ratio_mean=",
+        "model_aware_video_diagonal_candidate_ratio_mean=",
+        "model_aware_audio_exact_candidate_ratio_mean=",
+        "model_aware_video_exact_candidate_ratio_mean=",
+        "model_aware_audio_diagonal_candidate_head_ratio_mean=",
+        "model_aware_video_diagonal_candidate_head_ratio_mean=",
+        "model_aware_audio_exact_candidate_head_ratio_mean=",
+        "model_aware_video_exact_candidate_head_ratio_mean=",
+        "model_aware_audio_generic_head_ratio_mean=",
+        "model_aware_video_generic_head_ratio_mean=",
+        "model_aware_audio_exact_trust=",
+        "model_aware_video_exact_trust=",
+        "model_aware_audio_diagonal_comparisons=",
+        "model_aware_video_diagonal_comparisons=",
+        "model_aware_audio_exact_comparisons=",
+        "model_aware_video_exact_comparisons=",
+        "model_aware_audio_diagonal_candidate_wins=",
+        "model_aware_video_diagonal_candidate_wins=",
+        "model_aware_audio_exact_candidate_wins=",
+        "model_aware_video_exact_candidate_wins=",
+        "model_aware_audio_diagonal_candidate_losses=",
+        "model_aware_video_diagonal_candidate_losses=",
+        "model_aware_audio_exact_candidate_losses=",
+        "model_aware_video_exact_candidate_losses=",
+        "model_aware_audio_diagonal_bound_active=",
+        "model_aware_video_diagonal_bound_active=",
+        "model_aware_audio_exact_bound_active=",
+        "model_aware_video_exact_bound_active=",
+        "model_aware_audio_gain_delta_",
+        "model_aware_video_gain_delta_",
+        "model_aware_audio_exact_diagonal_delta_",
+        "model_aware_video_exact_diagonal_delta_",
+        "model_aware_exact_head_evidence_bytes=",
+        "model_aware_exact_head_projection_s=",
+        "model_aware_exact_head_projection_calls=",
+        "model_aware_exact_head_workspace_bytes=",
+        "model_aware_head_materialization_s=",
+        "model_aware_head_materialized_bytes=",
+        "_2d_",
+    )
+    for token in forbidden:
+        assert token not in summary
+
+
+def test_debug_summary_keeps_only_explicit_feature3_retirement_state():
     runtime = SpectrumH3Runtime(SpectrumH3Config(model_aware_mode="full"))
     summary = runtime.debug_summary()
     assert "feature3_model_informed_correction=retired_no_material_gain" in summary
