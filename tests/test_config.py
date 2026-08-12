@@ -43,6 +43,18 @@ def test_audio_blend_weight_requires_a_finite_unit_interval(value):
         SpectrumH3Config(audio_blend_weight=value).validate()
 
 
+@pytest.mark.parametrize("value", ["", "confidence", "FULL", None])
+def test_model_aware_mode_rejects_unknown_values(value):
+    with pytest.raises((TypeError, ValueError), match="model_aware_mode"):
+        SpectrumH3Config(model_aware_mode=value).validate()
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan"), float("inf")])
+def test_model_aware_threshold_requires_a_finite_unit_interval(value):
+    with pytest.raises(ValueError, match="model_aware_risk_threshold"):
+        SpectrumH3Config(model_aware_risk_threshold=value).validate()
+
+
 def test_preliminary_scheduler_defaults():
     config = SpectrumH3Config()
     required = SpectrumApplyMiniMaxH3.INPUT_TYPES()["required"]
@@ -57,6 +69,8 @@ def test_preliminary_scheduler_defaults():
     assert config.audio_blend_weight == 0.0
     assert config.offline_smoothing_replay is True
     assert config.offline_archive_storage == "system_ram"
+    assert config.model_aware_mode == "off"
+    assert config.model_aware_risk_threshold == 0.65
     assert required["degree"][1]["default"] == 1
     assert required["warmup_steps"][1]["default"] == 1
     assert required["tail_actual_steps"][1]["default"] == 1
@@ -77,6 +91,14 @@ def test_preliminary_scheduler_defaults():
     assert optional["offline_archive_storage"][1]["default"] == "system_ram"
     assert "not capped by max_history" in optional["offline_archive_storage"][1]["tooltip"]
     assert apply_parameters["offline_archive_storage"].default == "system_ram"
+    assert optional["model_aware_mode"][0] == [
+        "off",
+        "schedule",
+        "schedule_confidence",
+        "full",
+    ]
+    assert optional["model_aware_mode"][1]["default"] == "off"
+    assert apply_parameters["model_aware_mode"].default == "off"
     for name in ("anchor_residual_feedback", "selective_rollback_correction"):
         assert getattr(config, name) is False
         assert optional[name][0] == "BOOLEAN"

@@ -8,6 +8,25 @@ from comfyui_spectrum_h3.experiments import (
     OfflineSmoother,
     measure_stream_residual,
 )
+from comfyui_spectrum_h3.model_aware import ModelAwareForecastDecision
+
+
+def _model_decision(*, audio_blend: float, video_blend: float, correction: float = 0.0):
+    return ModelAwareForecastDecision(
+        trajectory_risk=0.2,
+        model_risk=0.3,
+        patch_risk=0.1,
+        combined_risk=0.25,
+        confidence=0.75,
+        ridge_lambda=0.2,
+        degree=1,
+        audio_blend_weight=audio_blend,
+        video_blend_weight=video_blend,
+        audio_correction_gain=correction,
+        video_correction_gain=-correction,
+        forecast_horizon=1.0,
+        force_actual=False,
+    )
 
 
 def _archive(right_value: float) -> OfflineFeatureArchive:
@@ -223,6 +242,50 @@ def test_offline_smoother_validates_audio_and_video_independently():
     )
     torch.testing.assert_close(prediction[:, :1], local[:, :1])
     assert not torch.equal(prediction[:, 1:], local[:, 1:])
+
+
+def test_offline_replay_preserves_per_forecast_model_aware_decisions_without_index_drift():
+    archive = OfflineFeatureArchive(total_steps=5, sampler_name="sample_er_sde")
+    coordinates = torch.linspace(-1.0, 1.0, 5).tolist()
+    first_decision = _model_decision(audio_blend=0.0, video_blend=0.2)
+    second_decision = _model_decision(audio_blend=0.0, video_blend=0.8, correction=0.1)
+    for step_id, coordinate in enumerate(coordinates):
+        archive.record_step(
+            step_id,
+            coordinate,
+            step_id % 2 == 0,
+            model_aware_decision={1: first_decision, 3: second_decision}.get(step_id),
+        )
+    for step_id, value in ((0, 0.0), (2, 1.0), (4, 2.0)):
+        feature = torch.empty(1, 2, 16)
+        feature[:, 0].fill_(value)
+        feature[:, 1].fill_(value)
+        archive.record_actual(
+            step_id,
+            coordinates[step_id],
+            feature,
+            labels=((0, "positive"),),
+            topology=(("target_audio_rows", 1), ("target_video_rows", 1)),
+            take_ownership=True,
+        )
+    assert archive.complete(minimum_anchors=2)
+
+    smoother = OfflineSmoother(
+        archive,
+        degree=1,
+        ridge_lambda=0.1,
+        blend_weight=0.5,
+        audio_blend_weight=0.0,
+    )
+
+    assert archive.steps[1].model_aware_decision is first_decision
+    assert archive.steps[3].model_aware_decision is second_decision
+    assert smoother.effective_blend_stream_stats["audio"] == (0.0, 0.0, 0.0)
+    assert smoother.effective_blend_stream_stats["video"] == pytest.approx((0.2, 0.5, 0.8))
+    assert not torch.equal(
+        smoother._forecast_weights[(1, 0, 1)],
+        smoother._forecast_weights[(3, 0, 1)],
+    )
 
 
 def test_offline_archive_shares_owned_storage_on_selected_device():

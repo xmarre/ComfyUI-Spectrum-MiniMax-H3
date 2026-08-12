@@ -113,6 +113,38 @@ Other external sampler callbacks remain replay-only. Spectrum does not invoke ar
 | `offline_smoothing_replay` | `true` | Standard v0.2.1+ audio-fidelity path: local-only causal capture followed by cross-validated, transformer-free bidirectional replay. |
 | `audio_blend_weight` | `0.00` | Configured audio spectral share. Zero keeps replayed audio on local interpolation and prevents direct spectral mixing of audio rows. |
 | `offline_archive_storage` | `system_ram` | Stores every actual anchor retained until offline replay completes. This archive is not capped by `max_history`; `vram` is an explicit speed/memory tradeoff. |
+| `model_aware_mode` | `off` | Experimental shared model/LoRA prior. `schedule` adds risk-based actual anchors; `schedule_confidence` also adapts fitting and blend; `full` adds bounded correction. |
+| `model_aware_risk_threshold` | `0.65` | A prospective legacy forecast becomes an actual evaluation when the combined live/model risk reaches this value. Existing hard sampler, warmup, history, and tail rules still take precedence. |
+
+## Experimental model-aware forecasting
+
+`model_aware_mode` is opt-in and defaults to `off`, so old workflows retain the legacy schedule, fitting, blending, and replay behavior. The modes share one controller and progressively enable:
+
+- `schedule`: evaluates a prospective legacy forecast's risk and may convert it to an actual transformer evaluation. It never converts a required actual step into a forecast.
+- `schedule_confidence`: also selects a bounded scalar ridge value, a history-valid polynomial degree, and modality-specific spectral share for that forecast.
+- `full`: additionally applies a bounded reduced-order correction in the span of the last observed feature change. The correction coefficient comes from counterfactual errors at completed actual anchors and is scaled by the effective model's audio/video output-head sensitivity. It does not compute a Jacobian, JVP, or extra denoiser forward.
+
+### Model and LoRA profile
+
+Before a generation, Spectrum lazily builds a compact scalar profile of the effective `ModelPatcher`. It samples at most 4,096 values from each of eight selected matrices in the final H3 block and `FinalLayer`, estimates projection gain, and reads active patch metadata. For ordinary LoRA updates it evaluates the relative Frobenius magnitude of the composed low-rank update directly from the factors. It does not materialize a full `B @ A` update. Large factor sets use a conservative norm bound; unsupported patch forms lower profile confidence and increase uncertainty instead of being reinterpreted as LoRA.
+
+The final block is emphasized because Spectrum caches the feature immediately after that block; the current native H3 `FinalLayer` consumes that feature directly. Earlier-block patches contribute at a lower weight. This is a structural prior, not a claim that weight spectra are Spectrum's temporal Chebyshev spectrum.
+
+Profiles are kept in a bounded 16-entry process LRU keyed by ComfyUI's clone lineage UUID, patch-set UUID, H3 architecture signature, and bypass-injection adapter metadata including strength and factor identity. Clones with the same effective patch state reuse a profile; `add_patches`, removal/reload, or changed bypass adapters produce a different key. Cached records retain only scalars and strings—no model, patch, CPU weight, or GPU tensor references.
+
+### Live evidence, replay, and samplers
+
+At actual anchors, Spectrum samples at most 4,096 feature values per branch and modality to measure the previous counterfactual forecast/hold ratio, curvature, fit condition, and residual projection. This trajectory evidence gradually calibrates the static prior: a strongly patched but smooth trajectory can regain confidence, while a nominal base model with abrupt observed behavior loses it. The fitting path uses only a small Chebyshev design/Gram system; it never introduces a per-feature regularization matrix.
+
+Offline capture stores each forecast's selected degree, ridge value, audio/video blends, and correction gains as scalar decision state. Replay uses those exact decisions after dynamically inserted anchors, preserving step alignment and the default `audio_blend_weight=0` fix. No tensor from the model profile is archived.
+
+Euler, deterministic RES/CFG++, MiniMax-H3 Turbo, and native `er_sde` retain their existing hard one-forecast horizon and refresh rules. On `er_sde`, evidence is generation-local and tied to the current seeded trajectory; it is never reused across runs. Offline replay still requires the existing seeded native ER-SDE components and rejects custom noise samplers/scalers.
+
+### Overhead, debugging, and limitations
+
+Debug mode reports profile cache/build time, retained and temporary workspace estimates, patch coverage, sensitivity, per-anchor evidence, per-forecast risk/confidence/fitting/correction choices, adaptive extra NFEs, and model-informed versus generic correction error ratios. It logs scalar aggregates only.
+
+The automated CPU fixture verifies bounded construction and per-step behavior but does not contain a full MiniMax-H3 checkpoint. Therefore this repository does **not** yet claim that static weight/LoRA statistics correlate with real-checkpoint forecast error, that adaptive fitting improves quality at equal NFE, or that the model-scaled correction beats generic residual feedback at equal wall-clock time. `full` should be treated as a research ablation, not a quality preset. Until the fixed-seed matrix in [MODEL_AWARE_BENCHMARK.md](MODEL_AWARE_BENCHMARK.md) has real-checkpoint results, the recommended production setting remains `off`; `schedule` is the most conservative starting point for controlled experiments.
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
@@ -390,8 +422,10 @@ Automated tests cover:
 - separate residual output-head timing, offline archive/build timing, per-modality cross-validation/effective-blend reporting, replay anchor/smoothed counts, and replay smoother history/chunk reporting;
 - continuous two-pass ComfyUI progress, capture progress callbacks, capture-and-replay KJ preview updates, replay-only ordinary external callback side effects and previews, and clean progress completion on recoverable replay fallbacks;
 - downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release.
+- scalar-only model/LoRA profile construction for base, single, stacked, differently weighted, zero-strength, and unknown patches; clone reuse, patch UUID invalidation, bounded cache lifetime, and no retained model references;
+- model-aware risk calibration, bounded adaptive ridge/degree/blend and correction, sampled anchor evidence, and risk-only insertion of actual evaluations without relaxing sampler constraints.
 
-The v0.2.5 suite passes 183 tests against the attached current ComfyUI source; four CUDA-only test cases are skipped in the CPU test environment. GitHub Actions also passes the full test suite against the three reviewed ComfyUI revisions listed in the test matrix.
+The model-aware development suite passes 213 tests against the attached current ComfyUI source in the CPU test environment; 11 native/CUDA cases are skipped where optional runtime dependencies or CUDA are unavailable. GitHub Actions remains the authoritative multi-revision check after this branch is published.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).
 
@@ -441,6 +475,7 @@ ComfyUI-Spectrum-MiniMax-H3/
 |   |-- config.py
 |   |-- experiments.py
 |   |-- forecast.py
+|   |-- model_aware.py
 |   |-- nodes.py
 |   |-- runtime.py
 |   |-- rollback.py
