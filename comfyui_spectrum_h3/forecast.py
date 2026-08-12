@@ -9,6 +9,8 @@ import torch
 
 from .model_aware import AnchorEvidence, AnchorEvidenceTiming, StreamAnchorEvidence
 
+_EXACT_HEAD_SAMPLE_ROWS = 32
+
 
 @dataclass(slots=True)
 class _HistoryEntry:
@@ -20,6 +22,9 @@ class _HistoryEntry:
 class ForecasterSnapshot:
     history: list[_HistoryEntry]
     evidence_history: list[dict[str, torch.Tensor]]
+    exact_head_history: list[dict[str, torch.Tensor]]
+    exact_head_row_indices: dict[str, torch.Tensor]
+    exact_head_shapes: dict[str, tuple[int, int]]
     evidence_segments: tuple[tuple[str, int, int], ...] | None
     feature_shape: tuple[int, ...] | None
     feature_dtype: torch.dtype | None
@@ -68,6 +73,9 @@ class HistoryWeightForecaster:
     def reset(self) -> None:
         self._history: list[_HistoryEntry] = []
         self._evidence_history: list[dict[str, torch.Tensor]] = []
+        self._exact_head_history: list[dict[str, torch.Tensor]] = []
+        self._exact_head_row_indices: dict[str, torch.Tensor] = {}
+        self._exact_head_shapes: dict[str, tuple[int, int]] = {}
         self._evidence_segments: tuple[tuple[str, int, int], ...] | None = None
         self._feature_shape: tuple[int, ...] | None = None
         self._feature_dtype: torch.dtype | None = None
@@ -82,11 +90,17 @@ class HistoryWeightForecaster:
         self.last_prediction_max_fp32_elements = 0
         self.model_aware_fit_seconds = 0.0
         self.model_aware_correction_seconds = 0.0
+        self.model_aware_exact_head_projection_seconds = 0.0
+        self.model_aware_exact_head_projection_calls = 0
+        self.model_aware_exact_head_workspace_bytes = 0
 
     def snapshot(self) -> ForecasterSnapshot:
         return ForecasterSnapshot(
             history=list(self._history),
             evidence_history=[dict(entry) for entry in self._evidence_history],
+            exact_head_history=[dict(entry) for entry in self._exact_head_history],
+            exact_head_row_indices=dict(self._exact_head_row_indices),
+            exact_head_shapes=dict(self._exact_head_shapes),
             evidence_segments=self._evidence_segments,
             feature_shape=self._feature_shape,
             feature_dtype=self._feature_dtype,
@@ -104,6 +118,9 @@ class HistoryWeightForecaster:
             raise TypeError("snapshot must be a ForecasterSnapshot")
         self._history = list(snapshot.history)
         self._evidence_history = [dict(entry) for entry in snapshot.evidence_history]
+        self._exact_head_history = [dict(entry) for entry in snapshot.exact_head_history]
+        self._exact_head_row_indices = dict(snapshot.exact_head_row_indices)
+        self._exact_head_shapes = dict(snapshot.exact_head_shapes)
         self._evidence_segments = snapshot.evidence_segments
         self._feature_shape = snapshot.feature_shape
         self._feature_dtype = snapshot.feature_dtype
@@ -149,6 +166,12 @@ class HistoryWeightForecaster:
             for entry in self._evidence_history
             for sample in entry.values()
         )
+        tensors.extend(
+            sample
+            for entry in self._exact_head_history
+            for sample in entry.values()
+        )
+        tensors.extend(self._exact_head_row_indices.values())
         tensors.extend(t for t in (self._design, self._cholesky) if t is not None)
         return sum(t.numel() * t.element_size() for t in tensors)
 
@@ -158,10 +181,25 @@ class HistoryWeightForecaster:
 
     @property
     def evidence_tensor_bytes(self) -> int:
+        return self.generic_evidence_tensor_bytes + self.exact_head_evidence_tensor_bytes
+
+    @property
+    def generic_evidence_tensor_bytes(self) -> int:
         return sum(
             sample.numel() * sample.element_size()
             for entry in self._evidence_history
             for sample in entry.values()
+        )
+
+    @property
+    def exact_head_evidence_tensor_bytes(self) -> int:
+        return sum(
+            sample.numel() * sample.element_size()
+            for entry in self._exact_head_history
+            for sample in entry.values()
+        ) + sum(
+            indices.numel() * indices.element_size()
+            for indices in self._exact_head_row_indices.values()
         )
 
     def ready(self, minimum: int | None = None) -> bool:
@@ -178,6 +216,52 @@ class HistoryWeightForecaster:
             columns.append(2.0 * x * columns[-1] - columns[-2])
         return torch.cat(columns[: degree + 1], dim=1)
 
+    @staticmethod
+    def _complete_row_indices(
+        row_count: int,
+        branch_count: int,
+        device: torch.device,
+        *,
+        limit: int = _EXACT_HEAD_SAMPLE_ROWS,
+    ) -> torch.Tensor:
+        rows = int(row_count)
+        branches = int(branch_count)
+        if rows < 1 or branches < 1:
+            raise ValueError("exact head evidence requires non-empty stream rows and branches")
+        count = min(rows, max(1, int(limit) // branches))
+        positions = torch.arange(count, device=device, dtype=torch.int64)
+        return (((2 * positions + 1) * rows) // (2 * count)).clamp_max(rows - 1)
+
+    @staticmethod
+    def _project_hidden_rows(
+        feature: torch.Tensor,
+        start_row: int,
+        end_row: int,
+        row_indices: torch.Tensor,
+        head_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        if feature.ndim != 3:
+            raise ValueError("exact head evidence requires [branch, row, hidden] features")
+        hidden = int(feature.shape[-1])
+        if (
+            head_weight.ndim != 2
+            or int(head_weight.shape[1]) != hidden
+            or head_weight.device != feature.device
+            or head_weight.dtype != torch.float32
+        ):
+            raise ValueError("FinalLayer head operator is incompatible with cached hidden rows")
+        if row_indices.ndim != 1 or row_indices.device != feature.device:
+            raise ValueError("exact head row indices are incompatible with cached hidden rows")
+        selected = feature[:, int(start_row) : int(end_row)].index_select(
+            1,
+            row_indices,
+        )
+        projected = torch.matmul(
+            selected.to(dtype=torch.float32),
+            head_weight.transpose(0, 1),
+        )
+        return projected.contiguous()
+
     def update(
         self,
         coordinate: float,
@@ -185,6 +269,7 @@ class HistoryWeightForecaster:
         *,
         take_ownership: bool = False,
         evidence_segments: Sequence[tuple[str, int, int]] | None = None,
+        exact_head_weights: dict[str, torch.Tensor] | None = None,
     ) -> None:
         if not torch.is_tensor(feature) or not feature.dtype.is_floating_point:
             raise ValueError("Spectrum history features must be floating-point tensors")
@@ -201,6 +286,7 @@ class HistoryWeightForecaster:
 
         detached = feature.detach()
         sampled_evidence = None
+        exact_head_evidence: dict[str, torch.Tensor] = {}
         normalized_segments = None
         clear_evidence = evidence_segments is None and bool(self._evidence_history)
         if evidence_segments is not None:
@@ -225,6 +311,54 @@ class HistoryWeightForecaster:
                 name: self._sample_segment_device(detached, start, end)
                 for name, start, end in normalized_segments
             }
+            head_weights = exact_head_weights or {}
+            projection_started = time.perf_counter() if head_weights else None
+            for name, start, end in normalized_segments:
+                head_weight = head_weights.get(name)
+                if head_weight is None:
+                    continue
+                row_count = int(end) - int(start)
+                indices = self._exact_head_row_indices.get(name)
+                if indices is None:
+                    indices = self._complete_row_indices(
+                        row_count,
+                        int(detached.shape[0]),
+                        detached.device,
+                    )
+                    self._exact_head_row_indices[name] = indices
+                shape = (int(head_weight.shape[0]), int(head_weight.shape[1]))
+                previous_shape = self._exact_head_shapes.get(name)
+                if previous_shape is not None and previous_shape != shape:
+                    raise ValueError("FinalLayer head operator shape changed during actual history")
+                self._exact_head_shapes[name] = shape
+                exact_head_evidence[name] = self._project_hidden_rows(
+                    detached,
+                    start,
+                    end,
+                    indices,
+                    head_weight,
+                )
+                self.model_aware_exact_head_workspace_bytes = max(
+                    self.model_aware_exact_head_workspace_bytes,
+                    int(detached.shape[0])
+                    * int(indices.numel())
+                    * (int(detached.shape[-1]) + int(head_weight.shape[0]))
+                    * torch.tensor([], dtype=torch.float32).element_size(),
+                )
+                self.model_aware_exact_head_projection_calls += 1
+            if projection_started is not None:
+                self.model_aware_exact_head_projection_seconds += (
+                    time.perf_counter() - projection_started
+                )
+            if self._history:
+                if len(self._exact_head_history) not in {0, len(self._history)}:
+                    raise ValueError("exact head evidence history is not aligned")
+                if self._exact_head_history and (
+                    set(exact_head_evidence) != set(self._exact_head_history[0])
+                ):
+                    raise ValueError("exact head evidence streams changed during actual history")
+                if not self._exact_head_history and exact_head_evidence:
+                    raise ValueError("exact head evidence sampling cannot start after history")
         storage_device = torch.device("cpu") if self.history_storage == "system_ram" else detached.device
         if self._history_device is None:
             self._history_device = storage_device
@@ -243,13 +377,20 @@ class HistoryWeightForecaster:
         if sampled_evidence is not None:
             self._evidence_segments = normalized_segments
             self._evidence_history.append(sampled_evidence)
+            if exact_head_evidence:
+                self._exact_head_history.append(exact_head_evidence)
         elif clear_evidence:
             self._evidence_history.clear()
+            self._exact_head_history.clear()
+            self._exact_head_row_indices.clear()
+            self._exact_head_shapes.clear()
             self._evidence_segments = None
         if len(self._history) > self.max_history:
             self._history.pop(0)
             if self._evidence_history:
                 self._evidence_history.pop(0)
+            if self._exact_head_history:
+                self._exact_head_history.pop(0)
         self._generation += 1
         self._design = None
         self._cholesky = None
@@ -468,12 +609,14 @@ class HistoryWeightForecaster:
         self,
         coordinate: float,
         actual_feature: torch.Tensor,
-        stream_parameters: Sequence[tuple[str, int, int, float, float, float, float]],
+        stream_parameters: Sequence[
+            tuple[str, int, int, float, float, float, float, float]
+        ],
         *,
         degree: int,
         ridge_lambda: float,
-        stream_sensitivities: dict[str, torch.Tensor] | None = None,
-        sensitivity_transfer_seconds: float = 0.0,
+        stream_diagonals: dict[str, torch.Tensor] | None = None,
+        exact_head_weights: dict[str, torch.Tensor] | None = None,
     ) -> AnchorEvidence | None:
         if len(self._history) < 2 or self._feature_shape is None:
             return None
@@ -486,6 +629,7 @@ class HistoryWeightForecaster:
         sample_index_seconds = 0.0
         scalar_transfer_seconds = 0.0
         reduction_seconds = 0.0
+        exact_head_projection_seconds = 0.0
         for (
             name,
             start,
@@ -493,6 +637,7 @@ class HistoryWeightForecaster:
             blend,
             model_gain,
             generic_gain,
+            diagonal_candidate_gain,
             model_candidate_gain,
         ) in stream_parameters:
             fit_started = time.perf_counter()
@@ -513,19 +658,56 @@ class HistoryWeightForecaster:
             )
             if any(sample.device != actual.device for sample in history_samples):
                 raise RuntimeError("model-aware evidence device changed during actual history")
-            sensitivity = None if stream_sensitivities is None else stream_sensitivities.get(str(name))
-            if sensitivity is not None and sensitivity.device != actual.device:
+            diagonal = None if stream_diagonals is None else stream_diagonals.get(str(name))
+            if diagonal is not None and diagonal.device != actual.device:
                 raise ValueError("FinalLayer head sensitivity is on the wrong evidence device")
-            sampled_sensitivity = (
+            sampled_diagonal = (
                 None
-                if sensitivity is None
+                if diagonal is None
                 else self._sample_channel_sensitivity(
                     self._feature_shape,
                     int(start),
                     int(end),
-                    sensitivity,
+                    diagonal,
                 )
             )
+            head_weight = (
+                None
+                if exact_head_weights is None
+                else exact_head_weights.get(str(name))
+            )
+            actual_head = None
+            history_head: list[torch.Tensor] = []
+            if head_weight is not None:
+                if len(self._exact_head_history) != len(self._history):
+                    raise RuntimeError("exact head evidence history is not aligned")
+                indices = self._exact_head_row_indices.get(str(name))
+                if indices is None:
+                    raise RuntimeError("exact head evidence row indices are missing")
+                history_head = [
+                    entry[str(name)] for entry in self._exact_head_history
+                ]
+                if any(sample.device != actual.device for sample in history_head):
+                    raise RuntimeError("exact head evidence device changed during actual history")
+                head_projection_started = time.perf_counter()
+                actual_head = self._project_hidden_rows(
+                    actual_feature,
+                    int(start),
+                    int(end),
+                    indices,
+                    head_weight,
+                )
+                self.model_aware_exact_head_workspace_bytes = max(
+                    self.model_aware_exact_head_workspace_bytes,
+                    int(actual_feature.shape[0])
+                    * int(indices.numel())
+                    * (int(actual_feature.shape[-1]) + int(head_weight.shape[0]))
+                    * torch.tensor([], dtype=torch.float32).element_size(),
+                )
+                head_projection_elapsed = time.perf_counter() - head_projection_started
+                exact_head_projection_seconds += head_projection_elapsed
+                self.model_aware_exact_head_projection_seconds += head_projection_elapsed
+                self.model_aware_exact_head_projection_calls += 1
             sample_index_seconds += time.perf_counter() - selection_started
             reduction_started = time.perf_counter()
             predicted = torch.zeros_like(actual)
@@ -546,47 +728,119 @@ class HistoryWeightForecaster:
             projection = torch.dot(residual, delta) / torch.dot(delta, delta).clamp_min(
                 dot_epsilon
             )
-            if sampled_sensitivity is None:
-                model_projection = projection
+            if sampled_diagonal is None:
+                diagonal_projection = projection
             else:
-                weighted_delta = sampled_sensitivity * delta
-                model_projection = torch.dot(residual, weighted_delta) / torch.dot(
+                weighted_delta = sampled_diagonal * delta
+                diagonal_projection = torch.dot(residual, weighted_delta) / torch.dot(
                     delta,
                     weighted_delta,
                 ).clamp_min(dot_epsilon)
+            predicted_head = None
+            latest_head = previous_head = delta_head = residual_head = None
+            if actual_head is None:
+                model_projection = projection
+            else:
+                predicted_head = torch.zeros_like(actual_head)
+                for weight, sample in zip(
+                    raw_weights.tolist(),
+                    history_head,
+                    strict=True,
+                ):
+                    if weight != 0.0:
+                        predicted_head.add_(sample, alpha=float(weight))
+                latest_head = history_head[-1]
+                previous_head = history_head[-2]
+                delta_head = latest_head - previous_head
+                residual_head = actual_head - predicted_head
+                flattened_delta_head = delta_head.reshape(-1)
+                flattened_residual_head = residual_head.reshape(-1)
+                head_epsilon = (
+                    torch.sqrt(torch.mean(actual_head.square()))
+                    .mul(1e-6)
+                    .clamp_min(torch.finfo(torch.float32).eps)
+                )
+                head_dot_epsilon = head_epsilon.square() * max(
+                    1,
+                    int(flattened_delta_head.numel()),
+                )
+                model_projection = torch.dot(
+                    flattened_residual_head,
+                    flattened_delta_head,
+                ) / torch.dot(
+                    flattened_delta_head,
+                    flattened_delta_head,
+                ).clamp_min(head_dot_epsilon)
             forecast_ratio = forecast_rms / hold_rms
             model_predicted = predicted + float(model_gain) * delta
             generic_predicted = predicted + float(generic_gain) * delta
+            diagonal_candidate_predicted = (
+                predicted + float(diagonal_candidate_gain) * delta
+            )
             model_candidate_predicted = predicted + float(model_candidate_gain) * delta
             model_error = actual - model_predicted
             generic_error = actual - generic_predicted
+            diagonal_candidate_error = actual - diagonal_candidate_predicted
             model_candidate_error = actual - model_candidate_predicted
             model_ratio = torch.sqrt(torch.mean(model_error.square())) / hold_rms
             generic_ratio = torch.sqrt(torch.mean(generic_error.square())) / hold_rms
+            diagonal_candidate_ratio = (
+                torch.sqrt(torch.mean(diagonal_candidate_error.square())) / hold_rms
+            )
             model_candidate_ratio = (
                 torch.sqrt(torch.mean(model_candidate_error.square())) / hold_rms
             )
-            if sampled_sensitivity is None:
+            if actual_head is None:
                 model_head_ratio = model_ratio
                 generic_head_ratio = generic_ratio
+                diagonal_candidate_head_ratio = diagonal_candidate_ratio
                 model_candidate_head_ratio = model_candidate_ratio
             else:
-                sensitivity_sum = sampled_sensitivity.sum().clamp_min(
-                    torch.finfo(torch.float32).eps
-                )
-                weighted_hold_rms = torch.sqrt(
-                    torch.sum(sampled_sensitivity * hold_error.square()) / sensitivity_sum
-                ).clamp_min(epsilon)
+                assert predicted_head is not None
+                assert latest_head is not None
+                assert delta_head is not None
+                head_hold_error = actual_head - latest_head
+                head_hold_rms = torch.sqrt(
+                    torch.mean(head_hold_error.square())
+                ).clamp_min(head_epsilon)
                 model_head_ratio = torch.sqrt(
-                    torch.sum(sampled_sensitivity * model_error.square()) / sensitivity_sum
-                ) / weighted_hold_rms
+                    torch.mean(
+                        (
+                            actual_head
+                            - (predicted_head + float(model_gain) * delta_head)
+                        ).square()
+                    )
+                ) / head_hold_rms
                 generic_head_ratio = torch.sqrt(
-                    torch.sum(sampled_sensitivity * generic_error.square()) / sensitivity_sum
-                ) / weighted_hold_rms
+                    torch.mean(
+                        (
+                            actual_head
+                            - (predicted_head + float(generic_gain) * delta_head)
+                        ).square()
+                    )
+                ) / head_hold_rms
+                diagonal_candidate_head_ratio = torch.sqrt(
+                    torch.mean(
+                        (
+                            actual_head
+                            - (
+                                predicted_head
+                                + float(diagonal_candidate_gain) * delta_head
+                            )
+                        ).square()
+                    )
+                ) / head_hold_rms
                 model_candidate_head_ratio = torch.sqrt(
-                    torch.sum(sampled_sensitivity * model_candidate_error.square())
-                    / sensitivity_sum
-                ) / weighted_hold_rms
+                    torch.mean(
+                        (
+                            actual_head
+                            - (
+                                predicted_head
+                                + float(model_candidate_gain) * delta_head
+                            )
+                        ).square()
+                    )
+                ) / head_hold_rms
             if len(history_samples) >= 3:
                 curvature = latest - 2.0 * previous + history_samples[-3]
                 curvature_ratio = torch.sqrt(torch.mean(curvature.square())) / torch.sqrt(
@@ -599,12 +853,15 @@ class HistoryWeightForecaster:
                     forecast_ratio,
                     curvature_ratio,
                     projection,
+                    diagonal_projection,
                     model_projection,
                     model_ratio,
                     generic_ratio,
+                    diagonal_candidate_ratio,
                     model_candidate_ratio,
                     model_head_ratio,
                     generic_head_ratio,
+                    diagonal_candidate_head_ratio,
                     model_candidate_head_ratio,
                 )
             )
@@ -614,12 +871,15 @@ class HistoryWeightForecaster:
                 forecast_ratio_value,
                 curvature_ratio_value,
                 projection_value,
+                diagonal_projection_value,
                 model_projection_value,
                 model_ratio_value,
                 generic_ratio_value,
+                diagonal_candidate_ratio_value,
                 model_candidate_ratio_value,
                 model_head_ratio_value,
                 generic_head_ratio_value,
+                diagonal_candidate_head_ratio_value,
                 model_candidate_head_ratio_value,
             ) = scalar_values.detach().to(device="cpu").tolist()
             scalar_transfer_seconds += time.perf_counter() - transfer_started
@@ -629,10 +889,13 @@ class HistoryWeightForecaster:
                 residual_projection=projection_value,
                 model_corrected_ratio=model_ratio_value,
                 generic_corrected_ratio=generic_ratio_value,
+                diagonal_projection=diagonal_projection_value,
                 model_projection=model_projection_value,
+                diagonal_candidate_ratio=diagonal_candidate_ratio_value,
                 model_candidate_ratio=model_candidate_ratio_value,
                 model_corrected_head_ratio=model_head_ratio_value,
                 generic_corrected_head_ratio=generic_head_ratio_value,
+                diagonal_candidate_head_ratio=diagonal_candidate_head_ratio_value,
                 model_candidate_head_ratio=model_candidate_head_ratio_value,
             )
         if "packed" in stream_evidence:
@@ -647,12 +910,15 @@ class HistoryWeightForecaster:
                 evidence.forecast_ratio,
                 evidence.curvature_ratio,
                 evidence.residual_projection,
+                evidence.diagonal_projection,
                 evidence.model_projection,
                 evidence.model_corrected_ratio,
                 evidence.generic_corrected_ratio,
+                evidence.diagonal_candidate_ratio,
                 evidence.model_candidate_ratio,
                 evidence.model_corrected_head_ratio,
                 evidence.generic_corrected_head_ratio,
+                evidence.diagonal_candidate_head_ratio,
                 evidence.model_candidate_head_ratio,
             )
         ]
@@ -681,11 +947,12 @@ class HistoryWeightForecaster:
                 weight_fit_seconds=weight_fit_seconds,
                 sample_index_seconds=sample_index_seconds,
                 device_transfer_seconds=(
-                    float(sensitivity_transfer_seconds) + scalar_transfer_seconds
+                    scalar_transfer_seconds
                 ),
-                sensitivity_transfer_seconds=float(sensitivity_transfer_seconds),
+                sensitivity_transfer_seconds=0.0,
                 scalar_transfer_seconds=scalar_transfer_seconds,
                 reduction_seconds=reduction_seconds,
+                exact_head_projection_seconds=exact_head_projection_seconds,
                 fit_condition_seconds=fit_condition_seconds,
             ),
         )

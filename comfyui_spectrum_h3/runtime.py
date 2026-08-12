@@ -144,7 +144,13 @@ class RuntimeStats:
     model_aware_evidence_sensitivity_transfer_seconds: float = 0.0
     model_aware_evidence_scalar_transfer_seconds: float = 0.0
     model_aware_evidence_reduction_seconds: float = 0.0
+    model_aware_evidence_exact_head_projection_seconds: float = 0.0
     model_aware_evidence_fit_condition_seconds: float = 0.0
+    model_aware_head_materialization_seconds: float = 0.0
+    model_aware_head_materialized_bytes: int = 0
+    model_aware_exact_head_projection_seconds: float = 0.0
+    model_aware_exact_head_projection_calls: int = 0
+    model_aware_exact_head_workspace_bytes: int = 0
     model_aware_fit_seconds: float = 0.0
     model_aware_correction_seconds: float = 0.0
     model_aware_causal_correction_seconds: float = 0.0
@@ -461,6 +467,31 @@ class SpectrumH3Runtime:
                 ("video", audio_rows, target_rows),
             )
         return (("packed", 0, target_rows),)
+
+    def _model_aware_head_metrics(
+        self,
+        device: torch.device,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        if self.config.model_aware_mode != "full":
+            return {}, {}
+        weights: dict[str, torch.Tensor] = {}
+        diagonals: dict[str, torch.Tensor] = {}
+        materialization_seconds = 0.0
+        for stream in ("audio", "video"):
+            weight, diagonal, elapsed = self.model_aware.head_metric_tensors(
+                stream,
+                device,
+            )
+            materialization_seconds += elapsed
+            if weight is not None and diagonal is not None:
+                weights[stream] = weight
+                diagonals[stream] = diagonal
+        self.stats.model_aware_head_materialization_seconds += materialization_seconds
+        self.stats.model_aware_head_materialized_bytes = (
+            self.model_aware.materialized_head_bytes
+        )
+        self.stats.model_aware_overhead_seconds += materialization_seconds
+        return weights, diagonals
 
     def _prediction_segments(self, call: _CallState) -> tuple[tuple[int, int, float], ...]:
         audio_blend_weight, video_blend_weight = self._causal_prediction_blends()
@@ -1417,6 +1448,8 @@ class SpectrumH3Runtime:
         self,
         step: _StepState,
         combined: torch.Tensor,
+        exact_head_weights: dict[str, torch.Tensor],
+        stream_diagonals: dict[str, torch.Tensor],
     ) -> None:
         if not self._model_aware_enabled() or self.forecaster.history_length < 2:
             return
@@ -1432,17 +1465,6 @@ class SpectrumH3Runtime:
             )
             generic_audio, generic_video = self.model_aware.generic_correction_gains(decision)
             parameters = []
-            stream_sensitivities: dict[str, torch.Tensor] = {}
-            sensitivity_transfer_seconds = 0.0
-            if self.config.model_aware_mode == "full":
-                for stream in ("audio", "video"):
-                    sensitivity, elapsed = self.model_aware.channel_sensitivity(
-                        stream,
-                        combined.device,
-                    )
-                    sensitivity_transfer_seconds += elapsed
-                    if sensitivity is not None:
-                        stream_sensitivities[stream] = sensitivity
             # A zero audio spectral blend selects the linear/local audio predictor;
             # it does not bypass audio forecasting. H3 emits packed audio and video
             # features from the same transformer evaluation, so an actual anchor
@@ -1455,6 +1477,9 @@ class SpectrumH3Runtime:
                     blend = decision.audio_blend_weight
                     model_gain = decision.audio_correction_gain
                     generic_gain = generic_audio
+                    diagonal_candidate_gain = (
+                        decision.audio_correction_telemetry.diagonal_candidate_gain
+                    )
                     model_candidate_gain = (
                         decision.audio_correction_telemetry.model_candidate_gain
                     )
@@ -1462,6 +1487,9 @@ class SpectrumH3Runtime:
                     blend = decision.video_blend_weight
                     model_gain = decision.video_correction_gain
                     generic_gain = generic_video
+                    diagonal_candidate_gain = (
+                        decision.video_correction_telemetry.diagonal_candidate_gain
+                    )
                     model_candidate_gain = (
                         decision.video_correction_telemetry.model_candidate_gain
                     )
@@ -1480,6 +1508,10 @@ class SpectrumH3Runtime:
                         decision.audio_correction_gain + decision.video_correction_gain
                     )
                     generic_gain = 0.5 * (generic_audio + generic_video)
+                    diagonal_candidate_gain = 0.5 * (
+                        decision.audio_correction_telemetry.diagonal_candidate_gain
+                        + decision.video_correction_telemetry.diagonal_candidate_gain
+                    )
                     model_candidate_gain = 0.5 * (
                         decision.audio_correction_telemetry.model_candidate_gain
                         + decision.video_correction_telemetry.model_candidate_gain
@@ -1492,6 +1524,7 @@ class SpectrumH3Runtime:
                         blend,
                         model_gain,
                         generic_gain,
+                        diagonal_candidate_gain,
                         model_candidate_gain,
                     )
                 )
@@ -1501,8 +1534,8 @@ class SpectrumH3Runtime:
                 parameters,
                 degree=decision.degree,
                 ridge_lambda=decision.ridge_lambda,
-                stream_sensitivities=stream_sensitivities,
-                sensitivity_transfer_seconds=sensitivity_transfer_seconds,
+                stream_diagonals=stream_diagonals,
+                exact_head_weights=exact_head_weights,
             )
             if evidence is not None:
                 self.model_aware.observe_anchor(evidence, decision)
@@ -1525,6 +1558,15 @@ class SpectrumH3Runtime:
                 self.stats.model_aware_evidence_reduction_seconds += (
                     evidence.timing.reduction_seconds
                 )
+                self.stats.model_aware_evidence_exact_head_projection_seconds += (
+                    evidence.timing.exact_head_projection_seconds
+                )
+                self.stats.model_aware_exact_head_projection_seconds += (
+                    evidence.timing.exact_head_projection_seconds
+                )
+                self.stats.model_aware_exact_head_projection_calls += len(
+                    exact_head_weights
+                )
                 self.stats.model_aware_evidence_fit_condition_seconds += (
                     evidence.timing.fit_condition_seconds
                 )
@@ -1544,35 +1586,20 @@ class SpectrumH3Runtime:
                         "curvature_ratio_audio=%.6f curvature_ratio_video=%.6f "
                         "curvature_ratio_aggregate=max(audio,video)=%.6f "
                         "fit_condition=%.6f "
-                        "audio_generic_projection=%.6f audio_head_projection=%.6f "
-                        "video_generic_projection=%.6f video_head_projection=%.6f "
+                        "audio_generic_projection=%.6f audio_diagonal_projection=%.6f "
+                        "audio_exact_head_projection=%.6f "
+                        "video_generic_projection=%.6f video_diagonal_projection=%.6f "
+                        "video_exact_head_projection=%.6f "
                         "audio_applied_ratio=%.6f audio_generic_ratio=%.6f "
-                        "audio_model_candidate_ratio=%.6f "
+                        "audio_diagonal_candidate_ratio=%.6f audio_exact_candidate_ratio=%.6f "
                         "audio_applied_head_ratio=%.6f audio_generic_head_ratio=%.6f "
-                        "audio_model_candidate_head_ratio=%.6f "
+                        "audio_diagonal_candidate_head_ratio=%.6f "
+                        "audio_exact_candidate_head_ratio=%.6f "
                         "video_applied_ratio=%.6f video_generic_ratio=%.6f "
-                        "video_model_candidate_ratio=%.6f "
+                        "video_diagonal_candidate_ratio=%.6f video_exact_candidate_ratio=%.6f "
                         "video_applied_head_ratio=%.6f video_generic_head_ratio=%.6f "
-                        "video_model_candidate_head_ratio=%.6f "
-                        "audio_raw_generic_gain=%.6f audio_raw_model_gain=%.6f "
-                        "audio_generic_gain=%.6f audio_model_candidate_gain=%.6f "
-                        "audio_applied_gain=%.6f audio_model_trust=%.6f "
-                        "audio_model_trust_next=%.6f "
-                        "audio_generic_bound_active=%s audio_model_bound_active=%s "
-                        "audio_gain_delta_pre_bound=%.6f audio_gain_delta_post_bound=%.6f "
-                        "audio_gain_delta_applied=%.6f "
-                        "video_raw_generic_gain=%.6f video_raw_model_gain=%.6f "
-                        "video_generic_gain=%.6f video_model_candidate_gain=%.6f "
-                        "video_applied_gain=%.6f video_model_trust=%.6f "
-                        "video_model_trust_next=%.6f "
-                        "video_generic_bound_active=%s video_model_bound_active=%s "
-                        "video_gain_delta_pre_bound=%.6f video_gain_delta_post_bound=%.6f "
-                        "video_gain_delta_applied=%.6f "
-                        "evidence_weight_fit_s=%.6f evidence_sample_index_s=%.6f "
-                        "evidence_device_transfer_s=%.6f "
-                        "evidence_sensitivity_transfer_s=%.6f evidence_scalar_transfer_s=%.6f "
-                        "evidence_reduction_s=%.6f "
-                        "evidence_fit_condition_s=%.6f",
+                        "video_diagonal_candidate_head_ratio=%.6f "
+                        "video_exact_candidate_head_ratio=%.6f",
                         step.step_id,
                         evidence.audio.forecast_ratio,
                         evidence.video.forecast_ratio,
@@ -1582,51 +1609,97 @@ class SpectrumH3Runtime:
                         evidence.curvature_ratio,
                         evidence.fit_condition,
                         evidence.audio.residual_projection,
+                        evidence.audio.diagonal_projection,
                         evidence.audio.model_projection,
                         evidence.video.residual_projection,
+                        evidence.video.diagonal_projection,
                         evidence.video.model_projection,
                         evidence.audio.model_corrected_ratio,
                         evidence.audio.generic_corrected_ratio,
+                        evidence.audio.diagonal_candidate_ratio,
                         evidence.audio.model_candidate_ratio,
                         evidence.audio.model_corrected_head_ratio,
                         evidence.audio.generic_corrected_head_ratio,
+                        evidence.audio.diagonal_candidate_head_ratio,
                         evidence.audio.model_candidate_head_ratio,
                         evidence.video.model_corrected_ratio,
                         evidence.video.generic_corrected_ratio,
+                        evidence.video.diagonal_candidate_ratio,
                         evidence.video.model_candidate_ratio,
                         evidence.video.model_corrected_head_ratio,
                         evidence.video.generic_corrected_head_ratio,
+                        evidence.video.diagonal_candidate_head_ratio,
                         evidence.video.model_candidate_head_ratio,
+                    )
+                    LOG.warning(
+                        "Spectrum H3 model-aware correction step=%s "
+                        "audio_raw_generic_gain=%.6f audio_raw_diagonal_gain=%.6f "
+                        "audio_raw_exact_gain=%.6f audio_generic_gain=%.6f "
+                        "audio_diagonal_candidate_gain=%.6f audio_exact_candidate_gain=%.6f "
+                        "audio_applied_gain=%.6f audio_exact_trust=%.6f "
+                        "audio_exact_trust_next=%.6f audio_generic_bound_active=%s "
+                        "audio_diagonal_bound_active=%s audio_exact_bound_active=%s "
+                        "audio_exact_generic_delta_pre=%.6f audio_exact_generic_delta_post=%.6f "
+                        "audio_exact_diagonal_delta_pre=%.6f "
+                        "audio_exact_diagonal_delta_post=%.6f audio_applied_delta=%.6f "
+                        "video_raw_generic_gain=%.6f video_raw_diagonal_gain=%.6f "
+                        "video_raw_exact_gain=%.6f video_generic_gain=%.6f "
+                        "video_diagonal_candidate_gain=%.6f video_exact_candidate_gain=%.6f "
+                        "video_applied_gain=%.6f video_exact_trust=%.6f "
+                        "video_exact_trust_next=%.6f video_generic_bound_active=%s "
+                        "video_diagonal_bound_active=%s video_exact_bound_active=%s "
+                        "video_exact_generic_delta_pre=%.6f video_exact_generic_delta_post=%.6f "
+                        "video_exact_diagonal_delta_pre=%.6f "
+                        "video_exact_diagonal_delta_post=%.6f video_applied_delta=%.6f",
+                        step.step_id,
                         audio_gain.raw_generic_gain,
+                        audio_gain.raw_diagonal_gain,
                         audio_gain.raw_model_gain,
                         audio_gain.generic_gain,
+                        audio_gain.diagonal_candidate_gain,
                         audio_gain.model_candidate_gain,
                         audio_gain.model_gain,
                         audio_gain.model_trust,
                         self.model_aware.audio_model_trust,
                         audio_gain.generic_bound_active,
+                        audio_gain.diagonal_bound_active,
                         audio_gain.model_bound_active,
                         audio_gain.pre_bound_delta,
                         audio_gain.post_bound_delta,
+                        audio_gain.exact_diagonal_pre_bound_delta,
+                        audio_gain.exact_diagonal_post_bound_delta,
                         audio_gain.applied_delta,
                         video_gain.raw_generic_gain,
+                        video_gain.raw_diagonal_gain,
                         video_gain.raw_model_gain,
                         video_gain.generic_gain,
+                        video_gain.diagonal_candidate_gain,
                         video_gain.model_candidate_gain,
                         video_gain.model_gain,
                         video_gain.model_trust,
                         self.model_aware.video_model_trust,
                         video_gain.generic_bound_active,
+                        video_gain.diagonal_bound_active,
                         video_gain.model_bound_active,
                         video_gain.pre_bound_delta,
                         video_gain.post_bound_delta,
+                        video_gain.exact_diagonal_pre_bound_delta,
+                        video_gain.exact_diagonal_post_bound_delta,
                         video_gain.applied_delta,
+                    )
+                    LOG.warning(
+                        "Spectrum H3 model-aware evidence timing step=%s "
+                        "evidence_weight_fit_s=%.6f evidence_sample_index_s=%.6f "
+                        "evidence_device_transfer_s=%.6f evidence_scalar_transfer_s=%.6f "
+                        "evidence_reduction_s=%.6f evidence_exact_head_projection_s=%.6f "
+                        "evidence_fit_condition_s=%.6f",
+                        step.step_id,
                         evidence.timing.weight_fit_seconds,
                         evidence.timing.sample_index_seconds,
                         evidence.timing.device_transfer_seconds,
-                        evidence.timing.sensitivity_transfer_seconds,
                         evidence.timing.scalar_transfer_seconds,
                         evidence.timing.reduction_seconds,
+                        evidence.timing.exact_head_projection_seconds,
                         evidence.timing.fit_condition_seconds,
                     )
         except torch.cuda.OutOfMemoryError:
@@ -1756,7 +1829,30 @@ class SpectrumH3Runtime:
             combined = self._aggregate_actual(step)
             residual_result = self._aggregate_residual(step)
             if combined is not None and not self._disabled:
-                self._observe_model_aware_anchor(step, combined)
+                exact_head_weights: dict[str, torch.Tensor] = {}
+                stream_diagonals: dict[str, torch.Tensor] = {}
+                if self._model_aware_enabled():
+                    try:
+                        exact_head_weights, stream_diagonals = (
+                            self._model_aware_head_metrics(combined.device)
+                        )
+                    except torch.cuda.OutOfMemoryError:
+                        raise
+                    except (RuntimeError, TypeError, ValueError) as exc:
+                        self._model_aware_disabled_reason = (
+                            f"head metric materialization failed: {exc}"
+                        )
+                        self.stats.model_aware_failures += 1
+                        LOG.warning(
+                            "Spectrum H3 model-aware correction disabled: %s",
+                            self._model_aware_disabled_reason,
+                        )
+                self._observe_model_aware_anchor(
+                    step,
+                    combined,
+                    exact_head_weights,
+                    stream_diagonals,
+                )
                 if self._offline_phase == "first_pass" and self._offline_archive is not None:
                     assert self._history_labels is not None
                     archive_started = time.perf_counter()
@@ -1774,6 +1870,12 @@ class SpectrumH3Runtime:
                         self.stats.offline_archive_seconds += elapsed
                         self._offline_archive_seconds_total += elapsed
                 update_started = time.perf_counter()
+                exact_projection_before = (
+                    self.forecaster.model_aware_exact_head_projection_seconds
+                )
+                exact_projection_calls_before = (
+                    self.forecaster.model_aware_exact_head_projection_calls
+                )
                 try:
                     self.forecaster.update(
                         step.coordinate,
@@ -1784,11 +1886,37 @@ class SpectrumH3Runtime:
                             if self._model_aware_enabled()
                             else None
                         ),
+                        exact_head_weights=(
+                            exact_head_weights
+                            if self._model_aware_enabled()
+                            else None
+                        ),
                     )
                 except ValueError as exc:
                     self._disable_forecasting(f"actual H3 feature is incompatible with history: {exc}")
                 finally:
                     self.stats.history_update_seconds += time.perf_counter() - update_started
+                    exact_projection_elapsed = max(
+                        0.0,
+                        self.forecaster.model_aware_exact_head_projection_seconds
+                        - exact_projection_before,
+                    )
+                    exact_projection_calls = max(
+                        0,
+                        self.forecaster.model_aware_exact_head_projection_calls
+                        - exact_projection_calls_before,
+                    )
+                    self.stats.model_aware_exact_head_projection_seconds += (
+                        exact_projection_elapsed
+                    )
+                    self.stats.model_aware_exact_head_projection_calls += (
+                        exact_projection_calls
+                    )
+                    self.stats.model_aware_exact_head_workspace_bytes = max(
+                        self.stats.model_aware_exact_head_workspace_bytes,
+                        self.forecaster.model_aware_exact_head_workspace_bytes,
+                    )
+                    self.stats.model_aware_overhead_seconds += exact_projection_elapsed
             self._consecutive_forecasts = 0
             self._required_actual_refreshes = max(0, self._required_actual_refreshes - 1)
             if step.consumes_feedback_refresh:
@@ -1893,7 +2021,10 @@ class SpectrumH3Runtime:
             "model_aware_evidence_sensitivity_transfer_seconds",
             "model_aware_evidence_scalar_transfer_seconds",
             "model_aware_evidence_reduction_seconds",
+            "model_aware_evidence_exact_head_projection_seconds",
             "model_aware_evidence_fit_condition_seconds",
+            "model_aware_head_materialization_seconds",
+            "model_aware_exact_head_projection_seconds",
             "model_aware_fit_seconds",
             "model_aware_causal_correction_seconds",
             "model_aware_offline_correction_seconds",
@@ -1917,6 +2048,7 @@ class SpectrumH3Runtime:
             "model_aware_anchor_updates",
             "model_aware_failures",
             "model_aware_offline_correction_applications",
+            "model_aware_exact_head_projection_calls",
         ):
             setattr(
                 restored,
@@ -1941,6 +2073,14 @@ class SpectrumH3Runtime:
         )
         restored.model_aware_correction_max = max(
             restored.model_aware_correction_max, current.model_aware_correction_max
+        )
+        restored.model_aware_head_materialized_bytes = max(
+            restored.model_aware_head_materialized_bytes,
+            current.model_aware_head_materialized_bytes,
+        )
+        restored.model_aware_exact_head_workspace_bytes = max(
+            restored.model_aware_exact_head_workspace_bytes,
+            current.model_aware_exact_head_workspace_bytes,
         )
 
         self._run.next_step_id = snapshot.next_step_id
@@ -2003,6 +2143,12 @@ class SpectrumH3Runtime:
         video_model_mean = controller.stream_mean("video", "model_corrected_ratio")
         audio_generic_mean = controller.stream_mean("audio", "generic_corrected_ratio")
         video_generic_mean = controller.stream_mean("video", "generic_corrected_ratio")
+        audio_diagonal_mean = controller.stream_mean(
+            "audio", "diagonal_candidate_ratio"
+        )
+        video_diagonal_mean = controller.stream_mean(
+            "video", "diagonal_candidate_ratio"
+        )
         audio_candidate_mean = controller.stream_mean("audio", "model_candidate_ratio")
         video_candidate_mean = controller.stream_mean("video", "model_candidate_ratio")
         audio_candidate_head_mean = controller.stream_mean(
@@ -2017,6 +2163,12 @@ class SpectrumH3Runtime:
         video_generic_head_mean = controller.stream_mean(
             "video", "generic_corrected_head_ratio"
         )
+        audio_diagonal_head_mean = controller.stream_mean(
+            "audio", "diagonal_candidate_head_ratio"
+        )
+        video_diagonal_head_mean = controller.stream_mean(
+            "video", "diagonal_candidate_head_ratio"
+        )
         audio_delta_pre_mean = controller.stream_mean("audio", "gain_delta_pre_abs")
         video_delta_pre_mean = controller.stream_mean("video", "gain_delta_pre_abs")
         audio_delta_post_mean = controller.stream_mean("audio", "gain_delta_post_abs")
@@ -2027,8 +2179,16 @@ class SpectrumH3Runtime:
         video_delta_applied_mean = controller.stream_mean(
             "video", "gain_delta_applied_abs"
         )
+        audio_exact_diagonal_delta_mean = controller.stream_mean(
+            "audio", "gain_delta_exact_diagonal_abs"
+        )
+        video_exact_diagonal_delta_mean = controller.stream_mean(
+            "video", "gain_delta_exact_diagonal_abs"
+        )
         head_metric_available = bool(
             controller.profile is not None
+            and controller.profile.audio_head_weight is not None
+            and controller.profile.video_head_weight is not None
             and controller.profile.audio_head_gram_diagonal is not None
             and controller.profile.video_head_gram_diagonal is not None
         )
@@ -2126,7 +2286,13 @@ class SpectrumH3Runtime:
             f"model_aware_evidence_sensitivity_transfer_s={self.stats.model_aware_evidence_sensitivity_transfer_seconds:.6f} "
             f"model_aware_evidence_scalar_transfer_s={self.stats.model_aware_evidence_scalar_transfer_seconds:.6f} "
             f"model_aware_evidence_reduction_s={self.stats.model_aware_evidence_reduction_seconds:.6f} "
+            f"model_aware_evidence_exact_head_projection_s={self.stats.model_aware_evidence_exact_head_projection_seconds:.6f} "
             f"model_aware_evidence_fit_condition_s={self.stats.model_aware_evidence_fit_condition_seconds:.6f} "
+            f"model_aware_head_materialization_s={self.stats.model_aware_head_materialization_seconds:.6f} "
+            f"model_aware_head_materialized_bytes={self.stats.model_aware_head_materialized_bytes} "
+            f"model_aware_exact_head_projection_s={self.stats.model_aware_exact_head_projection_seconds:.6f} "
+            f"model_aware_exact_head_projection_calls={self.stats.model_aware_exact_head_projection_calls} "
+            f"model_aware_exact_head_workspace_bytes={self.stats.model_aware_exact_head_workspace_bytes} "
             f"model_aware_fit_s={self.stats.model_aware_fit_seconds:.6f} "
             f"model_aware_correction_s={self.stats.model_aware_correction_seconds:.6f} "
             f"model_aware_causal_correction_s={self.stats.model_aware_causal_correction_seconds:.6f} "
@@ -2134,8 +2300,9 @@ class SpectrumH3Runtime:
             f"model_aware_offline_replay_correction_applications={self.stats.model_aware_offline_correction_applications} "
             f"model_aware_scheduler_forecast_aggregate=max(audio,video) "
             f"model_aware_scheduler_curvature_aggregate=max(audio,video) "
-            f"model_aware_correction_metric=final_layer_head_gram_diagonal "
-            f"model_aware_model_comparison_metric=head_weighted_rms "
+            f"model_aware_correction_metric=final_layer_exact_linear_head_space "
+            f"model_aware_diagonal_ablation_metric=final_layer_gram_diagonal "
+            f"model_aware_model_comparison_metric=exact_linear_head_space_rms "
             f"model_aware_head_metric_available={head_metric_available} "
             f"model_aware_correction_bound=rational_softsign_0.25 "
             f"model_aware_forecast_ratio_ewma={controller.forecast_ratio_ewma:.6f} "
@@ -2148,22 +2315,34 @@ class SpectrumH3Runtime:
             f"model_aware_video_model_corrected_ratio_mean={video_model_mean:.6f} "
             f"model_aware_audio_generic_corrected_ratio_mean={audio_generic_mean:.6f} "
             f"model_aware_video_generic_corrected_ratio_mean={video_generic_mean:.6f} "
-            f"model_aware_audio_model_candidate_ratio_mean={audio_candidate_mean:.6f} "
-            f"model_aware_video_model_candidate_ratio_mean={video_candidate_mean:.6f} "
-            f"model_aware_audio_model_candidate_head_ratio_mean={audio_candidate_head_mean:.6f} "
-            f"model_aware_video_model_candidate_head_ratio_mean={video_candidate_head_mean:.6f} "
+            f"model_aware_audio_diagonal_candidate_ratio_mean={audio_diagonal_mean:.6f} "
+            f"model_aware_video_diagonal_candidate_ratio_mean={video_diagonal_mean:.6f} "
+            f"model_aware_audio_exact_candidate_ratio_mean={audio_candidate_mean:.6f} "
+            f"model_aware_video_exact_candidate_ratio_mean={video_candidate_mean:.6f} "
+            f"model_aware_audio_diagonal_candidate_head_ratio_mean={audio_diagonal_head_mean:.6f} "
+            f"model_aware_video_diagonal_candidate_head_ratio_mean={video_diagonal_head_mean:.6f} "
+            f"model_aware_audio_exact_candidate_head_ratio_mean={audio_candidate_head_mean:.6f} "
+            f"model_aware_video_exact_candidate_head_ratio_mean={video_candidate_head_mean:.6f} "
             f"model_aware_audio_generic_head_ratio_mean={audio_generic_head_mean:.6f} "
             f"model_aware_video_generic_head_ratio_mean={video_generic_head_mean:.6f} "
-            f"model_aware_audio_model_trust={controller.audio_model_trust:.6f} "
-            f"model_aware_video_model_trust={controller.video_model_trust:.6f} "
-            f"model_aware_audio_model_comparisons={controller.audio_model_comparison_count} "
-            f"model_aware_video_model_comparisons={controller.video_model_comparison_count} "
-            f"model_aware_audio_model_candidate_wins={controller.audio_model_candidate_win_count} "
-            f"model_aware_video_model_candidate_wins={controller.video_model_candidate_win_count} "
-            f"model_aware_audio_model_candidate_losses={controller.audio_model_candidate_loss_count} "
-            f"model_aware_video_model_candidate_losses={controller.video_model_candidate_loss_count} "
-            f"model_aware_audio_model_bound_active={controller.audio_model_bound_active_count} "
-            f"model_aware_video_model_bound_active={controller.video_model_bound_active_count} "
+            f"model_aware_audio_exact_trust={controller.audio_model_trust:.6f} "
+            f"model_aware_video_exact_trust={controller.video_model_trust:.6f} "
+            f"model_aware_audio_diagonal_comparisons={controller.audio_diagonal_comparison_count} "
+            f"model_aware_video_diagonal_comparisons={controller.video_diagonal_comparison_count} "
+            f"model_aware_audio_diagonal_candidate_wins={controller.audio_diagonal_candidate_win_count} "
+            f"model_aware_video_diagonal_candidate_wins={controller.video_diagonal_candidate_win_count} "
+            f"model_aware_audio_diagonal_candidate_losses={controller.audio_diagonal_candidate_loss_count} "
+            f"model_aware_video_diagonal_candidate_losses={controller.video_diagonal_candidate_loss_count} "
+            f"model_aware_audio_exact_comparisons={controller.audio_model_comparison_count} "
+            f"model_aware_video_exact_comparisons={controller.video_model_comparison_count} "
+            f"model_aware_audio_exact_candidate_wins={controller.audio_model_candidate_win_count} "
+            f"model_aware_video_exact_candidate_wins={controller.video_model_candidate_win_count} "
+            f"model_aware_audio_exact_candidate_losses={controller.audio_model_candidate_loss_count} "
+            f"model_aware_video_exact_candidate_losses={controller.video_model_candidate_loss_count} "
+            f"model_aware_audio_diagonal_bound_active={controller.audio_diagonal_bound_active_count} "
+            f"model_aware_video_diagonal_bound_active={controller.video_diagonal_bound_active_count} "
+            f"model_aware_audio_exact_bound_active={controller.audio_model_bound_active_count} "
+            f"model_aware_video_exact_bound_active={controller.video_model_bound_active_count} "
             f"model_aware_audio_generic_bound_active={controller.audio_generic_bound_active_count} "
             f"model_aware_video_generic_bound_active={controller.video_generic_bound_active_count} "
             f"model_aware_audio_gain_delta_pre_abs_mean={audio_delta_pre_mean:.6f} "
@@ -2178,6 +2357,10 @@ class SpectrumH3Runtime:
             f"model_aware_audio_gain_delta_applied_abs_max={controller.audio_gain_delta_applied_abs_max:.6f} "
             f"model_aware_video_gain_delta_applied_abs_mean={video_delta_applied_mean:.6f} "
             f"model_aware_video_gain_delta_applied_abs_max={controller.video_gain_delta_applied_abs_max:.6f} "
+            f"model_aware_audio_exact_diagonal_delta_abs_mean={audio_exact_diagonal_delta_mean:.6f} "
+            f"model_aware_audio_exact_diagonal_delta_abs_max={controller.audio_gain_delta_exact_diagonal_abs_max:.6f} "
+            f"model_aware_video_exact_diagonal_delta_abs_mean={video_exact_diagonal_delta_mean:.6f} "
+            f"model_aware_video_exact_diagonal_delta_abs_max={controller.video_gain_delta_exact_diagonal_abs_max:.6f} "
             f"model_corrected_ratio_mean={self.stats.model_aware_model_corrected_ratio_mean:.6f} "
             f"generic_corrected_ratio_mean={self.stats.model_aware_generic_corrected_ratio_mean:.6f} "
             f"history_storage={self.config.history_storage} "
@@ -2186,6 +2369,8 @@ class SpectrumH3Runtime:
             f"history_device={str(self.prediction_history_device)!r} "
             f"history_mib={self.prediction_history_tensor_bytes / (1024 * 1024):.1f} "
             f"model_aware_evidence_history_mib={self.forecaster.evidence_tensor_bytes / (1024 * 1024):.3f} "
+            f"model_aware_generic_evidence_bytes={self.forecaster.generic_evidence_tensor_bytes} "
+            f"model_aware_exact_head_evidence_bytes={self.forecaster.exact_head_evidence_tensor_bytes} "
             f"reason={self.stats.disable_reason!r} "
             f"experimental_reason={self._experiment_disable_reason!r} "
             f"model_aware_reason={self._model_aware_disabled_reason!r}"

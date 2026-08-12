@@ -94,6 +94,8 @@ def _profile(**overrides):
         "final_block_perturbation": 0.0,
         "audio_sensitivity": 0.8,
         "video_sensitivity": 1.2,
+        "audio_head_weight": torch.eye(4),
+        "video_head_weight": torch.eye(4),
         "audio_head_gram_diagonal": torch.ones(4),
         "video_head_gram_diagonal": torch.ones(4),
         "forecast_risk_prior": 0.2,
@@ -118,7 +120,7 @@ def _lora_patch(strength, *, scale=1.0):
     return (strength, _LoRA(up, down), 1.0, None, None)
 
 
-def test_base_profile_retains_only_small_cpu_head_metrics_and_reuses_clone_lineage():
+def test_base_profile_retains_independent_cpu_head_metrics_and_reuses_clone_lineage():
     inner = _Inner()
     original = _Patcher(inner)
     first = get_model_forecastability_profile(original)
@@ -137,13 +139,23 @@ def test_base_profile_retains_only_small_cpu_head_metrics_and_reuses_clone_linea
         if torch.is_tensor(getattr(first.profile, field.name))
     }
     assert set(tensor_fields) == {
+        "audio_head_weight",
+        "video_head_weight",
         "audio_head_gram_diagonal",
         "video_head_gram_diagonal",
     }
     assert all(value.device.type == "cpu" for value in tensor_fields.values())
     assert all(value.dtype == torch.float32 for value in tensor_fields.values())
-    assert all(tuple(value.shape) == (inner.hidden_size,) for value in tensor_fields.values())
-    assert all(float(value.mean()) == pytest.approx(1.0) for value in tensor_fields.values())
+    assert tuple(tensor_fields["audio_head_weight"].shape) == (6, inner.hidden_size)
+    assert tuple(tensor_fields["video_head_weight"].shape) == (8, inner.hidden_size)
+    assert tuple(tensor_fields["audio_head_gram_diagonal"].shape) == (
+        inner.hidden_size,
+    )
+    assert tuple(tensor_fields["video_head_gram_diagonal"].shape) == (
+        inner.hidden_size,
+    )
+    assert float(tensor_fields["audio_head_gram_diagonal"].mean()) == pytest.approx(1.0)
+    assert float(tensor_fields["video_head_gram_diagonal"].mean()) == pytest.approx(1.0)
 
     reference = weakref.ref(original)
     del original
@@ -433,8 +445,12 @@ def test_smooth_trust_region_preserves_model_candidate_difference_after_bounding
         assert -0.25 < telemetry.model_candidate_gain < 0.0
         assert -0.25 < telemetry.generic_gain < 0.0
         assert telemetry.model_candidate_gain != telemetry.generic_gain
+        assert telemetry.model_candidate_gain != telemetry.diagonal_candidate_gain
         assert telemetry.model_gain == pytest.approx(
             0.5 * (telemetry.generic_gain + telemetry.model_candidate_gain)
+        )
+        assert telemetry.model_gain != pytest.approx(
+            0.5 * (telemetry.generic_gain + telemetry.diagonal_candidate_gain)
         )
         assert telemetry.pre_bound_delta != 0.0
         assert telemetry.post_bound_delta != 0.0
@@ -494,9 +510,9 @@ def test_smooth_trust_region_preserves_model_candidate_difference_after_bounding
     runtime.model_aware = controller
     summary = runtime.debug_summary()
     assert "model_aware_scheduler_forecast_aggregate=max(audio,video)" in summary
-    assert "model_aware_audio_model_bound_active=1" in summary
+    assert "model_aware_audio_exact_bound_active=1" in summary
     assert "model_aware_correction_bound=rational_softsign_0.25" in summary
-    assert "model_aware_audio_model_candidate_wins=1" in summary
+    assert "model_aware_audio_exact_candidate_wins=1" in summary
 
 
 def test_new_stream_and_saturation_statistics_round_trip_through_snapshot_restore():
@@ -708,12 +724,12 @@ def test_sampled_evidence_is_bounded_and_model_aware_weight_correction_preserves
         1.0,
         actual,
         (
-            ("audio", 0, 2, 0.5, 0.2, 0.1, 0.15),
-            ("video", 2, 4, 0.5, -0.1, 0.1, -0.05),
+            ("audio", 0, 2, 0.5, 0.2, 0.1, 0.15, 0.18),
+            ("video", 2, 4, 0.5, -0.1, 0.1, -0.05, -0.08),
         ),
         degree=1,
         ridge_lambda=0.2,
-        stream_sensitivities={
+        stream_diagonals={
             "audio": torch.tensor([3.0, 1.0, 0.5]),
             "video": torch.tensor([0.5, 1.0, 3.0]),
         },
@@ -778,8 +794,8 @@ def test_anchor_telemetry_retains_raw_projection_while_controller_calibration_st
         1.0,
         torch.full((1, 4, 3), 10.0),
         (
-            ("audio", 0, 2, 0.0, 0.0, 0.0, 0.0),
-            ("video", 2, 4, 0.0, 0.0, 0.0, 0.0),
+            ("audio", 0, 2, 0.0, 0.0, 0.0, 0.0, 0.0),
+            ("video", 2, 4, 0.0, 0.0, 0.0, 0.0, 0.0),
         ),
         degree=1,
         ridge_lambda=0.1,
@@ -800,7 +816,7 @@ def test_anchor_telemetry_retains_raw_projection_while_controller_calibration_st
     assert controller.video_projection_ewma == pytest.approx(expected_video)
 
 
-def test_final_layer_weighted_projection_differs_from_euclidean_control_on_device():
+def test_final_layer_diagonal_projection_remains_independent_on_device():
     forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.0, max_history=4)
     segments = (("audio", 0, 1), ("video", 1, 2))
     previous = torch.zeros((1, 2, 2))
@@ -813,12 +829,12 @@ def test_final_layer_weighted_projection_differs_from_euclidean_control_on_devic
         2.0,
         actual,
         (
-            ("audio", 0, 1, 0.0, 0.0, 0.0, 0.0),
-            ("video", 1, 2, 0.0, 0.0, 0.0, 0.0),
+            ("audio", 0, 1, 0.0, 0.0, 0.0, 0.0, 0.0),
+            ("video", 1, 2, 0.0, 0.0, 0.0, 0.0, 0.0),
         ),
         degree=1,
         ridge_lambda=0.0,
-        stream_sensitivities={
+        stream_diagonals={
             "audio": torch.tensor([10.0, 1.0]),
             "video": torch.ones(2),
         },
@@ -826,15 +842,272 @@ def test_final_layer_weighted_projection_differs_from_euclidean_control_on_devic
 
     assert evidence is not None
     assert evidence.audio.residual_projection == pytest.approx(0.25)
-    assert evidence.audio.model_projection == pytest.approx(9.5 / 11.0)
-    assert evidence.audio.model_projection != evidence.audio.residual_projection
-    assert evidence.video.model_projection == pytest.approx(
+    assert evidence.audio.diagonal_projection == pytest.approx(9.5 / 11.0)
+    assert evidence.audio.diagonal_projection != evidence.audio.residual_projection
+    assert evidence.video.diagonal_projection == pytest.approx(
         evidence.video.residual_projection
     )
     assert forecaster.evidence_tensor_bytes == 32
     assert all(
         sample.device == actual.device
         for entry in forecaster._evidence_history
+        for sample in entry.values()
+    )
+
+
+def test_generic_evidence_update_does_not_charge_exact_head_projection():
+    forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.0, max_history=4)
+
+    forecaster.update(
+        0.0,
+        torch.zeros((1, 2, 3)),
+        evidence_segments=(("audio", 0, 1), ("video", 1, 2)),
+    )
+
+    assert forecaster.model_aware_exact_head_projection_calls == 0
+    assert forecaster.model_aware_exact_head_projection_seconds == 0.0
+    assert forecaster.exact_head_evidence_tensor_bytes == 0
+
+
+def _operator_evidence(
+    weight: torch.Tensor,
+    delta: torch.Tensor,
+    residual: torch.Tensor,
+    *,
+    diagonal: torch.Tensor | None = None,
+):
+    forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.0, max_history=4)
+    segments = (("audio", 0, 1), ("video", 1, 2))
+    previous = torch.zeros((1, 2, delta.numel()), dtype=torch.float32)
+    latest = torch.zeros_like(previous)
+    latest[:, 0] = delta
+    exact = {"audio": weight, "video": weight}
+    forecaster.update(
+        0.0,
+        previous,
+        evidence_segments=segments,
+        exact_head_weights=exact,
+    )
+    forecaster.update(
+        1.0,
+        latest,
+        evidence_segments=segments,
+        exact_head_weights=exact,
+    )
+    actual = torch.zeros_like(previous)
+    actual[:, 0] = 2.0 * delta + residual
+    resolved_diagonal = (
+        weight.square().sum(dim=0)
+        if diagonal is None
+        else diagonal
+    )
+    resolved_diagonal = resolved_diagonal / resolved_diagonal.mean()
+    evidence = forecaster.sampled_anchor_evidence(
+        2.0,
+        actual,
+        (
+            ("audio", 0, 1, 0.0, 0.0, 0.0, 0.0, 0.0),
+            ("video", 1, 2, 0.0, 0.0, 0.0, 0.0, 0.0),
+        ),
+        degree=1,
+        ridge_lambda=0.0,
+        stream_diagonals={"audio": resolved_diagonal, "video": resolved_diagonal},
+        exact_head_weights=exact,
+    )
+    assert evidence is not None
+    return forecaster, evidence.audio
+
+
+def test_exact_head_projection_matches_explicit_full_gram_formula():
+    weight = torch.tensor([[1.0, 2.0, -1.0], [0.5, -1.0, 3.0]])
+    delta = torch.tensor([1.0, -2.0, 0.5])
+    residual = torch.tensor([-0.5, 1.5, 2.0])
+    _, evidence = _operator_evidence(weight, delta, residual)
+    gram = weight.transpose(0, 1) @ weight
+    expected = torch.dot(residual, gram @ delta) / torch.dot(delta, gram @ delta)
+
+    assert evidence.model_projection == pytest.approx(float(expected))
+
+
+def test_exact_head_path_projects_to_output_width_without_materializing_full_gram(
+    monkeypatch,
+):
+    real_matmul = torch.matmul
+    calls = []
+
+    def tracked_matmul(left, right, *args, **kwargs):
+        result = real_matmul(left, right, *args, **kwargs)
+        calls.append((tuple(left.shape), tuple(right.shape), tuple(result.shape)))
+        return result
+
+    monkeypatch.setattr(torch, "matmul", tracked_matmul)
+    weight = torch.tensor([[1.0, 1.0, 0.0], [0.0, 1.0, 1.0]])
+    _operator_evidence(
+        weight,
+        torch.tensor([1.0, 0.5, -1.0]),
+        torch.tensor([0.25, 1.0, 0.5]),
+    )
+
+    assert calls
+    assert all(result_shape[-1] == weight.shape[0] for _, _, result_shape in calls)
+    assert all(result_shape[-2:] != (weight.shape[1], weight.shape[1]) for _, _, result_shape in calls)
+
+
+def test_complete_row_sampling_preserves_hidden_alignment_and_is_deterministic():
+    forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.0, max_history=4)
+    segments = (("audio", 0, 5), ("video", 5, 9))
+    feature = torch.arange(2 * 9 * 4, dtype=torch.float32).reshape(2, 9, 4)
+    audio_weight = torch.tensor([[1.0, 10.0, 100.0, 1000.0]])
+    video_weight = torch.eye(4)[:2]
+    weights = {"audio": audio_weight, "video": video_weight}
+    forecaster.update(
+        0.0,
+        feature,
+        evidence_segments=segments,
+        exact_head_weights=weights,
+    )
+    first_indices = {
+        name: indices.clone()
+        for name, indices in forecaster._exact_head_row_indices.items()
+    }
+    forecaster.update(
+        1.0,
+        feature + 1.0,
+        evidence_segments=segments,
+        exact_head_weights=weights,
+    )
+
+    assert all(
+        torch.equal(indices, forecaster._exact_head_row_indices[name])
+        for name, indices in first_indices.items()
+    )
+    selected = feature[:, :5].index_select(1, first_indices["audio"])
+    expected = torch.matmul(selected, audio_weight.transpose(0, 1))
+    torch.testing.assert_close(
+        forecaster._exact_head_history[0]["audio"],
+        expected,
+    )
+    assert forecaster._exact_head_history[0]["audio"].shape[:2] == selected.shape[:2]
+
+
+def test_diagonal_and_exact_projections_agree_when_gram_has_no_cross_terms():
+    weight = torch.diag(torch.tensor([1.0, 2.0, 3.0]))
+    _, evidence = _operator_evidence(
+        weight,
+        torch.tensor([1.0, -0.5, 2.0]),
+        torch.tensor([0.25, 1.5, -1.0]),
+    )
+
+    assert evidence.model_projection == pytest.approx(evidence.diagonal_projection)
+
+
+def test_exact_projection_retains_off_diagonal_gram_terms():
+    weight = torch.tensor([[1.0, 1.0]])
+    _, evidence = _operator_evidence(
+        weight,
+        torch.tensor([1.0, 0.0]),
+        torch.tensor([0.0, 1.0]),
+    )
+
+    assert evidence.residual_projection == pytest.approx(0.0)
+    assert evidence.diagonal_projection == pytest.approx(0.0)
+    assert evidence.model_projection == pytest.approx(1.0)
+
+
+def test_exact_projection_minimizes_instantaneous_head_space_scalar_objective():
+    weight = torch.tensor([[1.0, 1.0, 0.0], [0.0, 1.0, 2.0]])
+    delta = torch.tensor([1.0, -0.5, 0.25])
+    residual = torch.tensor([0.25, 1.5, -0.75])
+    _, evidence = _operator_evidence(weight, delta, residual)
+    residual_head = residual @ weight.transpose(0, 1)
+    delta_head = delta @ weight.transpose(0, 1)
+
+    def objective(gain):
+        return torch.sum((residual_head - gain * delta_head).square())
+
+    optimum = evidence.model_projection
+    assert objective(optimum) <= objective(optimum - 0.1)
+    assert objective(optimum) <= objective(optimum + 0.1)
+
+
+def test_exact_head_evidence_snapshot_restore_and_system_ram_history_are_independent():
+    forecaster = HistoryWeightForecaster(
+        degree=1,
+        ridge_lambda=0.0,
+        max_history=4,
+        history_storage="system_ram",
+    )
+    segments = (("audio", 0, 2), ("video", 2, 4))
+    weights = {"audio": torch.eye(3)[:2], "video": torch.eye(3)}
+    for coordinate in (0.0, 1.0):
+        forecaster.update(
+            coordinate,
+            torch.full((1, 4, 3), coordinate),
+            evidence_segments=segments,
+            exact_head_weights=weights,
+        )
+    snapshot = forecaster.snapshot()
+    expected_indices = {
+        name: value.clone()
+        for name, value in forecaster._exact_head_row_indices.items()
+    }
+    expected_head = [
+        {name: value.clone() for name, value in entry.items()}
+        for entry in forecaster._exact_head_history
+    ]
+    forecaster.update(
+        2.0,
+        torch.full((1, 4, 3), 2.0),
+        evidence_segments=segments,
+        exact_head_weights=weights,
+    )
+    forecaster.restore(snapshot)
+
+    assert forecaster.history_device == torch.device("cpu")
+    assert forecaster.history_length == 2
+    assert all(
+        torch.equal(value, forecaster._exact_head_row_indices[name])
+        for name, value in expected_indices.items()
+    )
+    for expected_entry, restored_entry in zip(
+        expected_head,
+        forecaster._exact_head_history,
+        strict=True,
+    ):
+        for name, expected in expected_entry.items():
+            torch.testing.assert_close(restored_entry[name], expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_exact_head_evidence_keeps_hidden_rows_off_cpu():
+    device = torch.device("cuda")
+    forecaster = HistoryWeightForecaster(
+        degree=1,
+        ridge_lambda=0.0,
+        max_history=4,
+        history_storage="system_ram",
+    )
+    segments = (("audio", 0, 2), ("video", 2, 4))
+    weights = {
+        "audio": torch.eye(3, device=device)[:2],
+        "video": torch.eye(3, device=device),
+    }
+    for coordinate in (0.0, 1.0):
+        forecaster.update(
+            coordinate,
+            torch.full((1, 4, 3), coordinate, device=device),
+            evidence_segments=segments,
+            exact_head_weights=weights,
+        )
+
+    assert forecaster.history_device == torch.device("cpu")
+    assert all(
+        sample.device.type == "cuda"
+        for history in (
+            forecaster._evidence_history,
+            forecaster._exact_head_history,
+        )
+        for entry in history
         for sample in entry.values()
     )
 
@@ -880,6 +1153,31 @@ def test_online_model_trust_falls_when_head_weighted_candidate_loses():
         generic_corrected_head_ratio=1.0,
         model_candidate_head_ratio=1.25,
     )
+    for _ in range(3):
+        controller.observe_anchor(
+            AnchorEvidence(
+                1.0,
+                0.1,
+                2.0,
+                -1.0,
+                -1.0,
+                1.1,
+                1.0,
+                audio=losing,
+                video=losing,
+            ),
+            decision,
+        )
+
+    assert controller.audio_model_candidate_loss_count == 3
+    assert controller.video_model_candidate_loss_count == 3
+    assert controller.audio_model_trust < 0.5
+    assert controller.video_model_trust < 0.5
+
+
+def test_online_exact_head_trust_rises_only_by_measured_advantage():
+    controller = ModelAwareController("full", risk_threshold=1.0)
+    controller.set_profile(_profile())
     controller.observe_anchor(
         AnchorEvidence(
             1.0,
@@ -887,18 +1185,66 @@ def test_online_model_trust_falls_when_head_weighted_candidate_loses():
             2.0,
             -1.0,
             -1.0,
-            1.1,
             1.0,
-            audio=losing,
-            video=losing,
-        ),
-        decision,
+            1.0,
+            audio=StreamAnchorEvidence(
+                residual_projection=-1.0,
+                diagonal_projection=-1.25,
+                model_projection=-2.0,
+            ),
+            video=StreamAnchorEvidence(
+                residual_projection=-1.0,
+                diagonal_projection=-1.25,
+                model_projection=-2.0,
+            ),
+        )
     )
+    decision = controller.decision(
+        forecast_horizon=1.0,
+        history_length=4,
+        configured_degree=2,
+        configured_ridge_lambda=0.1,
+        configured_audio_blend=0.0,
+        configured_video_blend=0.5,
+    )
+    winning = StreamAnchorEvidence(
+        forecast_ratio=1.0,
+        residual_projection=-1.0,
+        diagonal_projection=-1.25,
+        model_projection=-2.0,
+        model_corrected_ratio=0.99,
+        generic_corrected_ratio=1.0,
+        diagonal_candidate_ratio=0.999,
+        model_candidate_ratio=0.99,
+        model_corrected_head_ratio=0.99,
+        generic_corrected_head_ratio=1.0,
+        diagonal_candidate_head_ratio=0.999,
+        model_candidate_head_ratio=0.99,
+    )
+    for _ in range(3):
+        controller.observe_anchor(
+            AnchorEvidence(
+                1.0,
+                0.1,
+                2.0,
+                -1.0,
+                -1.0,
+                0.99,
+                1.0,
+                audio=winning,
+                video=winning,
+            ),
+            decision,
+        )
 
-    assert controller.audio_model_candidate_loss_count == 1
-    assert controller.video_model_candidate_loss_count == 1
-    assert controller.audio_model_trust < 0.5
-    assert controller.video_model_trust < 0.5
+    assert controller.audio_model_candidate_win_count == 3
+    assert controller.video_model_candidate_win_count == 3
+    assert controller.audio_diagonal_candidate_win_count == 3
+    assert controller.video_diagonal_candidate_win_count == 3
+    assert controller.audio_diagonal_candidate_loss_count == 0
+    assert controller.video_diagonal_candidate_loss_count == 0
+    assert 0.5 < controller.audio_model_trust < 0.53
+    assert 0.5 < controller.video_model_trust < 0.53
 
 
 def test_model_aware_schedule_can_only_convert_a_legacy_forecast_to_actual():

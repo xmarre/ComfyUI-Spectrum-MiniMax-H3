@@ -99,11 +99,35 @@ def measure_stream_residual(
 
 
 @dataclass(frozen=True, slots=True)
+class OfflineModelAwareDecision:
+    degree: int
+    ridge_lambda: float
+    audio_blend_weight: float
+    video_blend_weight: float
+    audio_correction_gain: float
+    video_correction_gain: float
+
+    @classmethod
+    def from_runtime(
+        cls,
+        decision: ModelAwareForecastDecision,
+    ) -> OfflineModelAwareDecision:
+        return cls(
+            degree=int(decision.degree),
+            ridge_lambda=float(decision.ridge_lambda),
+            audio_blend_weight=float(decision.audio_blend_weight),
+            video_blend_weight=float(decision.video_blend_weight),
+            audio_correction_gain=float(decision.audio_correction_gain),
+            video_correction_gain=float(decision.video_correction_gain),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class OfflineStepRecord:
     step_id: int
     coordinate: float
     actual: bool
-    model_aware_decision: ModelAwareForecastDecision | None = None
+    model_aware_decision: OfflineModelAwareDecision | None = None
 
 
 @dataclass(slots=True)
@@ -171,7 +195,11 @@ class OfflineFeatureArchive:
                 int(step_id),
                 float(coordinate),
                 bool(actual),
-                model_aware_decision,
+                (
+                    None
+                    if model_aware_decision is None
+                    else OfflineModelAwareDecision.from_runtime(model_aware_decision)
+                ),
             )
         )
 

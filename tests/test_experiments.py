@@ -280,8 +280,25 @@ def test_offline_replay_preserves_per_forecast_model_aware_decisions_without_ind
         audio_blend_weight=0.0,
     )
 
-    assert archive.steps[1].model_aware_decision is first_decision
-    assert archive.steps[3].model_aware_decision is second_decision
+    first_archived = archive.steps[1].model_aware_decision
+    second_archived = archive.steps[3].model_aware_decision
+    assert first_archived is not None and first_archived is not first_decision
+    assert second_archived is not None and second_archived is not second_decision
+    assert first_archived.audio_blend_weight == first_decision.audio_blend_weight
+    assert first_archived.video_blend_weight == first_decision.video_blend_weight
+    assert second_archived.audio_correction_gain == second_decision.audio_correction_gain
+    assert second_archived.video_correction_gain == second_decision.video_correction_gain
+    assert all(
+        isinstance(getattr(second_archived, field), (int, float))
+        for field in (
+            "degree",
+            "ridge_lambda",
+            "audio_blend_weight",
+            "video_blend_weight",
+            "audio_correction_gain",
+            "video_correction_gain",
+        )
+    )
     assert smoother.effective_blend_stream_stats["audio"] == (0.0, 0.0, 0.0)
     assert smoother.effective_blend_stream_stats["video"] == pytest.approx((0.2, 0.5, 0.8))
     assert smoother.model_aware_offline_correction_applications == 2
