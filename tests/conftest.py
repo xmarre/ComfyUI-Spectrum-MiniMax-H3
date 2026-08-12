@@ -27,3 +27,13 @@ if comfyui_path and not torch.cuda.is_available():
         import comfy.cli_args
     finally:
         sys.argv[:] = original_argv
+
+    # The compatibility matrix intentionally pins a minimal comfy-kitchen that
+    # is sufficient for the reviewed H3 fixture. Newer ComfyUI imports probe a
+    # capability helper added after that pinned package. Source-contract tests
+    # do not execute INT8 attention, so provide the missing negative capability
+    # answer without installing a moving dependency into the historical matrix.
+    import comfy_kitchen
+
+    if not hasattr(comfy_kitchen, "int8_attention_is_available"):
+        comfy_kitchen.int8_attention_is_available = lambda: False
