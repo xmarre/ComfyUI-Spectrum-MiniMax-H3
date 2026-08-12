@@ -43,13 +43,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install pytest numpy psutil safetensors einops tqdm pyyaml pillow packaging comfy-kitchen==0.2.26 comfy-aimdo==0.4.13
+          python -m pip install pytest ruff numpy psutil safetensors einops tqdm pyyaml pillow packaging comfy-kitchen==0.2.26 comfy-aimdo==0.4.13
           python -m pip wheel --no-deps --wheel-dir /tmp/spectrum-h3-wheel .
 
       - name: Run forecaster smoke test
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: python tests/smoke_forecaster.py
+
+      - name: Run Ruff and compileall
+        run: |
+          python -m ruff check comfyui_spectrum_h3 tests
+          python -m compileall -q comfyui_spectrum_h3 tests
 
       - name: Run tests against native MiniMax H3
         env:
