@@ -113,42 +113,72 @@ Other external sampler callbacks remain replay-only. Spectrum does not invoke ar
 | `offline_smoothing_replay` | `true` | Standard v0.2.1+ audio-fidelity path: local-only causal capture followed by cross-validated, transformer-free bidirectional replay. |
 | `audio_blend_weight` | `0.00` | Configured audio spectral share. Zero keeps replayed audio on local interpolation and prevents direct spectral mixing of audio rows. |
 | `offline_archive_storage` | `system_ram` | Stores every actual anchor retained until offline replay completes. This archive is not capped by `max_history`; `vram` is an explicit speed/memory tradeoff. |
-| `model_aware_mode` | `off` | Experimental shared model/LoRA prior. `schedule` adds risk-based actual anchors; `schedule_confidence` also adapts fitting and blend; `full` adds bounded correction. |
+| `model_aware_mode` | `off` | Experimental model/patch prior. `schedule` adds risk-based actual anchors; `schedule_confidence` also adapts fitting/blend; `full` additionally applies only the bounded generic latest-delta residual correction. Tested model-specific Feature-3 correction families are retired. |
 | `model_aware_risk_threshold` | `0.65` | A prospective legacy forecast becomes an actual evaluation when the combined live/model risk reaches this value. Existing hard sampler, warmup, history, and tail rules still take precedence. |
 
 ## Experimental model-aware forecasting
 
-`model_aware_mode` is opt-in and defaults to `off`, so old workflows retain the legacy schedule, fitting, blending, and replay behavior. The modes share one controller and progressively enable:
+`model_aware_mode` is opt-in and defaults to `off`, so old workflows retain the legacy schedule, fitting, blending, and replay behavior. The serialized values are intentionally unchanged for workflow compatibility:
 
-- `schedule`: evaluates a prospective legacy forecast's risk and may convert it to an actual transformer evaluation. It never converts a required actual step into a forecast.
-- `schedule_confidence`: also selects a bounded scalar ridge value, a history-valid polynomial degree, and modality-specific spectral share for that forecast.
-- `full`: additionally applies a bounded reduced-order correction in the span of the last observed feature change. It keeps the generic Euclidean residual projection and Gram-diagonal candidate as controls, then applies a third candidate measured in the exact linear output-head space of native H3 `FinalLayer.audio_out` / `video_out`. Completed actual anchors calibrate how much of that exact-head candidate is mixed into the generic control. It does not compute a Jacobian, JVP, Gram matrix, or extra denoiser forward.
+- `off`: legacy Spectrum behavior.
+- `schedule`: Feature 1 model/patch-aware scheduling. A prospective risky forecast may be converted into an actual transformer evaluation, but a required actual step is never relaxed into a forecast.
+- `schedule_confidence`: Feature 1 plus Feature 2 confidence/adaptive fitting. It may adapt ridge regularization, usable degree, and modality-specific spectral share. It applies no forecast correction.
+- `full`: Feature 1 plus Feature 2 plus the bounded **generic latest-delta residual correction**. No successful model-specific Feature-3 correction is applied.
+
+The model-informed correction objective was investigated explicitly rather than assumed to work. Real base-H3 gates tested exact/Gram-diagonal scalar head metrics, K=2 causal trajectory rank, normalized `W^T W d`, normalized `J_t^T J_t d`, previous hidden residual persistence, `W^T e_previous`, and the complete current-FinalLayer adjoint `J_t^T e_previous`. None produced a material >=2% improvement over the appropriate generic baseline. The complete experiment record, including the radial-bound bug found during the transformed-direction screen and the corrected normalization rerun, is preserved in [MODEL_AWARE_BENCHMARK.md](MODEL_AWARE_BENCHMARK.md).
+
+The generic latest-delta correction remains independently useful: the final same-seed gate improved the aggregate raw forecast ratio by about 6.2% for audio and 5.5% for video. That benefit is **generic trajectory correction**, not evidence of successful model-informed Feature 3.
 
 ### Model and LoRA profile
 
-Before a generation, Spectrum lazily builds a profile of the effective `ModelPatcher`. It samples at most 4,096 values from each of eight selected matrices in the final H3 block and `FinalLayer`, estimates projection gain, and reads active patch metadata. For each FP32 `audio_out` / `video_out` matrix it retains an independent CPU FP32 copy plus the normalized 5,376-channel diagonal of `W^T W`. The two real H3 matrices are approximately 2.6 MiB combined and retain no model/module reference. Spectrum never materializes the 5,376 x 5,376 Gram matrix. For ordinary LoRA updates it evaluates the relative Frobenius magnitude of the composed low-rank update directly from the factors. It does not materialize a full `B @ A` update. Large factor sets use a conservative norm bound; unsupported patch forms lower profile confidence and increase uncertainty instead of being reinterpreted as LoRA.
+Before a generation, Spectrum lazily builds a bounded profile of the effective `ModelPatcher`. It samples at most 4,096 values from each of eight selected matrices in the final H3 block and `FinalLayer`, estimates projection gain, and reads active patch metadata. Ordinary LoRA updates are measured from their low-rank factors without materializing a full `B @ A` update. Large factor sets use a conservative norm bound; unsupported patch forms lower profile confidence and increase uncertainty instead of being reinterpreted as LoRA.
 
-The exact operator and diagonal ablation currently use the base output heads. Existing LoRA identity, perturbation, coverage, and scheduling-risk support remains active, including persistent bypass-hook discovery. Patch-conditioned output-head operators are a separate unproven extension; the immediate Feature 3 benchmark therefore targets base H3 with no active LoRA.
+The final runtime profile retains compact metadata and scalar statistics only: identities, patch counts/coverage, recognized-LoRA/unknown-patch counts, profile confidence, aggregate/base/final-block perturbation information, audio/video scalar sensitivities, forecast-risk prior, and build/memory telemetry. Audio/video output-head weights may contribute to scalar sensitivity while the profile is built, but the full FP32 head matrices and Gram diagonals are discarded afterward. The rejected Feature-3 experiments previously retained roughly 2.6 MiB of detached output-head data; normal `full` no longer needs or materializes it.
 
-Spectrum caches `[branch, target audio rows + target video rows, 5376]` immediately after the last `DiTBlock`. Native H3 then applies stream-specific `FinalLayer` RMSNorm/AdaLN state and the separate FP32 output heads. Complete sampled hidden rows can therefore be multiplied by the corresponding head without an axis approximation. This is exact for the linear head and deliberately omits the timestep-dependent RMSNorm/AdaLN Jacobian. Earlier-block patches contribute at a lower weight to the separate risk prior. This is a structural prior, not a claim that weight spectra are Spectrum's temporal Chebyshev spectrum.
+Profiles are kept in a bounded 16-entry process LRU keyed by ComfyUI clone lineage, patch identity, H3 architecture signature, and bypass-injection adapter metadata. Bypass state is read from the persistent manager or configured hook objects retained by `ModelPatcher.injections`, so reusing a cached loader output does not depend on the loader executing again. Cached profile records retain no model, patch, adapter, module, or GPU tensor reference.
 
-Profiles are kept in a bounded 16-entry process LRU keyed by ComfyUI's clone lineage UUID, patch-set UUID, H3 architecture signature, and bypass-injection adapter metadata including strength and factor identity. Bypass state is read from the persistent manager or configured hook objects retained by `ModelPatcher.injections`, so reusing a cached loader output does not depend on the loader executing again. Clones with the same effective patch state reuse a profile; `add_patches`, removal/reload, or changed bypass adapters produce a different key. Cached records retain scalars, strings, detached CPU head operators, and their diagonals. They retain no model, patch, adapter, or GPU tensor reference. Generation-local device copies are released when the controller resets.
+### Live evidence, generic correction, replay, and samplers
 
-### Live evidence, replay, and samplers
+Feature 2 and the surviving generic scalar correction use the existing deterministic at-most-4,096-value hidden sample per modality. Only reduced scalar evidence reaches controller state; exact-head projected-row history is not populated.
 
-At actual anchors, Spectrum preserves the existing at-most-4,096-value hidden sample per modality for generic Euclidean evidence and the Gram-diagonal ablation. `full` additionally selects at most 32 complete hidden rows across active branches per stream, projects them on-device through the real linear head, and retains only the small projected rows. Identical deterministic row positions are reused across history. Because the head is linear, temporal head forecasts combine archived head rows directly. The full feature history retains its configured system-RAM/VRAM policy, and neither evidence history copies hidden features to CPU. Only reduced scalars return to the controller. Generic, diagonal, exact, and applied candidates are evaluated in ordinary feature RMS and exact linear-head RMS. Exact-versus-generic head-space error updates per-stream trust for the next forecast; diagonal remains a logged ablation.
+At a completed actual anchor, the generic correction reconstructs the uncorrected causal forecast, forms the latest actual-history delta `d`, and measures the hidden residual `r`:
 
-The projection EWMAs use a monotonic rational soft limit of 2.0, so extreme finite evidence remains bounded without mapping distinct generic/diagonal/exact observations to the same calibration value. The ±0.25 correction maximum remains a second trust region. All three raw candidates pass through `g / (1 + |g| / 0.25)`. Finite unequal candidates therefore remain unequal after bounding. The applied correction is `generic + trust * (exact - generic)`, so it cannot leave the same ±0.25 region.
+```text
+d = h[-1] - h[-2]
+r = h_actual - h_pred_uncorrected
+g_raw = <r, d> / <d, d>
+```
 
-Offline capture stores each forecast's selected degree, ridge value, audio/video blends, and correction gains as scalar decision state. Replay uses those exact decisions after dynamically inserted anchors, preserving step alignment and the default `audio_blend_weight=0` fix. No tensor from the model profile is archived.
+The existing confidence chronology and rational correction trust region are retained. In scalar form the bounded gain is:
+
+```text
+g = g_raw_scaled / (1 + |g_raw_scaled| / 0.25)
+```
+
+`full` applies that generic gain to the latest-delta correction exactly. The rejected exact-head trust mixture, Gram-diagonal correction ablation, K=2 coefficients, transformed-direction screens, and previous-error-adjoint screens no longer execute in normal runtime.
+
+Offline capture stores each forecast's selected degree, ridge value, audio/video blends, and the same generic scalar correction gain as scalar decision state. Replay uses those exact decisions after dynamically inserted anchors, preserving step alignment and the default `audio_blend_weight=0` fix. No model-profile tensor is archived. First-pass `full` and replay therefore use the same correction semantics.
 
 Euler, deterministic RES/CFG++, MiniMax-H3 Turbo, and native `er_sde` retain their existing hard one-forecast horizon and refresh rules. On `er_sde`, evidence is generation-local and tied to the current seeded trajectory; it is never reused across runs. Offline replay still requires the existing seeded native ER-SDE components and rejects custom noise samplers/scalers.
 
 ### Overhead, debugging, and limitations
 
-Debug mode reports profile cache/build time, retained and temporary workspace estimates, patch coverage, generic/diagonal/exact projections, every raw and smoothly bounded candidate, applied gains, per-stream exact trust, exact wins/losses, ordinary and exact-head counterfactual ratios, and exact-versus-generic / exact-versus-diagonal deltas. Evidence timing separates fitting, sample/index work, one-time head materialization, exact-head projection, scalar device transfer, reductions, and condition estimation. It also reports retained generic/exact evidence bytes, device-materialized head bytes, temporary exact-row workspace, and causal/offline-replay correction timings.
+Normal `full` no longer materializes output heads for correction, performs exact-head projection, retains exact-head evidence, or allocates K=2/transformed-direction/previous-error Feature-3 workspace. Debug output marks the final state explicitly:
 
-The automated CPU fixture verifies bounded construction and per-step behavior but does not contain a full MiniMax-H3 checkpoint. Therefore this repository does **not** yet claim that static weight/LoRA statistics correlate with real-checkpoint forecast error, that adaptive fitting improves quality at equal NFE, or that the `FinalLayer`-weighted correction beats generic residual feedback at equal wall-clock time. `full` should be treated as a research ablation, not a quality preset. Until the fixed-seed matrix in [MODEL_AWARE_BENCHMARK.md](MODEL_AWARE_BENCHMARK.md) has real-checkpoint results, the recommended production setting remains `off`; `schedule` is the most conservative starting point for controlled experiments.
+```text
+feature3_model_informed_correction=retired_no_material_gain
+feature3_applied_correction=generic_scalar_latest_delta
+feature3_k2_runtime=retired
+feature3_transformed_trajectory_runtime=retired
+feature3_previous_error_runtime=retired
+feature3_direction_evidence_bytes=0
+feature3_direction_workspace_bytes=0
+feature3_error_evidence_bytes=0
+feature3_error_workspace_bytes=0
+feature3_extra_transformer_nfe=0
+```
+
+The automated environment does not contain a full MiniMax-H3 checkpoint, so real-checkpoint timing and quality conclusions remain based on the recorded user gates rather than synthetic fixtures. The final gate requested by this PR is a single mechanical `full -> schedule_confidence -> full` rerun to verify the cleaned shipping architecture, not to search for another Feature-3 hypothesis.
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
@@ -425,11 +455,15 @@ Automated tests cover:
 - single-buffer modality-specific online and offline prediction with an audio-local default;
 - separate residual output-head timing, offline archive/build timing, per-modality cross-validation/effective-blend reporting, replay anchor/smoothed counts, and replay smoother history/chunk reporting;
 - continuous two-pass ComfyUI progress, capture progress callbacks, capture-and-replay KJ preview updates, replay-only ordinary external callback side effects and previews, and clean progress completion on recoverable replay fallbacks;
-- downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release.
-- compact model/LoRA profile construction for base, single, stacked, differently weighted, zero-strength, and unknown patches; detached `FinalLayer` linear heads plus exact normalized Gram diagonals, clone reuse, patch UUID invalidation, bounded cache lifetime, and no retained model references;
-- model-aware risk calibration, bounded adaptive ridge/degree/blend, independently auditable generic/diagonal/exact correction candidates, exact-head online trust, deterministic complete-row evidence, and risk-only insertion of actual evaluations without relaxing sampler constraints.
+- downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release;
+- compact model/LoRA profile construction for base, single, stacked, differently weighted, zero-strength, and unknown patches; scalar audio/video output-head sensitivity, clone reuse, patch UUID invalidation, bounded cache lifetime, and no retained model or output-head tensor references;
+- model-aware risk calibration and bounded adaptive ridge/degree/blend;
+- exact `full` equality between the applied correction gain and the surviving generic scalar gain;
+- zero exact-head materialization/projection/evidence after Feature-3 retirement;
+- K=2/transformed-direction/previous-error runtime retirement and zero Feature-3 workspace/evidence;
+- replay scalar-state continuity for the generic correction and no extra transformer NFE.
 
-The model-aware development suite includes formula equivalence against explicit `W^T W`, cross-channel ablations, complete-row alignment, exact least-squares optimality, trust rise/fall, replay scalar-state, rollback, system-RAM separation, and CUDA device-local evidence coverage. GitHub Actions remains the authoritative multi-revision check after this branch is published.
+GitHub Actions remains the authoritative multi-revision check after this branch is published. The historical Feature-3 mathematical/telemetry tests were removed with their rejected runtime; the real experimental record remains in `MODEL_AWARE_BENCHMARK.md` and Git history.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).
 
@@ -474,11 +508,13 @@ ComfyUI-Spectrum-MiniMax-H3/
 |-- LICENSE
 |-- README.md
 |-- IMPLEMENTATION_NOTES.md
+|-- MODEL_AWARE_BENCHMARK.md
 |-- comfyui_spectrum_h3/
 |   |-- __init__.py
 |   |-- config.py
 |   |-- experiments.py
 |   |-- forecast.py
+|   |-- generic_correction.py
 |   |-- model_aware.py
 |   |-- nodes.py
 |   |-- runtime.py
