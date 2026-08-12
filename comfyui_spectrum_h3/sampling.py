@@ -442,11 +442,21 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
         )
         model_decision = runtime.active_model_aware_decision
         if model_decision is not None:
+            audio_gain = model_decision.audio_correction_telemetry
+            video_gain = model_decision.video_correction_telemetry
             LOG.warning(
                 "Spectrum H3 model-aware step=%s trajectory_risk=%.6f model_risk=%.6f "
                 "patch_risk=%.6f combined_risk=%.6f confidence=%.6f horizon=%.3f "
                 "degree=%s ridge=%.8f audio_blend=%.6f video_blend=%.6f "
-                "audio_correction=%.6f video_correction=%.6f decision=%s",
+                "audio_projection_used=%.6f audio_raw_generic_gain=%.6f "
+                "audio_raw_model_gain=%.6f audio_generic_gain=%.6f "
+                "audio_model_gain=%.6f audio_generic_clamped=%s audio_model_clamped=%s "
+                "audio_gain_delta_pre_clamp=%.6f audio_gain_delta_post_clamp=%.6f "
+                "video_projection_used=%.6f video_raw_generic_gain=%.6f "
+                "video_raw_model_gain=%.6f video_generic_gain=%.6f "
+                "video_model_gain=%.6f video_generic_clamped=%s video_model_clamped=%s "
+                "video_gain_delta_pre_clamp=%.6f video_gain_delta_post_clamp=%.6f "
+                "decision=%s",
                 decision["step_id"],
                 model_decision.trajectory_risk,
                 model_decision.model_risk,
@@ -458,8 +468,24 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 model_decision.ridge_lambda,
                 model_decision.audio_blend_weight,
                 model_decision.video_blend_weight,
-                model_decision.audio_correction_gain,
-                model_decision.video_correction_gain,
+                audio_gain.residual_projection,
+                audio_gain.raw_generic_gain,
+                audio_gain.raw_model_gain,
+                audio_gain.generic_gain,
+                audio_gain.model_gain,
+                audio_gain.generic_saturated,
+                audio_gain.model_saturated,
+                audio_gain.pre_clamp_delta,
+                audio_gain.post_clamp_delta,
+                video_gain.residual_projection,
+                video_gain.raw_generic_gain,
+                video_gain.raw_model_gain,
+                video_gain.generic_gain,
+                video_gain.model_gain,
+                video_gain.generic_saturated,
+                video_gain.model_saturated,
+                video_gain.pre_clamp_delta,
+                video_gain.post_clamp_delta,
                 "ACTUAL" if decision["actual"] else "FORECAST",
             )
 

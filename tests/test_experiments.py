@@ -3,12 +3,14 @@ from __future__ import annotations
 import pytest
 import torch
 
+from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.experiments import (
     OfflineFeatureArchive,
     OfflineSmoother,
     measure_stream_residual,
 )
 from comfyui_spectrum_h3.model_aware import ModelAwareForecastDecision
+from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
 
 
 def _model_decision(*, audio_blend: float, video_blend: float, correction: float = 0.0):
@@ -282,6 +284,30 @@ def test_offline_replay_preserves_per_forecast_model_aware_decisions_without_ind
     assert archive.steps[3].model_aware_decision is second_decision
     assert smoother.effective_blend_stream_stats["audio"] == (0.0, 0.0, 0.0)
     assert smoother.effective_blend_stream_stats["video"] == pytest.approx((0.2, 0.5, 0.8))
+    assert smoother.model_aware_offline_correction_applications == 2
+    assert smoother.model_aware_offline_correction_seconds > 0.0
+    assert (
+        smoother.model_aware_correction_seconds
+        == smoother.model_aware_offline_correction_seconds
+    )
+    runtime = SpectrumH3Runtime(SpectrumH3Config(model_aware_mode="full"))
+    runtime._offline_smoother = smoother
+    runtime._record_offline_smoother_stats()
+    assert runtime.stats.model_aware_offline_correction_applications == 2
+    assert runtime.stats.model_aware_offline_correction_seconds > 0.0
+    assert runtime.stats.model_aware_causal_correction_seconds == 0.0
+    assert (
+        runtime.stats.model_aware_correction_seconds
+        == runtime.stats.model_aware_offline_correction_seconds
+    )
+    assert runtime.stats.model_aware_overhead_seconds >= (
+        runtime.stats.model_aware_fit_seconds
+        + runtime.stats.model_aware_offline_correction_seconds
+    )
+    summary = runtime.debug_summary()
+    assert "model_aware_causal_correction_s=0.000000" in summary
+    assert "model_aware_offline_replay_correction_s=" in summary
+    assert "model_aware_offline_replay_correction_applications=2" in summary
     spectral = smoother._affine_spectral_weights(
         smoother._forecaster.model_aware_weights(
             coordinates[3],

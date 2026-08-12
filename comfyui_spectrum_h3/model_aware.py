@@ -5,7 +5,7 @@ import math
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -14,6 +14,7 @@ _PROFILE_CACHE_LIMIT = 16
 _BASE_SAMPLE_ELEMENTS = 4096
 _EXACT_LORA_FACTOR_ELEMENTS = 4_000_000
 _EXACT_LORA_COMBINED_RANK = 512
+_CORRECTION_GAIN_LIMIT = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,25 @@ class ProfileLookup:
 
 
 @dataclass(frozen=True, slots=True)
+class CorrectionGainTelemetry:
+    residual_projection: float = 0.0
+    raw_generic_gain: float = 0.0
+    raw_model_gain: float = 0.0
+    generic_gain: float = 0.0
+    model_gain: float = 0.0
+    generic_saturated: bool = False
+    model_saturated: bool = False
+
+    @property
+    def pre_clamp_delta(self) -> float:
+        return self.raw_model_gain - self.raw_generic_gain
+
+    @property
+    def post_clamp_delta(self) -> float:
+        return self.model_gain - self.generic_gain
+
+
+@dataclass(frozen=True, slots=True)
 class ModelAwareForecastDecision:
     trajectory_risk: float
     model_risk: float
@@ -60,6 +80,30 @@ class ModelAwareForecastDecision:
     video_correction_gain: float
     forecast_horizon: float
     force_actual: bool
+    audio_correction_telemetry: CorrectionGainTelemetry = field(
+        default_factory=CorrectionGainTelemetry
+    )
+    video_correction_telemetry: CorrectionGainTelemetry = field(
+        default_factory=CorrectionGainTelemetry
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StreamAnchorEvidence:
+    forecast_ratio: float = 0.0
+    curvature_ratio: float = 0.0
+    residual_projection: float = 0.0
+    model_corrected_ratio: float = 0.0
+    generic_corrected_ratio: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class AnchorEvidenceTiming:
+    weight_fit_seconds: float = 0.0
+    sample_index_seconds: float = 0.0
+    device_transfer_seconds: float = 0.0
+    reduction_seconds: float = 0.0
+    fit_condition_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +115,17 @@ class AnchorEvidence:
     video_projection: float
     model_corrected_ratio: float
     generic_corrected_ratio: float
+    audio: StreamAnchorEvidence = field(default_factory=StreamAnchorEvidence)
+    video: StreamAnchorEvidence = field(default_factory=StreamAnchorEvidence)
+    timing: AnchorEvidenceTiming = field(default_factory=AnchorEvidenceTiming)
+
+
+@dataclass(frozen=True, slots=True)
+class _InjectionAdapter:
+    key: str
+    adapter: Any
+    strength: float
+    group: str | None = None
 
 
 _PROFILE_CACHE: OrderedDict[tuple[Any, ...], ModelForecastabilityProfile] = OrderedDict()
@@ -178,10 +233,69 @@ def _patch_metadata_digest(model_patcher: Any) -> str:
     return digest.hexdigest()
 
 
-def _injection_metadata(model_patcher: Any) -> tuple[tuple[Any, ...], list[tuple[str, Any, float]]]:
+def _injection_metadata(
+    model_patcher: Any,
+    inner: Any,
+) -> tuple[tuple[Any, ...], list[_InjectionAdapter]]:
     descriptors: list[tuple[Any, ...]] = []
-    adapters: list[tuple[str, Any, float]] = []
+    adapters: list[_InjectionAdapter] = []
     seen_managers: set[int] = set()
+    seen_hooks: set[int] = set()
+    module_labels: dict[int, str] = {}
+    selected_weights = [
+        (key, _get_base_weight(model_patcher, key))
+        for key in _selected_base_keys(inner)
+    ]
+
+    def hook_target(module: Any, injection_key: str) -> tuple[str, str]:
+        weight = getattr(module, "weight", None)
+        for key, selected in selected_weights:
+            if selected is weight and selected is not None:
+                return key, _key_group(
+                    key,
+                    max(0, len(getattr(inner, "blocks", ())) - 1),
+                )
+        module_identity = id(module)
+        label = module_labels.get(module_identity)
+        if label is None:
+            label = f"@bypass:{injection_key}:module:{len(module_labels)}"
+            module_labels[module_identity] = label
+        return label, "other"
+
+    def collect_hook(candidate: Any, injection_key: str) -> None:
+        adapter = getattr(candidate, "adapter", None)
+        module = getattr(candidate, "module", None)
+        if adapter is None or module is None:
+            return
+        hook_identity = id(candidate)
+        if hook_identity in seen_hooks:
+            return
+        seen_hooks.add(hook_identity)
+        try:
+            strength = float(getattr(candidate, "multiplier", 1.0))
+        except (TypeError, ValueError):
+            strength = 1.0
+        key, group = hook_target(module, injection_key)
+        base_weight = getattr(module, "weight", None)
+        adapters.append(
+            _InjectionAdapter(
+                key=key,
+                adapter=adapter,
+                strength=strength,
+                group=group,
+            )
+        )
+        descriptors.append(
+            (
+                str(injection_key),
+                key,
+                strength,
+                _adapter_signature(adapter),
+                _tensor_signature(base_weight),
+                group,
+            )
+        )
+
     injections = getattr(model_patcher, "injections", {}) or {}
     for injection_key in sorted(injections, key=str):
         entries = injections[injection_key] or ()
@@ -196,29 +310,43 @@ def _injection_metadata(model_patcher: Any) -> tuple[tuple[Any, ...], list[tuple
                     except ValueError:
                         continue
                     registered = getattr(captured, "adapters", None)
-                    if not isinstance(registered, dict):
+                    if isinstance(registered, dict):
+                        manager_identity = id(captured)
+                        if manager_identity not in seen_managers:
+                            seen_managers.add(manager_identity)
+                            for key, value in sorted(
+                                registered.items(),
+                                key=lambda item: str(item[0]),
+                            ):
+                                if not isinstance(value, tuple) or len(value) != 2:
+                                    continue
+                                adapter, strength = value
+                                try:
+                                    strength_value = float(strength)
+                                except (TypeError, ValueError):
+                                    strength_value = 1.0
+                                adapters.append(
+                                    _InjectionAdapter(str(key), adapter, strength_value)
+                                )
+                                descriptors.append(
+                                    (
+                                        str(injection_key),
+                                        str(key),
+                                        strength_value,
+                                        _adapter_signature(adapter),
+                                    )
+                                )
                         continue
-                    manager_identity = id(captured)
-                    if manager_identity in seen_managers:
-                        continue
-                    seen_managers.add(manager_identity)
-                    for key, value in sorted(registered.items(), key=lambda item: str(item[0])):
-                        if not isinstance(value, tuple) or len(value) != 2:
-                            continue
-                        adapter, strength = value
-                        try:
-                            strength_value = float(strength)
-                        except (TypeError, ValueError):
-                            strength_value = 1.0
-                        adapters.append((str(key), adapter, strength_value))
-                        descriptors.append(
-                            (str(injection_key), str(key), strength_value, _adapter_signature(adapter))
-                        )
+                    if isinstance(captured, (tuple, list)):
+                        for candidate in captured:
+                            collect_hook(candidate, str(injection_key))
+                    else:
+                        collect_hook(captured, str(injection_key))
     return tuple(descriptors), adapters
 
 
 def _profile_cache_key(model_patcher: Any, inner: Any) -> tuple[Any, ...]:
-    injection_signature, _ = _injection_metadata(model_patcher)
+    injection_signature, _ = _injection_metadata(model_patcher, inner)
     return (
         str(getattr(model_patcher, "clone_base_uuid", "unknown-base")),
         str(getattr(model_patcher, "patches_uuid", "unknown-patches")),
@@ -390,7 +518,7 @@ def _build_profile(model_patcher: Any, inner: Any, cache_key: tuple[Any, ...]) -
     video_sensitivity = _clamp(video_gain / stream_mean, 0.25, 2.0)
 
     patches = getattr(model_patcher, "patches", {}) or {}
-    _, injection_adapters = _injection_metadata(model_patcher)
+    _, injection_adapters = _injection_metadata(model_patcher, inner)
     last_block_index = max(0, len(getattr(inner, "blocks", ())) - 1)
     active_patch_count = 0
     active_patch_keys: set[str] = set()
@@ -475,7 +603,10 @@ def _build_profile(model_patcher: Any, inner: Any, cache_key: tuple[Any, ...]) -
         if group in {"final_head", "final_block"}:
             final_values.append((relative, group_weight))
 
-    for key, adapter, strength in injection_adapters:
+    for injection_adapter in injection_adapters:
+        key = injection_adapter.key
+        adapter = injection_adapter.adapter
+        strength = injection_adapter.strength
         if strength == 0.0:
             continue
         active_patch_count += 1
@@ -489,10 +620,13 @@ def _build_profile(model_patcher: Any, inner: Any, cache_key: tuple[Any, ...]) -
             unknown_patch_count += 1
             continue
         recognized_lora_count += 1
-        group = _key_group(key, last_block_index)
+        group = injection_adapter.group or _key_group(key, last_block_index)
         group_weight = 1.0 if group == "final_block" else 1.2 if group == "final_head" else 0.45
         up, down = lora
-        denominator = max(base_gain * math.sqrt(max(1, up.shape[0] * down.shape[1])), 1e-12)
+        denominator = max(
+            base_gain * math.sqrt(max(1, up.shape[0] * down.shape[1])),
+            1e-12,
+        )
         relative = norm / denominator
         patch_values.append((relative, group_weight))
         if group in {"final_head", "final_block"}:
@@ -588,12 +722,24 @@ class ModelAwareController:
         self.model_corrected_ratio_sum = 0.0
         self.generic_corrected_ratio_sum = 0.0
         self.ablation_count = 0
+        self.stream_evidence_count = 0
+        for stream in ("audio", "video"):
+            setattr(self, f"{stream}_forecast_ratio_sum", 0.0)
+            setattr(self, f"{stream}_forecast_ratio_max", 0.0)
+            setattr(self, f"{stream}_model_corrected_ratio_sum", 0.0)
+            setattr(self, f"{stream}_generic_corrected_ratio_sum", 0.0)
+            setattr(self, f"{stream}_model_gain_clamp_count", 0)
+            setattr(self, f"{stream}_generic_gain_clamp_count", 0)
+            setattr(self, f"{stream}_gain_delta_pre_abs_sum", 0.0)
+            setattr(self, f"{stream}_gain_delta_pre_abs_max", 0.0)
+            setattr(self, f"{stream}_gain_delta_post_abs_sum", 0.0)
+            setattr(self, f"{stream}_gain_delta_post_abs_max", 0.0)
 
     def set_profile(self, profile: ModelForecastabilityProfile | None) -> None:
         self.profile = profile
 
     def snapshot(self) -> dict[str, float | int]:
-        return {
+        state = {
             "anchor_count": self.anchor_count,
             "forecast_ratio_ewma": self.forecast_ratio_ewma,
             "curvature_ratio_ewma": self.curvature_ratio_ewma,
@@ -603,7 +749,24 @@ class ModelAwareController:
             "model_corrected_ratio_sum": self.model_corrected_ratio_sum,
             "generic_corrected_ratio_sum": self.generic_corrected_ratio_sum,
             "ablation_count": self.ablation_count,
+            "stream_evidence_count": self.stream_evidence_count,
         }
+        for stream in ("audio", "video"):
+            for suffix in (
+                "forecast_ratio_sum",
+                "forecast_ratio_max",
+                "model_corrected_ratio_sum",
+                "generic_corrected_ratio_sum",
+                "model_gain_clamp_count",
+                "generic_gain_clamp_count",
+                "gain_delta_pre_abs_sum",
+                "gain_delta_pre_abs_max",
+                "gain_delta_post_abs_sum",
+                "gain_delta_post_abs_max",
+            ):
+                key = f"{stream}_{suffix}"
+                state[key] = getattr(self, key)
+        return state
 
     def restore(self, state: dict[str, float | int]) -> None:
         self.anchor_count = int(state["anchor_count"])
@@ -615,8 +778,62 @@ class ModelAwareController:
         self.model_corrected_ratio_sum = float(state["model_corrected_ratio_sum"])
         self.generic_corrected_ratio_sum = float(state["generic_corrected_ratio_sum"])
         self.ablation_count = int(state["ablation_count"])
+        self.stream_evidence_count = int(state["stream_evidence_count"])
+        for stream in ("audio", "video"):
+            for suffix in (
+                "forecast_ratio_sum",
+                "forecast_ratio_max",
+                "model_corrected_ratio_sum",
+                "generic_corrected_ratio_sum",
+                "gain_delta_pre_abs_sum",
+                "gain_delta_pre_abs_max",
+                "gain_delta_post_abs_sum",
+                "gain_delta_post_abs_max",
+            ):
+                key = f"{stream}_{suffix}"
+                setattr(self, key, float(state[key]))
+            for suffix in ("model_gain_clamp_count", "generic_gain_clamp_count"):
+                key = f"{stream}_{suffix}"
+                setattr(self, key, int(state[key]))
 
-    def observe_anchor(self, evidence: AnchorEvidence) -> None:
+    def observe_anchor(
+        self,
+        evidence: AnchorEvidence,
+        decision: ModelAwareForecastDecision | None = None,
+    ) -> None:
+        stream_records = (
+            (
+                "audio",
+                evidence.audio,
+                None if decision is None else decision.audio_correction_telemetry,
+            ),
+            (
+                "video",
+                evidence.video,
+                None if decision is None else decision.video_correction_telemetry,
+            ),
+        )
+        for _, stream_evidence, correction in stream_records:
+            values = (
+                stream_evidence.forecast_ratio,
+                stream_evidence.curvature_ratio,
+                stream_evidence.residual_projection,
+                stream_evidence.model_corrected_ratio,
+                stream_evidence.generic_corrected_ratio,
+            )
+            if not all(math.isfinite(float(value)) for value in values):
+                raise ValueError("per-stream model-aware evidence is nonfinite")
+            if correction is not None and not all(
+                math.isfinite(value)
+                for value in (
+                    correction.residual_projection,
+                    correction.raw_generic_gain,
+                    correction.raw_model_gain,
+                    correction.generic_gain,
+                    correction.model_gain,
+                )
+            ):
+                raise ValueError("model-aware correction telemetry is nonfinite")
         alpha = 0.5 if self.anchor_count < 2 else 0.3
         self.forecast_ratio_ewma = (1.0 - alpha) * self.forecast_ratio_ewma + alpha * _clamp(
             evidence.forecast_ratio, 0.0, 8.0
@@ -637,6 +854,52 @@ class ModelAwareController:
             self.model_corrected_ratio_sum += evidence.model_corrected_ratio
             self.generic_corrected_ratio_sum += evidence.generic_corrected_ratio
             self.ablation_count += 1
+        for stream, stream_evidence, correction in stream_records:
+            forecast_ratio = float(stream_evidence.forecast_ratio)
+            model_ratio = float(stream_evidence.model_corrected_ratio)
+            generic_ratio = float(stream_evidence.generic_corrected_ratio)
+            setattr(
+                self,
+                f"{stream}_forecast_ratio_sum",
+                getattr(self, f"{stream}_forecast_ratio_sum") + forecast_ratio,
+            )
+            setattr(
+                self,
+                f"{stream}_forecast_ratio_max",
+                max(getattr(self, f"{stream}_forecast_ratio_max"), forecast_ratio),
+            )
+            setattr(
+                self,
+                f"{stream}_model_corrected_ratio_sum",
+                getattr(self, f"{stream}_model_corrected_ratio_sum") + model_ratio,
+            )
+            setattr(
+                self,
+                f"{stream}_generic_corrected_ratio_sum",
+                getattr(self, f"{stream}_generic_corrected_ratio_sum") + generic_ratio,
+            )
+            if correction is not None:
+                if correction.model_saturated:
+                    setattr(
+                        self,
+                        f"{stream}_model_gain_clamp_count",
+                        getattr(self, f"{stream}_model_gain_clamp_count") + 1,
+                    )
+                if correction.generic_saturated:
+                    setattr(
+                        self,
+                        f"{stream}_generic_gain_clamp_count",
+                        getattr(self, f"{stream}_generic_gain_clamp_count") + 1,
+                    )
+                for stage, delta in (
+                    ("pre", abs(correction.pre_clamp_delta)),
+                    ("post", abs(correction.post_clamp_delta)),
+                ):
+                    sum_name = f"{stream}_gain_delta_{stage}_abs_sum"
+                    max_name = f"{stream}_gain_delta_{stage}_abs_max"
+                    setattr(self, sum_name, getattr(self, sum_name) + delta)
+                    setattr(self, max_name, max(getattr(self, max_name), delta))
+        self.stream_evidence_count += 1
         self.anchor_count += 1
 
     def _risks(self, forecast_horizon: float) -> tuple[float, float, float, float, float]:
@@ -671,6 +934,34 @@ class ModelAwareController:
         confidence = _clamp(1.0 - combined)
         return trajectory_risk, calibrated_model, patch_risk, combined, confidence
 
+    @staticmethod
+    def _correction_telemetry(
+        projection: float,
+        sensitivity: float,
+        scale: float,
+    ) -> CorrectionGainTelemetry:
+        raw_generic = float(projection) * float(scale)
+        raw_model = raw_generic * float(sensitivity)
+        generic = _clamp(
+            raw_generic,
+            -_CORRECTION_GAIN_LIMIT,
+            _CORRECTION_GAIN_LIMIT,
+        )
+        model = _clamp(
+            raw_model,
+            -_CORRECTION_GAIN_LIMIT,
+            _CORRECTION_GAIN_LIMIT,
+        )
+        return CorrectionGainTelemetry(
+            residual_projection=float(projection),
+            raw_generic_gain=raw_generic,
+            raw_model_gain=raw_model,
+            generic_gain=generic,
+            model_gain=model,
+            generic_saturated=abs(raw_generic) >= _CORRECTION_GAIN_LIMIT,
+            model_saturated=abs(raw_model) >= _CORRECTION_GAIN_LIMIT,
+        )
+
     def decision(
         self,
         *,
@@ -698,25 +989,20 @@ class ModelAwareController:
             audio_blend *= spectral_scale
             video_blend *= spectral_scale
 
-        audio_correction = 0.0
-        video_correction = 0.0
+        audio_correction = CorrectionGainTelemetry()
+        video_correction = CorrectionGainTelemetry()
         if self.mode == "full" and self.anchor_count > 0 and self.profile is not None:
             horizon_scale = min(1.5, max(0.5, float(forecast_horizon)))
-            audio_correction = _clamp(
-                self.audio_projection_ewma
-                * self.profile.audio_sensitivity
-                * confidence
-                * horizon_scale,
-                -0.25,
-                0.25,
+            scale = confidence * horizon_scale
+            audio_correction = self._correction_telemetry(
+                self.audio_projection_ewma,
+                self.profile.audio_sensitivity,
+                scale,
             )
-            video_correction = _clamp(
-                self.video_projection_ewma
-                * self.profile.video_sensitivity
-                * confidence
-                * horizon_scale,
-                -0.25,
-                0.25,
+            video_correction = self._correction_telemetry(
+                self.video_projection_ewma,
+                self.profile.video_sensitivity,
+                scale,
             )
         return ModelAwareForecastDecision(
             trajectory_risk=trajectory,
@@ -728,10 +1014,12 @@ class ModelAwareController:
             degree=degree,
             audio_blend_weight=audio_blend,
             video_blend_weight=video_blend,
-            audio_correction_gain=audio_correction,
-            video_correction_gain=video_correction,
+            audio_correction_gain=audio_correction.model_gain,
+            video_correction_gain=video_correction.model_gain,
             forecast_horizon=float(forecast_horizon),
             force_actual=combined >= self.risk_threshold,
+            audio_correction_telemetry=audio_correction,
+            video_correction_telemetry=video_correction,
         )
 
     def generic_correction_gains(
@@ -740,11 +1028,9 @@ class ModelAwareController:
     ) -> tuple[float, float]:
         if self.mode != "full" or self.anchor_count == 0:
             return 0.0, 0.0
-        horizon_scale = min(1.5, max(0.5, decision.forecast_horizon))
-        scale = decision.confidence * horizon_scale
         return (
-            _clamp(self.audio_projection_ewma * scale, -0.25, 0.25),
-            _clamp(self.video_projection_ewma * scale, -0.25, 0.25),
+            decision.audio_correction_telemetry.generic_gain,
+            decision.video_correction_telemetry.generic_gain,
         )
 
     @property
@@ -755,13 +1041,34 @@ class ModelAwareController:
     def generic_corrected_ratio_mean(self) -> float:
         return self.generic_corrected_ratio_sum / self.ablation_count if self.ablation_count else 0.0
 
+    def stream_mean(self, stream: str, metric: str) -> float:
+        if stream not in {"audio", "video"}:
+            raise ValueError("stream must be 'audio' or 'video'")
+        if metric not in {
+            "forecast_ratio",
+            "model_corrected_ratio",
+            "generic_corrected_ratio",
+            "gain_delta_pre_abs",
+            "gain_delta_post_abs",
+        }:
+            raise ValueError("unknown model-aware stream metric")
+        if self.stream_evidence_count == 0:
+            return 0.0
+        return (
+            getattr(self, f"{stream}_{metric}_sum")
+            / self.stream_evidence_count
+        )
+
 
 __all__ = [
     "AnchorEvidence",
+    "AnchorEvidenceTiming",
+    "CorrectionGainTelemetry",
     "ModelAwareController",
     "ModelAwareForecastDecision",
     "ModelForecastabilityProfile",
     "ProfileLookup",
+    "StreamAnchorEvidence",
     "clear_model_profile_cache",
     "get_model_forecastability_profile",
 ]

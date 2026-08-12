@@ -323,6 +323,8 @@ class OfflineSmoother:
         self.effective_blend_mean = self.blend_weight
         self.effective_blend_max = self.blend_weight
         self._last_prediction_chunk_count = 0
+        self.model_aware_offline_correction_seconds = 0.0
+        self.model_aware_offline_correction_applications = 0
         validation_started = time.perf_counter()
         try:
             self._validation_scores = self._build_validation_scores()
@@ -352,7 +354,10 @@ class OfflineSmoother:
 
     @property
     def model_aware_correction_seconds(self) -> float:
-        return self._forecaster.model_aware_correction_seconds
+        return (
+            self._forecaster.model_aware_correction_seconds
+            + self.model_aware_offline_correction_seconds
+        )
 
     @staticmethod
     def _affine_spectral_weights(weights: torch.Tensor) -> torch.Tensor:
@@ -537,9 +542,16 @@ class OfflineSmoother:
                         effective_blend * spectral + (1.0 - effective_blend) * local
                     )
                     if correction_gain != 0.0:
-                        weights = weights.clone()
-                        weights[position - 1] -= correction_gain
-                        weights[position] += correction_gain
+                        correction_started = time.perf_counter()
+                        try:
+                            weights = weights.clone()
+                            weights[position - 1] -= correction_gain
+                            weights[position] += correction_gain
+                        finally:
+                            self.model_aware_offline_correction_seconds += (
+                                time.perf_counter() - correction_started
+                            )
+                        self.model_aware_offline_correction_applications += 1
                     weights_by_step[(record.step_id, branch, stream_index)] = weights
                     effective_blends.append(effective_blend)
                     stream_effective_blends[stream_name].append(effective_blend)

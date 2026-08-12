@@ -130,7 +130,7 @@ Before a generation, Spectrum lazily builds a compact scalar profile of the effe
 
 The final block is emphasized because Spectrum caches the feature immediately after that block; the current native H3 `FinalLayer` consumes that feature directly. Earlier-block patches contribute at a lower weight. This is a structural prior, not a claim that weight spectra are Spectrum's temporal Chebyshev spectrum.
 
-Profiles are kept in a bounded 16-entry process LRU keyed by ComfyUI's clone lineage UUID, patch-set UUID, H3 architecture signature, and bypass-injection adapter metadata including strength and factor identity. Clones with the same effective patch state reuse a profile; `add_patches`, removal/reload, or changed bypass adapters produce a different key. Cached records retain only scalars and strings—no model, patch, CPU weight, or GPU tensor references.
+Profiles are kept in a bounded 16-entry process LRU keyed by ComfyUI's clone lineage UUID, patch-set UUID, H3 architecture signature, and bypass-injection adapter metadata including strength and factor identity. Bypass state is read from the persistent manager or configured hook objects retained by `ModelPatcher.injections`, so reusing a cached loader output does not depend on the loader executing again. Clones with the same effective patch state reuse a profile; `add_patches`, removal/reload, or changed bypass adapters produce a different key. Cached records retain only scalars and strings—no model, patch, CPU weight, or GPU tensor references.
 
 ### Live evidence, replay, and samplers
 
@@ -142,7 +142,7 @@ Euler, deterministic RES/CFG++, MiniMax-H3 Turbo, and native `er_sde` retain the
 
 ### Overhead, debugging, and limitations
 
-Debug mode reports profile cache/build time, retained and temporary workspace estimates, patch coverage, sensitivity, per-anchor evidence, per-forecast risk/confidence/fitting/correction choices, adaptive extra NFEs, and model-informed versus generic correction error ratios. It logs scalar aggregates only.
+Debug mode reports profile cache/build time, retained and temporary workspace estimates, patch coverage, sensitivity, per-stream anchor evidence and scheduler aggregation, raw/bounded model and generic gains with clamp flags, per-stream corrected-error ratios, saturation/delta aggregates, and an evidence timing split for fitting, sampling, transfer, reductions, and condition estimation. Causal and offline-replay correction-weight construction timings are separate. It logs bounded scalar state only.
 
 The automated CPU fixture verifies bounded construction and per-step behavior but does not contain a full MiniMax-H3 checkpoint. Therefore this repository does **not** yet claim that static weight/LoRA statistics correlate with real-checkpoint forecast error, that adaptive fitting improves quality at equal NFE, or that the model-scaled correction beats generic residual feedback at equal wall-clock time. `full` should be treated as a research ablation, not a quality preset. Until the fixed-seed matrix in [MODEL_AWARE_BENCHMARK.md](MODEL_AWARE_BENCHMARK.md) has real-checkpoint results, the recommended production setting remains `off`; `schedule` is the most conservative starting point for controlled experiments.
 
@@ -425,7 +425,7 @@ Automated tests cover:
 - scalar-only model/LoRA profile construction for base, single, stacked, differently weighted, zero-strength, and unknown patches; clone reuse, patch UUID invalidation, bounded cache lifetime, and no retained model references;
 - model-aware risk calibration, bounded adaptive ridge/degree/blend and correction, sampled anchor evidence, and risk-only insertion of actual evaluations without relaxing sampler constraints.
 
-The model-aware development suite passes 218 tests against the attached current ComfyUI source in the CPU test environment; 11 native/CUDA cases are skipped where optional runtime dependencies or CUDA are unavailable. GitHub Actions remains the authoritative multi-revision check after this branch is published.
+The model-aware development suite passes 224 tests against the attached current ComfyUI source in the CPU test environment; 11 native/CUDA cases are skipped where optional runtime dependencies or CUDA are unavailable. GitHub Actions remains the authoritative multi-revision check after this branch is published.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).
 

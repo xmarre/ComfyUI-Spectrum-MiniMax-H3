@@ -96,6 +96,33 @@ def _complete_step(runtime, timestep, *, labels=LABEL):
     return decision
 
 
+def test_model_aware_off_never_enters_controller_and_keeps_legacy_forecast_path(
+    monkeypatch,
+):
+    runtime = _runtime(model_aware_mode="off")
+
+    def unexpected_decision(**_kwargs):
+        raise AssertionError("model-aware controller must not run in off mode")
+
+    monkeypatch.setattr(runtime.model_aware, "decision", unexpected_decision)
+    run_id = runtime.start_run(
+        torch.linspace(1.0, 0.0, 5),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    _actual_step(runtime, 1.0, [(LABEL, torch.zeros((1, 3, 4)))])
+    _actual_step(runtime, 0.75, [(LABEL, torch.ones((1, 3, 4)))])
+
+    prediction = _forecast_step(runtime, 0.5)
+
+    assert prediction.shape == (1, 3, 4)
+    assert runtime.stats.model_aware_decision_seconds == 0.0
+    assert runtime.stats.model_aware_correction_seconds == 0.0
+    runtime.end_run(run_id)
+
+
 def test_preliminary_runtime_defaults():
     config = SpectrumH3Config()
 

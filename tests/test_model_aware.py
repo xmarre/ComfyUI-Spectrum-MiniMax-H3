@@ -15,6 +15,7 @@ from comfyui_spectrum_h3.model_aware import (
     ModelAwareController,
     ModelForecastabilityProfile,
     ProfileLookup,
+    StreamAnchorEvidence,
     clear_model_profile_cache,
     get_model_forecastability_profile,
 )
@@ -207,6 +208,57 @@ def test_bypass_injection_manager_is_profiled_once_when_both_closures_capture_it
     assert profile.recognized_lora_count == 1
 
 
+def test_runtime_bypass_hook_profile_survives_cached_model_reuse_without_loader_rerun():
+    inner = _Inner()
+    adapter = _LoRA(torch.eye(4), torch.eye(4))
+    hook = SimpleNamespace(
+        module=inner.blocks[1].attn.out_proj,
+        adapter=adapter,
+        multiplier=0.75,
+    )
+    configured_hooks = [hook]
+    active_hooks = []
+
+    def inject(_patcher):
+        active_hooks.extend(configured_hooks)
+
+    def eject(_patcher):
+        active_hooks.clear()
+
+    injection = SimpleNamespace(inject=inject, eject=eject)
+    produced = _Patcher(inner, base_uuid="cached-base", patches_uuid="cached-patches")
+    produced.injections = {"dora_runtime_bypass_lora": [injection]}
+
+    first = get_model_forecastability_profile(produced)
+    inject(produced)
+    while_injected = get_model_forecastability_profile(produced)
+    eject(produced)
+
+    # ComfyUI preserves ModelPatcher injections when a cached MODEL output is
+    # reused and cloned downstream. The loader-local execution state is absent;
+    # the configured hook closure is the persistent effective-model state.
+    reused = _Patcher(inner, base_uuid="cached-base", patches_uuid="cached-patches")
+    reused.injections = {
+        key: entries.copy()
+        for key, entries in produced.injections.items()
+    }
+    second = get_model_forecastability_profile(reused)
+
+    assert first.profile.active_patch_count == 1
+    assert first.profile.active_patch_keys == 1
+    assert first.profile.recognized_lora_count == 1
+    assert first.profile.patch_perturbation > 0.0
+    assert while_injected.cache_hit
+    assert while_injected.profile.cache_key == first.profile.cache_key
+    assert second.cache_hit
+    assert second.profile.cache_key == first.profile.cache_key
+    assert second.profile.patch_identity == first.profile.patch_identity
+    assert second.profile.active_patch_count == first.profile.active_patch_count
+    assert second.profile.active_patch_keys == first.profile.active_patch_keys
+    assert second.profile.recognized_lora_count == first.profile.recognized_lora_count
+    assert second.profile.patch_perturbation == first.profile.patch_perturbation
+
+
 def test_patch_uuid_invalidates_cache_while_same_identity_hits():
     inner = _Inner()
     first = get_model_forecastability_profile(_Patcher(inner, patches_uuid="a"))
@@ -274,6 +326,123 @@ def test_controller_combines_static_prior_with_observed_evidence_and_bounds_outp
     assert calibrated.audio_correction_gain != calibrated.video_correction_gain
 
 
+def test_correction_saturation_exposes_pre_clamp_model_difference_and_post_clamp_equality():
+    controller = ModelAwareController("full", risk_threshold=1.0)
+    controller.set_profile(
+        _profile(audio_sensitivity=2.0, video_sensitivity=1.5)
+    )
+    seed_evidence = AnchorEvidence(
+        1.0,
+        0.2,
+        2.0,
+        -2.0,
+        -2.0,
+        1.0,
+        1.0,
+        audio=StreamAnchorEvidence(1.2, 0.1, -2.0, 0.9, 0.9),
+        video=StreamAnchorEvidence(0.8, 0.2, -2.0, 0.7, 0.7),
+    )
+    controller.observe_anchor(seed_evidence)
+
+    decision = controller.decision(
+        forecast_horizon=1.0,
+        history_length=5,
+        configured_degree=4,
+        configured_ridge_lambda=0.1,
+        configured_audio_blend=0.0,
+        configured_video_blend=0.5,
+    )
+
+    for telemetry in (
+        decision.audio_correction_telemetry,
+        decision.video_correction_telemetry,
+    ):
+        assert telemetry.raw_model_gain != telemetry.raw_generic_gain
+        assert telemetry.model_saturated
+        assert telemetry.generic_saturated
+        assert telemetry.model_gain == -0.25
+        assert telemetry.generic_gain == -0.25
+        assert telemetry.pre_clamp_delta != 0.0
+        assert telemetry.post_clamp_delta == 0.0
+
+    measured = AnchorEvidence(
+        2.0,
+        0.4,
+        3.0,
+        -1.5,
+        -0.7,
+        1.8,
+        1.8,
+        audio=StreamAnchorEvidence(2.0, 0.4, -1.5, 1.8, 1.8),
+        video=StreamAnchorEvidence(0.6, 0.1, -0.7, 0.5, 0.5),
+    )
+    controller.observe_anchor(measured, decision)
+
+    assert controller.audio_model_gain_clamp_count == 1
+    assert controller.audio_generic_gain_clamp_count == 1
+    assert controller.video_model_gain_clamp_count == 1
+    assert controller.video_generic_gain_clamp_count == 1
+    assert controller.audio_gain_delta_pre_abs_max > 0.0
+    assert controller.video_gain_delta_pre_abs_max > 0.0
+    assert controller.audio_gain_delta_post_abs_max == 0.0
+    assert controller.video_gain_delta_post_abs_max == 0.0
+    assert controller.stream_mean("audio", "forecast_ratio") == pytest.approx(1.6)
+    assert controller.stream_mean("video", "forecast_ratio") == pytest.approx(0.7)
+    assert controller.forecast_ratio_ewma > controller.video_forecast_ratio_max
+    runtime = SpectrumH3Runtime(SpectrumH3Config(model_aware_mode="full"))
+    runtime.model_aware = controller
+    summary = runtime.debug_summary()
+    assert "model_aware_scheduler_forecast_aggregate=max(audio,video)" in summary
+    assert "model_aware_audio_model_gain_clamps=1" in summary
+    assert "model_aware_audio_gain_delta_post_abs_max=0.000000" in summary
+
+
+def test_new_stream_and_saturation_statistics_round_trip_through_snapshot_restore():
+    controller = ModelAwareController("full", risk_threshold=1.0)
+    controller.set_profile(_profile(audio_sensitivity=2.0, video_sensitivity=2.0))
+    controller.observe_anchor(
+        AnchorEvidence(
+            2.0,
+            0.5,
+            2.0,
+            -2.0,
+            -2.0,
+            1.5,
+            1.5,
+            audio=StreamAnchorEvidence(2.0, 0.5, -2.0, 1.5, 1.5),
+            video=StreamAnchorEvidence(1.0, 0.25, -2.0, 0.8, 0.8),
+        )
+    )
+    decision = controller.decision(
+        forecast_horizon=1.0,
+        history_length=4,
+        configured_degree=2,
+        configured_ridge_lambda=0.1,
+        configured_audio_blend=0.0,
+        configured_video_blend=0.5,
+    )
+    controller.observe_anchor(
+        AnchorEvidence(
+            1.5,
+            0.4,
+            2.0,
+            -1.0,
+            -1.0,
+            1.0,
+            1.0,
+            audio=StreamAnchorEvidence(1.5, 0.4, -1.0, 1.0, 1.0),
+            video=StreamAnchorEvidence(0.5, 0.2, -1.0, 0.4, 0.4),
+        ),
+        decision,
+    )
+    snapshot = controller.snapshot()
+
+    controller.reset()
+    controller.restore(snapshot)
+
+    assert controller.snapshot() == snapshot
+
+
 def test_bad_observed_evidence_overrides_a_benign_static_prior():
     controller = ModelAwareController("schedule_confidence", risk_threshold=0.45)
     controller.set_profile(_profile(forecast_risk_prior=0.02))
@@ -320,6 +489,40 @@ def test_correction_is_zero_outside_full_mode():
     assert decision.video_correction_gain == 0.0
 
 
+def test_schedule_preserves_fitting_and_blends_while_schedule_confidence_adapts_without_correction():
+    evidence = AnchorEvidence(3.0, 1.5, 1e5, -1.0, -1.0, 2.0, 2.0)
+    schedule = ModelAwareController("schedule", risk_threshold=1.0)
+    confidence = ModelAwareController("schedule_confidence", risk_threshold=1.0)
+    for controller in (schedule, confidence):
+        controller.set_profile(_profile(forecast_risk_prior=0.8))
+        controller.observe_anchor(evidence)
+
+    inputs = {
+        "forecast_horizon": 1.0,
+        "history_length": 6,
+        "configured_degree": 4,
+        "configured_ridge_lambda": 0.1,
+        "configured_audio_blend": 0.0,
+        "configured_video_blend": 0.5,
+    }
+    schedule_decision = schedule.decision(**inputs)
+    confidence_decision = confidence.decision(**inputs)
+
+    assert schedule_decision.degree == 4
+    assert schedule_decision.ridge_lambda == 0.1
+    assert schedule_decision.audio_blend_weight == 0.0
+    assert schedule_decision.video_blend_weight == 0.5
+    assert schedule_decision.audio_correction_gain == 0.0
+    assert schedule_decision.video_correction_gain == 0.0
+    assert (
+        confidence_decision.degree != 4
+        or confidence_decision.ridge_lambda != 0.1
+        or confidence_decision.video_blend_weight != 0.5
+    )
+    assert confidence_decision.audio_correction_gain == 0.0
+    assert confidence_decision.video_correction_gain == 0.0
+
+
 def test_sampled_evidence_is_bounded_and_model_aware_weight_correction_preserves_affine_sum():
     forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.1, max_history=4)
     forecaster.update(0.0, torch.zeros((1, 4, 3)))
@@ -338,9 +541,12 @@ def test_sampled_evidence_is_bounded_and_model_aware_weight_correction_preserves
         ridge_lambda=0.2,
         correction_gain=0.0,
     )
+    actual = torch.empty((1, 4, 3))
+    actual[:, :2].fill_(2.2)
+    actual[:, 2:].fill_(1.4)
     evidence = forecaster.sampled_anchor_evidence(
         1.0,
-        torch.full((1, 4, 3), 2.2),
+        actual,
         (("audio", 0, 2, 0.5, 0.2, 0.1), ("video", 2, 4, 0.5, -0.1, 0.1)),
         degree=1,
         ridge_lambda=0.2,
@@ -357,6 +563,56 @@ def test_sampled_evidence_is_bounded_and_model_aware_weight_correction_preserves
             evidence.video_projection,
         )
     )
+    assert evidence.forecast_ratio == max(
+        evidence.audio.forecast_ratio,
+        evidence.video.forecast_ratio,
+    )
+    assert evidence.curvature_ratio == max(
+        evidence.audio.curvature_ratio,
+        evidence.video.curvature_ratio,
+    )
+    assert evidence.audio.forecast_ratio != evidence.video.forecast_ratio
+    assert (
+        evidence.audio.model_corrected_ratio
+        != evidence.audio.generic_corrected_ratio
+    )
+    assert (
+        evidence.video.model_corrected_ratio
+        != evidence.video.generic_corrected_ratio
+    )
+    assert evidence.model_corrected_ratio == max(
+        evidence.audio.model_corrected_ratio,
+        evidence.video.model_corrected_ratio,
+    )
+    assert evidence.generic_corrected_ratio == max(
+        evidence.audio.generic_corrected_ratio,
+        evidence.video.generic_corrected_ratio,
+    )
+    assert evidence.timing.sample_index_seconds >= 0.0
+    assert evidence.timing.device_transfer_seconds >= 0.0
+    assert evidence.timing.reduction_seconds >= 0.0
+    assert evidence.timing.fit_condition_seconds >= 0.0
+
+
+def test_anchor_telemetry_retains_raw_projection_while_controller_calibration_stays_bounded():
+    forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.1, max_history=4)
+    forecaster.update(0.0, torch.zeros((1, 4, 3)))
+    forecaster.update(0.5, torch.ones((1, 4, 3)))
+    evidence = forecaster.sampled_anchor_evidence(
+        1.0,
+        torch.full((1, 4, 3), 10.0),
+        (("audio", 0, 2, 0.0, 0.0, 0.0), ("video", 2, 4, 0.0, 0.0, 0.0)),
+        degree=1,
+        ridge_lambda=0.1,
+    )
+
+    assert evidence is not None
+    assert evidence.audio.residual_projection > 2.0
+    assert evidence.video.residual_projection > 2.0
+    controller = ModelAwareController("full", risk_threshold=1.0)
+    controller.observe_anchor(evidence)
+    assert controller.audio_projection_ewma == 1.0
+    assert controller.video_projection_ewma == 1.0
 
 
 def test_model_aware_schedule_can_only_convert_a_legacy_forecast_to_actual():

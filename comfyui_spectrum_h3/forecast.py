@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .model_aware import AnchorEvidence
+from .model_aware import AnchorEvidence, AnchorEvidenceTiming, StreamAnchorEvidence
 
 
 @dataclass(slots=True)
@@ -359,24 +359,50 @@ class HistoryWeightForecaster:
         return condition if math.isfinite(condition) else float("inf")
 
     @staticmethod
-    def _sample_segment(
+    def _sample_segment_with_timing(
         feature: torch.Tensor,
         start_row: int,
         end_row: int,
         *,
         limit: int = 4096,
-    ) -> torch.Tensor:
-        samples = []
+    ) -> tuple[torch.Tensor, float, float]:
+        selection_started = time.perf_counter()
+        selected = []
         per_branch = max(1, int(limit) // max(1, int(feature.shape[0])))
         for branch in range(int(feature.shape[0])):
             flat = feature[branch, start_row:end_row].detach().reshape(-1)
             if flat.numel() == 0:
                 continue
             stride = max(1, flat.numel() // per_branch)
-            samples.append(flat[::stride][:per_branch].to(device="cpu", dtype=torch.float32))
-        if not samples:
+            selected.append(flat[::stride][:per_branch])
+        selection_seconds = time.perf_counter() - selection_started
+        if not selected:
             raise ValueError("cannot sample an empty feature segment")
-        return torch.cat(samples)
+        transfer_started = time.perf_counter()
+        samples = [
+            sample.to(device="cpu", dtype=torch.float32)
+            for sample in selected
+        ]
+        result = torch.cat(samples)
+        transfer_seconds = time.perf_counter() - transfer_started
+        return result, selection_seconds, transfer_seconds
+
+    @classmethod
+    def _sample_segment(
+        cls,
+        feature: torch.Tensor,
+        start_row: int,
+        end_row: int,
+        *,
+        limit: int = 4096,
+    ) -> torch.Tensor:
+        sampled, _, _ = cls._sample_segment_with_timing(
+            feature,
+            start_row,
+            end_row,
+            limit=limit,
+        )
+        return sampled
 
     def sampled_anchor_evidence(
         self,
@@ -391,12 +417,13 @@ class HistoryWeightForecaster:
             return None
         if tuple(actual_feature.shape) != self._feature_shape:
             raise ValueError("actual feature shape changed during model-aware evidence sampling")
-        forecast_ratios = []
-        curvature_ratios = []
-        model_ratios = []
-        generic_ratios = []
-        projections: dict[str, float] = {}
+        stream_evidence: dict[str, StreamAnchorEvidence] = {}
+        weight_fit_seconds = 0.0
+        sample_index_seconds = 0.0
+        device_transfer_seconds = 0.0
+        reduction_seconds = 0.0
         for name, start, end, blend, model_gain, generic_gain in stream_parameters:
+            fit_started = time.perf_counter()
             raw_weights = self.model_aware_weights(
                 coordinate,
                 blend,
@@ -404,15 +431,25 @@ class HistoryWeightForecaster:
                 ridge_lambda=ridge_lambda,
                 correction_gain=0.0,
             )
-            history_samples = [
-                self._sample_segment(
+            weight_fit_seconds += time.perf_counter() - fit_started
+            history_samples = []
+            for entry in self._history:
+                sampled, selection_seconds, transfer_seconds = self._sample_segment_with_timing(
                     entry.feature_flat.reshape(self._feature_shape),
                     int(start),
                     int(end),
                 )
-                for entry in self._history
-            ]
-            actual = self._sample_segment(actual_feature, int(start), int(end))
+                history_samples.append(sampled)
+                sample_index_seconds += selection_seconds
+                device_transfer_seconds += transfer_seconds
+            actual, selection_seconds, transfer_seconds = self._sample_segment_with_timing(
+                actual_feature,
+                int(start),
+                int(end),
+            )
+            sample_index_seconds += selection_seconds
+            device_transfer_seconds += transfer_seconds
+            reduction_started = time.perf_counter()
             predicted = torch.zeros_like(actual)
             for weight, sample in zip(raw_weights.tolist(), history_samples, strict=True):
                 if weight != 0.0:
@@ -427,15 +464,14 @@ class HistoryWeightForecaster:
             denominator = float(torch.dot(delta, delta).item())
             dot_epsilon = epsilon * epsilon * max(1, int(delta.numel()))
             projection = float(torch.dot(residual, delta).item()) / max(denominator, dot_epsilon)
-            projections[str(name)] = max(-2.0, min(2.0, projection))
-            forecast_ratios.append(forecast_rms / max(hold_rms, epsilon))
+            forecast_ratio = forecast_rms / max(hold_rms, epsilon)
             model_predicted = predicted + float(model_gain) * delta
             generic_predicted = predicted + float(generic_gain) * delta
-            model_ratios.append(
+            model_ratio = (
                 float(torch.sqrt(torch.mean((actual - model_predicted).square())).item())
                 / max(hold_rms, epsilon)
             )
-            generic_ratios.append(
+            generic_ratio = (
                 float(torch.sqrt(torch.mean((actual - generic_predicted).square())).item())
                 / max(hold_rms, epsilon)
             )
@@ -443,20 +479,61 @@ class HistoryWeightForecaster:
                 curvature = latest - 2.0 * previous + history_samples[-3]
                 curvature_rms = float(torch.sqrt(torch.mean(curvature.square())).item())
                 delta_rms = float(torch.sqrt(torch.mean(delta.square())).item())
-                curvature_ratios.append(curvature_rms / max(delta_rms, epsilon))
+                curvature_ratio = curvature_rms / max(delta_rms, epsilon)
             else:
-                curvature_ratios.append(0.0)
-        values = forecast_ratios + curvature_ratios + model_ratios + generic_ratios + list(projections.values())
+                curvature_ratio = 0.0
+            stream_evidence[str(name)] = StreamAnchorEvidence(
+                forecast_ratio=forecast_ratio,
+                curvature_ratio=curvature_ratio,
+                residual_projection=projection,
+                model_corrected_ratio=model_ratio,
+                generic_corrected_ratio=generic_ratio,
+            )
+            reduction_seconds += time.perf_counter() - reduction_started
+        if "packed" in stream_evidence:
+            audio = video = stream_evidence["packed"]
+        else:
+            audio = stream_evidence.get("audio", StreamAnchorEvidence())
+            video = stream_evidence.get("video", StreamAnchorEvidence())
+        values = [
+            value
+            for evidence in stream_evidence.values()
+            for value in (
+                evidence.forecast_ratio,
+                evidence.curvature_ratio,
+                evidence.residual_projection,
+                evidence.model_corrected_ratio,
+                evidence.generic_corrected_ratio,
+            )
+        ]
         if not values or not all(math.isfinite(value) for value in values):
             raise ValueError("model-aware anchor evidence is nonfinite")
+        fit_condition_started = time.perf_counter()
+        fit_condition = self.fit_condition(degree=degree)
+        fit_condition_seconds = time.perf_counter() - fit_condition_started
         return AnchorEvidence(
-            forecast_ratio=max(forecast_ratios),
-            curvature_ratio=max(curvature_ratios),
-            fit_condition=self.fit_condition(degree=degree),
-            audio_projection=projections.get("audio", projections.get("packed", 0.0)),
-            video_projection=projections.get("video", projections.get("packed", 0.0)),
-            model_corrected_ratio=max(model_ratios),
-            generic_corrected_ratio=max(generic_ratios),
+            forecast_ratio=max(audio.forecast_ratio, video.forecast_ratio),
+            curvature_ratio=max(audio.curvature_ratio, video.curvature_ratio),
+            fit_condition=fit_condition,
+            audio_projection=audio.residual_projection,
+            video_projection=video.residual_projection,
+            model_corrected_ratio=max(
+                audio.model_corrected_ratio,
+                video.model_corrected_ratio,
+            ),
+            generic_corrected_ratio=max(
+                audio.generic_corrected_ratio,
+                video.generic_corrected_ratio,
+            ),
+            audio=audio,
+            video=video,
+            timing=AnchorEvidenceTiming(
+                weight_fit_seconds=weight_fit_seconds,
+                sample_index_seconds=sample_index_seconds,
+                device_transfer_seconds=device_transfer_seconds,
+                reduction_seconds=reduction_seconds,
+                fit_condition_seconds=fit_condition_seconds,
+            ),
         )
 
     def _chunk_elements(self, device: torch.device) -> int:

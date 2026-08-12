@@ -138,8 +138,16 @@ class RuntimeStats:
     model_aware_overhead_seconds: float = 0.0
     model_aware_decision_seconds: float = 0.0
     model_aware_evidence_seconds: float = 0.0
+    model_aware_evidence_weight_fit_seconds: float = 0.0
+    model_aware_evidence_sample_index_seconds: float = 0.0
+    model_aware_evidence_device_transfer_seconds: float = 0.0
+    model_aware_evidence_reduction_seconds: float = 0.0
+    model_aware_evidence_fit_condition_seconds: float = 0.0
     model_aware_fit_seconds: float = 0.0
     model_aware_correction_seconds: float = 0.0
+    model_aware_causal_correction_seconds: float = 0.0
+    model_aware_offline_correction_seconds: float = 0.0
+    model_aware_offline_correction_applications: int = 0
     model_aware_model_corrected_ratio_mean: float = 0.0
     model_aware_generic_corrected_ratio_mean: float = 0.0
 
@@ -408,8 +416,27 @@ class SpectrumH3Runtime:
         self.stats.offline_attenuated_video_predictions = smoother.attenuated_prediction_counts.get("video", 0)
         self.stats.offline_local_only_audio_predictions = smoother.local_only_prediction_counts.get("audio", 0)
         self.stats.offline_local_only_video_predictions = smoother.local_only_prediction_counts.get("video", 0)
+        previous_model_aware_fit = self.stats.model_aware_fit_seconds
         self.stats.model_aware_fit_seconds = smoother.model_aware_fit_seconds
-        self.stats.model_aware_correction_seconds = smoother.model_aware_correction_seconds
+        previous_offline_correction = self.stats.model_aware_offline_correction_seconds
+        self.stats.model_aware_offline_correction_seconds = (
+            smoother.model_aware_offline_correction_seconds
+        )
+        self.stats.model_aware_offline_correction_applications = (
+            smoother.model_aware_offline_correction_applications
+        )
+        self.stats.model_aware_correction_seconds = (
+            self.stats.model_aware_causal_correction_seconds
+            + self.stats.model_aware_offline_correction_seconds
+        )
+        self.stats.model_aware_overhead_seconds += max(
+            0.0,
+            self.stats.model_aware_fit_seconds - previous_model_aware_fit,
+        ) + max(
+            0.0,
+            self.stats.model_aware_offline_correction_seconds
+            - previous_offline_correction,
+        )
 
     def _stream_ranges(self, call: _CallState) -> tuple[tuple[str, int, int], ...]:
         topology = {
@@ -502,7 +529,12 @@ class SpectrumH3Runtime:
             self.forecaster.model_aware_correction_seconds - correction_before
         )
         self.stats.model_aware_fit_seconds += max(0.0, fit_elapsed)
-        self.stats.model_aware_correction_seconds += max(0.0, correction_elapsed)
+        correction_elapsed = max(0.0, correction_elapsed)
+        self.stats.model_aware_causal_correction_seconds += correction_elapsed
+        self.stats.model_aware_correction_seconds = (
+            self.stats.model_aware_causal_correction_seconds
+            + self.stats.model_aware_offline_correction_seconds
+        )
         self.stats.model_aware_overhead_seconds += max(
             0.0,
             fit_elapsed + correction_elapsed,
@@ -1398,6 +1430,13 @@ class SpectrumH3Runtime:
             )
             generic_audio, generic_video = self.model_aware.generic_correction_gains(decision)
             parameters = []
+            # A zero audio spectral blend selects the linear/local audio predictor;
+            # it does not bypass audio forecasting. H3 emits packed audio and video
+            # features from the same transformer evaluation, so an actual anchor
+            # refreshes both streams and audio error remains scheduler-relevant.
+            # Offline replay later uses bracketing local interpolation, making this
+            # causal audio evidence a trajectory-risk proxy rather than an exact
+            # measurement of replay interpolation error.
             for name, start, end in self._stream_ranges(step.calls[0]):
                 if name == "audio":
                     blend = decision.audio_blend_weight
@@ -1433,8 +1472,23 @@ class SpectrumH3Runtime:
                 ridge_lambda=decision.ridge_lambda,
             )
             if evidence is not None:
-                self.model_aware.observe_anchor(evidence)
+                self.model_aware.observe_anchor(evidence, decision)
                 self.stats.model_aware_anchor_updates += 1
+                self.stats.model_aware_evidence_weight_fit_seconds += (
+                    evidence.timing.weight_fit_seconds
+                )
+                self.stats.model_aware_evidence_sample_index_seconds += (
+                    evidence.timing.sample_index_seconds
+                )
+                self.stats.model_aware_evidence_device_transfer_seconds += (
+                    evidence.timing.device_transfer_seconds
+                )
+                self.stats.model_aware_evidence_reduction_seconds += (
+                    evidence.timing.reduction_seconds
+                )
+                self.stats.model_aware_evidence_fit_condition_seconds += (
+                    evidence.timing.fit_condition_seconds
+                )
                 self.stats.model_aware_model_corrected_ratio_mean = (
                     self.model_aware.model_corrected_ratio_mean
                 )
@@ -1442,19 +1496,68 @@ class SpectrumH3Runtime:
                     self.model_aware.generic_corrected_ratio_mean
                 )
                 if self.config.debug:
+                    audio_gain = decision.audio_correction_telemetry
+                    video_gain = decision.video_correction_telemetry
                     LOG.warning(
-                        "Spectrum H3 model-aware anchor step=%s forecast_ratio=%.6f "
-                        "curvature=%.6f fit_condition=%.6f audio_projection=%.6f "
-                        "video_projection=%.6f model_correction_ratio=%.6f "
-                        "generic_correction_ratio=%.6f",
+                        "Spectrum H3 model-aware anchor step=%s "
+                        "forecast_ratio_audio=%.6f forecast_ratio_video=%.6f "
+                        "forecast_ratio_aggregate=max(audio,video)=%.6f "
+                        "curvature_ratio_audio=%.6f curvature_ratio_video=%.6f "
+                        "curvature_ratio_aggregate=max(audio,video)=%.6f "
+                        "fit_condition=%.6f "
+                        "audio_residual_projection=%.6f video_residual_projection=%.6f "
+                        "audio_model_corrected_ratio=%.6f video_model_corrected_ratio=%.6f "
+                        "model_corrected_ratio_aggregate=max(audio,video)=%.6f "
+                        "audio_generic_corrected_ratio=%.6f video_generic_corrected_ratio=%.6f "
+                        "generic_corrected_ratio_aggregate=max(audio,video)=%.6f "
+                        "audio_raw_generic_gain=%.6f audio_raw_model_gain=%.6f "
+                        "audio_generic_gain=%.6f audio_model_gain=%.6f "
+                        "audio_generic_clamped=%s audio_model_clamped=%s "
+                        "audio_gain_delta_pre_clamp=%.6f audio_gain_delta_post_clamp=%.6f "
+                        "video_raw_generic_gain=%.6f video_raw_model_gain=%.6f "
+                        "video_generic_gain=%.6f video_model_gain=%.6f "
+                        "video_generic_clamped=%s video_model_clamped=%s "
+                        "video_gain_delta_pre_clamp=%.6f video_gain_delta_post_clamp=%.6f "
+                        "evidence_weight_fit_s=%.6f evidence_sample_index_s=%.6f "
+                        "evidence_device_transfer_s=%.6f evidence_reduction_s=%.6f "
+                        "evidence_fit_condition_s=%.6f",
                         step.step_id,
+                        evidence.audio.forecast_ratio,
+                        evidence.video.forecast_ratio,
                         evidence.forecast_ratio,
+                        evidence.audio.curvature_ratio,
+                        evidence.video.curvature_ratio,
                         evidence.curvature_ratio,
                         evidence.fit_condition,
-                        evidence.audio_projection,
-                        evidence.video_projection,
+                        evidence.audio.residual_projection,
+                        evidence.video.residual_projection,
+                        evidence.audio.model_corrected_ratio,
+                        evidence.video.model_corrected_ratio,
                         evidence.model_corrected_ratio,
+                        evidence.audio.generic_corrected_ratio,
+                        evidence.video.generic_corrected_ratio,
                         evidence.generic_corrected_ratio,
+                        audio_gain.raw_generic_gain,
+                        audio_gain.raw_model_gain,
+                        audio_gain.generic_gain,
+                        audio_gain.model_gain,
+                        audio_gain.generic_saturated,
+                        audio_gain.model_saturated,
+                        audio_gain.pre_clamp_delta,
+                        audio_gain.post_clamp_delta,
+                        video_gain.raw_generic_gain,
+                        video_gain.raw_model_gain,
+                        video_gain.generic_gain,
+                        video_gain.model_gain,
+                        video_gain.generic_saturated,
+                        video_gain.model_saturated,
+                        video_gain.pre_clamp_delta,
+                        video_gain.post_clamp_delta,
+                        evidence.timing.weight_fit_seconds,
+                        evidence.timing.sample_index_seconds,
+                        evidence.timing.device_transfer_seconds,
+                        evidence.timing.reduction_seconds,
+                        evidence.timing.fit_condition_seconds,
                     )
         except torch.cuda.OutOfMemoryError:
             raise
@@ -1705,8 +1808,14 @@ class SpectrumH3Runtime:
             "model_aware_overhead_seconds",
             "model_aware_decision_seconds",
             "model_aware_evidence_seconds",
+            "model_aware_evidence_weight_fit_seconds",
+            "model_aware_evidence_sample_index_seconds",
+            "model_aware_evidence_device_transfer_seconds",
+            "model_aware_evidence_reduction_seconds",
+            "model_aware_evidence_fit_condition_seconds",
             "model_aware_fit_seconds",
-            "model_aware_correction_seconds",
+            "model_aware_causal_correction_seconds",
+            "model_aware_offline_correction_seconds",
         ):
             setattr(
                 restored,
@@ -1726,6 +1835,7 @@ class SpectrumH3Runtime:
             "offline_replay_smoothed_steps",
             "model_aware_anchor_updates",
             "model_aware_failures",
+            "model_aware_offline_correction_applications",
         ):
             setattr(
                 restored,
@@ -1767,6 +1877,10 @@ class SpectrumH3Runtime:
         self._last_completed_mode = snapshot.last_completed_mode
         self._last_completed_step_id = snapshot.last_completed_step_id
         self.model_aware.restore(snapshot.model_aware_state)
+        restored.model_aware_correction_seconds = (
+            restored.model_aware_causal_correction_seconds
+            + restored.model_aware_offline_correction_seconds
+        )
         restored.model_aware_model_corrected_ratio_mean = (
             self.model_aware.model_corrected_ratio_mean
         )
@@ -1801,6 +1915,17 @@ class SpectrumH3Runtime:
             if self._offline_archive is not None
             else None
         )
+        controller = self.model_aware
+        audio_forecast_mean = controller.stream_mean("audio", "forecast_ratio")
+        video_forecast_mean = controller.stream_mean("video", "forecast_ratio")
+        audio_model_mean = controller.stream_mean("audio", "model_corrected_ratio")
+        video_model_mean = controller.stream_mean("video", "model_corrected_ratio")
+        audio_generic_mean = controller.stream_mean("audio", "generic_corrected_ratio")
+        video_generic_mean = controller.stream_mean("video", "generic_corrected_ratio")
+        audio_delta_pre_mean = controller.stream_mean("audio", "gain_delta_pre_abs")
+        video_delta_pre_mean = controller.stream_mean("video", "gain_delta_pre_abs")
+        audio_delta_post_mean = controller.stream_mean("audio", "gain_delta_post_abs")
+        video_delta_post_mean = controller.stream_mean("video", "gain_delta_post_abs")
         return (
             f"run_id={self.stats.run_id} sampler={self.stats.sampler_name} "
             f"steps={self.stats.total_steps} actual_steps={self.stats.actual_steps} "
@@ -1889,8 +2014,40 @@ class SpectrumH3Runtime:
             f"model_aware_overhead_s={self.stats.model_aware_overhead_seconds:.6f} "
             f"model_aware_decision_s={self.stats.model_aware_decision_seconds:.6f} "
             f"model_aware_evidence_s={self.stats.model_aware_evidence_seconds:.6f} "
+            f"model_aware_evidence_weight_fit_s={self.stats.model_aware_evidence_weight_fit_seconds:.6f} "
+            f"model_aware_evidence_sample_index_s={self.stats.model_aware_evidence_sample_index_seconds:.6f} "
+            f"model_aware_evidence_device_transfer_s={self.stats.model_aware_evidence_device_transfer_seconds:.6f} "
+            f"model_aware_evidence_reduction_s={self.stats.model_aware_evidence_reduction_seconds:.6f} "
+            f"model_aware_evidence_fit_condition_s={self.stats.model_aware_evidence_fit_condition_seconds:.6f} "
             f"model_aware_fit_s={self.stats.model_aware_fit_seconds:.6f} "
             f"model_aware_correction_s={self.stats.model_aware_correction_seconds:.6f} "
+            f"model_aware_causal_correction_s={self.stats.model_aware_causal_correction_seconds:.6f} "
+            f"model_aware_offline_replay_correction_s={self.stats.model_aware_offline_correction_seconds:.6f} "
+            f"model_aware_offline_replay_correction_applications={self.stats.model_aware_offline_correction_applications} "
+            f"model_aware_scheduler_forecast_aggregate=max(audio,video) "
+            f"model_aware_scheduler_curvature_aggregate=max(audio,video) "
+            f"model_aware_forecast_ratio_ewma={controller.forecast_ratio_ewma:.6f} "
+            f"model_aware_curvature_ratio_ewma={controller.curvature_ratio_ewma:.6f} "
+            f"model_aware_audio_forecast_ratio_mean={audio_forecast_mean:.6f} "
+            f"model_aware_audio_forecast_ratio_max={controller.audio_forecast_ratio_max:.6f} "
+            f"model_aware_video_forecast_ratio_mean={video_forecast_mean:.6f} "
+            f"model_aware_video_forecast_ratio_max={controller.video_forecast_ratio_max:.6f} "
+            f"model_aware_audio_model_corrected_ratio_mean={audio_model_mean:.6f} "
+            f"model_aware_video_model_corrected_ratio_mean={video_model_mean:.6f} "
+            f"model_aware_audio_generic_corrected_ratio_mean={audio_generic_mean:.6f} "
+            f"model_aware_video_generic_corrected_ratio_mean={video_generic_mean:.6f} "
+            f"model_aware_audio_model_gain_clamps={controller.audio_model_gain_clamp_count} "
+            f"model_aware_video_model_gain_clamps={controller.video_model_gain_clamp_count} "
+            f"model_aware_audio_generic_gain_clamps={controller.audio_generic_gain_clamp_count} "
+            f"model_aware_video_generic_gain_clamps={controller.video_generic_gain_clamp_count} "
+            f"model_aware_audio_gain_delta_pre_abs_mean={audio_delta_pre_mean:.6f} "
+            f"model_aware_audio_gain_delta_pre_abs_max={controller.audio_gain_delta_pre_abs_max:.6f} "
+            f"model_aware_video_gain_delta_pre_abs_mean={video_delta_pre_mean:.6f} "
+            f"model_aware_video_gain_delta_pre_abs_max={controller.video_gain_delta_pre_abs_max:.6f} "
+            f"model_aware_audio_gain_delta_post_abs_mean={audio_delta_post_mean:.6f} "
+            f"model_aware_audio_gain_delta_post_abs_max={controller.audio_gain_delta_post_abs_max:.6f} "
+            f"model_aware_video_gain_delta_post_abs_mean={video_delta_post_mean:.6f} "
+            f"model_aware_video_gain_delta_post_abs_max={controller.video_gain_delta_post_abs_max:.6f} "
             f"model_corrected_ratio_mean={self.stats.model_aware_model_corrected_ratio_mean:.6f} "
             f"generic_corrected_ratio_mean={self.stats.model_aware_generic_corrected_ratio_mean:.6f} "
             f"history_storage={self.config.history_storage} "

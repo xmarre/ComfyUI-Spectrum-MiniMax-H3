@@ -28,11 +28,23 @@ Capture the debug summary plus:
 - sampler wall time and total generation wall time;
 - profile miss/hit time, temporary workspace estimate, retained profile bytes, and model-aware per-step overhead;
 - peak allocated/reserved VRAM and peak process RSS;
-- sampled counterfactual forecast/hold error at actual anchors by audio/video stream;
-- correction magnitude and model-informed versus generic-correction error ratios;
+- sampled counterfactual forecast/hold error and curvature at every actual anchor, separately for audio and video;
+- the explicit aggregate rule and value consumed by the scheduler (`max(audio, video)` in this revision);
+- raw residual projection, raw generic gain, raw model-scaled gain, bounded generic/model gains, and clamp flags for each stream;
+- per-stream model-informed and generic-correction error ratios, clamp counts, and pre/post-clamp model-versus-generic gain deltas;
+- anchor-evidence timing split into temporal-weight fitting, sample/index selection, device transfer, reductions/error calculations, and fit-condition calculation;
+- causal correction time and offline-replay correction-weight construction time/application count as separate fields;
 - decoded same-seed video, audio, and synchronization assessments using a blinded ordering where practical.
 
 Repeat each timing after one warm-up and include a second generation with the identical effective patch set to measure cache benefit. Run both cache measurements in the same process with the same clone lineage, patch-set identity and strengths, H3 architecture, and bypass-adapter metadata. Do not clear or evict the process-local profile cache between them. Report every seed, repetition, failure, and cancellation.
+
+When a runtime/bypass LoRA loader is upstream, run one mode that executes the loader and then change only `model_aware_mode` so ComfyUI reuses the cached MODEL output. The second profile must retain the same patch/adaptor identity, active patch and key counts, recognized/unknown counts, perturbation, and cache key. A zero-patch profile after cached reuse invalidates the model-aware comparison.
+
+## Pilot observations
+
+The first real 8-step seeded ER-SDE pilot used one workflow/configuration/seed and produced three anchor updates. `schedule` and `schedule_confidence` retained the same 5-actual/3-forecast schedule, confidence mode changed ridge/blend values, and `full` applied correction. At every measured anchor, the model-scaled and generic corrected ratios were identical. The learned projections were large and negative, and both gain paths reached the existing `-0.25` bound, so the clamp erased their pre-clamp difference. This does not disprove the model-sensitivity hypothesis; that pilot could not observe its incremental effect after saturation.
+
+A later 20-step `off` then `full` pilot reported risk up to `0.575384` (below the unchanged `0.65` threshold), nine saturated `-0.25` learned corrections, identical model/generic corrected ratios, and about 3.98 seconds of anchor-evidence work for nine anchors. Its `full` profile incorrectly reported zero patches after ComfyUI reused a cached output from `RuntimeBypassDoraPowerLoraLoader`, so its weight-prior result is invalid. That exposed a profiler lifetime bug: the loader persists effective adapters as bypass-hook objects in `ModelPatcher.injections`, while the old profiler recognized only manager objects exposing an `.adapters` dictionary. The corrected benchmark must verify persistent hook-derived profile identity before interpreting model-aware results.
 
 ## Required ablations
 
