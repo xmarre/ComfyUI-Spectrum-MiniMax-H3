@@ -55,8 +55,10 @@ jobs:
         run: |
           python -m ruff check \
             comfyui_spectrum_h3/feature3_direction.py \
+            comfyui_spectrum_h3/feature3_direction_normalization.py \
             comfyui_spectrum_h3/__init__.py \
             tests/test_feature3_direction.py \
+            tests/test_feature3_direction_normalization.py \
             tests/conftest.py \
             --ignore N999,I001,C408
           python -m compileall -q comfyui_spectrum_h3 tests
