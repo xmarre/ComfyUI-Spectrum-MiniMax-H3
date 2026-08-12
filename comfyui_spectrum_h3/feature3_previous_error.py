@@ -21,7 +21,7 @@ _ERROR_SAMPLE_ROWS = 32
 
 @dataclass(frozen=True, slots=True)
 class PreviousErrorState:
-    """Strictly prior-anchor sampled residuals in hidden and native output space."""
+    """Strictly prior-anchor sampled residuals in hidden/native output space."""
 
     anchor_id: int
     hidden_residual: torch.Tensor
@@ -29,10 +29,9 @@ class PreviousErrorState:
 
     @property
     def tensor_bytes(self) -> int:
-        values = (self.hidden_residual, self.output_residual)
         return sum(
             value.numel() * value.element_size()
-            for value in values
+            for value in (self.hidden_residual, self.output_residual)
             if torch.is_tensor(value)
         )
 
@@ -126,11 +125,11 @@ def _comparison(
     comparison: str,
     baseline: float,
     candidate: float,
-) -> float:
+) -> None:
     if not all(math.isfinite(value) for value in (baseline, candidate)):
-        return 0.0
+        return
     if baseline <= 0.0 or candidate <= 0.0:
-        return 0.0
+        return
     advantage = (baseline - candidate) / max(baseline, 1e-12)
     prefix = f"_feature3_error_{stream}_{comparison}"
     setattr(controller, f"{prefix}_count", getattr(controller, f"{prefix}_count") + 1)
@@ -148,7 +147,6 @@ def _comparison(
         setattr(controller, f"{prefix}_wins", getattr(controller, f"{prefix}_wins") + 1)
     elif candidate > baseline:
         setattr(controller, f"{prefix}_losses", getattr(controller, f"{prefix}_losses") + 1)
-    return advantage
 
 
 def _reset_error_state(controller: ModelAwareController) -> None:
@@ -301,7 +299,7 @@ def _sample_feature_rows(
 ) -> torch.Tensor:
     indices = indices_cpu.to(device=feature.device)
     selected = feature[:, int(start) : int(end)].index_select(1, indices)
-    return selected.detach().to(device=device, dtype=torch.float32).contiguous()
+    return selected.detach().to(device=device).contiguous()
 
 
 def _history_rows(
@@ -317,10 +315,9 @@ def _history_rows(
         raise RuntimeError("previous-error screen lost the forecaster feature shape")
     rows = []
     for entry in runtime.forecaster._history:
-        feature = entry.feature_flat.reshape(shape)
         rows.append(
             _sample_feature_rows(
-                feature,
+                entry.feature_flat.reshape(shape),
                 start,
                 end,
                 indices_cpu,
@@ -338,7 +335,11 @@ def _record_candidate(
 ) -> None:
     prefix = f"_feature3_error_{stream}_{kind}"
     if not telemetry.eligible:
-        setattr(controller, f"{prefix}_fallback_count", getattr(controller, f"{prefix}_fallback_count") + 1)
+        setattr(
+            controller,
+            f"{prefix}_fallback_count",
+            getattr(controller, f"{prefix}_fallback_count") + 1,
+        )
         return
     setattr(controller, f"{prefix}_eligible_count", getattr(controller, f"{prefix}_eligible_count") + 1)
     setattr(controller, f"{prefix}_ratio_sum", getattr(controller, f"{prefix}_ratio_sum") + telemetry.ordinary_ratio)
@@ -389,7 +390,6 @@ def _capture_geometry(
 ) -> _base.FinalLayerGeometry:
     import comfy.ops
 
-    started = time.perf_counter()
     shift, scale = inner.final_layer.adaln_proj(state.t_emb)
     del shift
     audio_row = int(state.audio_timestep_row)
@@ -402,11 +402,7 @@ def _capture_geometry(
         raise RuntimeError("native FinalLayer RMSNorm epsilon is invalid")
     probe = torch.empty((), device=device, dtype=dtype)
     if getattr(norm, "weight", None) is None:
-        norm_weight = torch.ones(
-            int(inner.hidden_size),
-            device=device,
-            dtype=dtype,
-        )
+        norm_weight = torch.ones(int(inner.hidden_size), device=device, dtype=dtype)
     else:
         weight, bias, offload_state = comfy.ops.cast_bias_weight(
             norm,
@@ -417,23 +413,20 @@ def _capture_geometry(
             norm_weight = weight.detach().clone()
         finally:
             comfy.ops.uncast_bias_weight(norm, weight, bias, offload_state)
-    geometry = _base.FinalLayerGeometry(
+    return _base.FinalLayerGeometry(
         norm_weight=norm_weight,
         norm_eps=eps,
         audio_scale=scale[audio_row].detach().clone(),
         video_scale=scale[video_row].detach().clone(),
     )
-    geometry._capture_elapsed = time.perf_counter() - started if hasattr(geometry, "_capture_elapsed") else 0.0
-    return geometry
 
 
-def _candidate_tensors(
+def _candidate_geometry(
     direction: torch.Tensor | None,
-    residual: torch.Tensor,
     delta: torch.Tensor,
     *,
     alpha_used: float,
-) -> tuple[Any, Any, torch.Tensor]:
+) -> tuple[Any, Any]:
     if direction is None:
         zero = torch.zeros((), dtype=torch.float32, device=delta.device)
         normalization = _norm._TensorNormalizedDirection(
@@ -451,12 +444,7 @@ def _candidate_tensors(
         normalization.direction,
         delta,
     )
-    instantaneous = _instantaneous_alpha(
-        residual,
-        normalization.direction,
-        normalization.eligible,
-    )
-    return normalization, bounded, instantaneous
+    return normalization, bounded
 
 
 def _observe_previous_error_anchor(
@@ -467,9 +455,7 @@ def _observe_previous_error_anchor(
     raw_weights_by_stream: dict[str, torch.Tensor],
     exact_head_weights: dict[str, torch.Tensor],
 ) -> None:
-    if runtime.config.model_aware_mode != "full":
-        return
-    if runtime._offline_phase == "replay":
+    if runtime.config.model_aware_mode != "full" or runtime._offline_phase == "replay":
         return
     controller = runtime.model_aware
     if controller._feature3_error_disabled_reason is not None:
@@ -492,58 +478,37 @@ def _observe_previous_error_anchor(
             weights = raw_weights_by_stream.get(stream)
             if head is None or weights is None:
                 continue
-            branch_count = int(combined.shape[0])
-            row_count = int(end) - int(start)
             indices_cpu = _row_indices(
                 controller,
                 runtime.forecaster,
                 stream,
-                row_count,
-                branch_count,
+                int(end) - int(start),
+                int(combined.shape[0]),
             )
-            history = _history_rows(
+            history_native = _history_rows(
                 runtime,
                 start,
                 end,
                 indices_cpu,
                 device=combined.device,
             )
-            if len(history) != runtime.forecaster.history_length or len(history) < 2:
+            if len(history_native) != runtime.forecaster.history_length or len(history_native) < 2:
                 raise RuntimeError("previous-error sampled history is not aligned")
-            if len(weights) != len(history):
+            if len(weights) != len(history_native):
                 raise RuntimeError("previous-error prediction weights are not aligned")
 
-            actual_native = _sample_feature_rows(
-                combined,
-                start,
-                end,
-                indices_cpu,
-                device=combined.device,
-            )
-            predicted = torch.zeros_like(actual_native)
+            history = [sample.to(torch.float32) for sample in history_native]
+            predicted = torch.zeros_like(history[-1])
             for weight_value, sample in zip(weights.tolist(), history, strict=True):
                 if weight_value != 0.0:
                     predicted.add_(sample, alpha=float(weight_value))
+            latest_native = history_native[-1]
             latest = history[-1]
             previous = history[-2]
             delta = latest - previous
-            current_residual = actual_native - predicted
-            hold_rms = _base._tensor_rms(actual_native - latest).clamp_min(
-                _base._DIRECTION_EPS
-            )
-            generic_gain = generic_audio if stream == "audio" else generic_video
-            exact_gain = (
-                decision.audio_correction_telemetry.model_candidate_gain
-                if stream == "audio"
-                else decision.video_correction_telemetry.model_candidate_gain
-            )
-            generic_ratio = _base._tensor_rms(
-                actual_native - (predicted + float(generic_gain) * delta)
-            ) / hold_rms
-            exact_ratio = _base._tensor_rms(
-                actual_native - (predicted + float(exact_gain) * delta)
-            ) / hold_rms
+            predicted_native = predicted.to(dtype=latest_native.dtype)
 
+            # Construct all candidates from anchors < N before reading actual N.
             prior = controller._feature3_error_previous.get(stream)
             residual_raw = None if prior is None else prior.hidden_residual
             static_started = time.perf_counter()
@@ -561,15 +526,14 @@ def _observe_previous_error_anchor(
                 full_started = time.perf_counter()
                 vjp_started = time.perf_counter()
                 full_raw = _base.final_layer_vjp(
-                    predicted.to(dtype=actual_native.dtype),
+                    predicted_native,
                     prior.output_residual,
                     norm_weight=geometry.norm_weight,
                     norm_eps=geometry.norm_eps,
                     adaln_scale=adaln_scale,
                     head_weight=head,
                 ).to(torch.float32)
-                vjp_elapsed = time.perf_counter() - vjp_started
-                controller._feature3_error_vjp_seconds += vjp_elapsed
+                controller._feature3_error_vjp_seconds += time.perf_counter() - vjp_started
                 controller._feature3_error_full_seconds += time.perf_counter() - full_started
 
             residual_alpha, residual_count = _alpha_used(
@@ -581,44 +545,63 @@ def _observe_previous_error_anchor(
             full_alpha, full_count = _alpha_used(
                 controller, stream, "full", decision.confidence
             )
-            residual_norm, residual_bound, residual_instant = _candidate_tensors(
+            residual_norm, residual_bound = _candidate_geometry(
                 residual_raw,
-                current_residual,
                 delta,
                 alpha_used=residual_alpha,
             )
-            static_norm, static_bound, static_instant = _candidate_tensors(
+            static_norm, static_bound = _candidate_geometry(
                 static_raw,
-                current_residual,
                 delta,
                 alpha_used=static_alpha,
             )
-            full_norm, full_bound, full_instant = _candidate_tensors(
+            full_norm, full_bound = _candidate_geometry(
                 full_raw,
-                current_residual,
                 delta,
                 alpha_used=full_alpha,
             )
-
             residual_prediction = predicted + residual_bound.correction
             static_prediction = predicted + static_bound.correction
             full_prediction = predicted + full_bound.correction
-            residual_ratio = _base._tensor_rms(actual_native - residual_prediction) / hold_rms
-            static_ratio = _base._tensor_rms(actual_native - static_prediction) / hold_rms
-            full_ratio = _base._tensor_rms(actual_native - full_prediction) / hold_rms
+
+            # Actual N is first touched here, after every candidate is fixed.
+            actual_native = _sample_feature_rows(
+                combined,
+                start,
+                end,
+                indices_cpu,
+                device=combined.device,
+            )
+            actual = actual_native.to(torch.float32)
+            hold_rms = _base._tensor_rms(actual - latest).clamp_min(_base._DIRECTION_EPS)
+            generic_gain = generic_audio if stream == "audio" else generic_video
+            exact_gain = (
+                decision.audio_correction_telemetry.model_candidate_gain
+                if stream == "audio"
+                else decision.video_correction_telemetry.model_candidate_gain
+            )
+            generic_ratio = _base._tensor_rms(
+                actual - (predicted + float(generic_gain) * delta)
+            ) / hold_rms
+            exact_ratio = _base._tensor_rms(
+                actual - (predicted + float(exact_gain) * delta)
+            ) / hold_rms
+            residual_ratio = _base._tensor_rms(actual - residual_prediction) / hold_rms
+            static_ratio = _base._tensor_rms(actual - static_prediction) / hold_rms
+            full_ratio = _base._tensor_rms(actual - full_prediction) / hold_rms
 
             static_head_hold = _base._tensor_rms(
-                _base._static_head_difference(actual_native, latest, head)
+                _base._static_head_difference(actual, latest, head)
             ).clamp_min(_base._DIRECTION_EPS)
             static_head_ratio = _base._tensor_rms(
-                _base._static_head_difference(actual_native, static_prediction, head)
+                _base._static_head_difference(actual, static_prediction, head)
             ) / static_head_hold
             full_final_ratio = torch.zeros((), dtype=torch.float32, device=combined.device)
             if geometry is not None and adaln_scale is not None:
                 final_hold = _base._tensor_rms(
                     _base._final_layer_difference(
-                        actual_native.to(dtype=actual_native.dtype),
-                        latest.to(dtype=actual_native.dtype),
+                        actual_native,
+                        latest_native,
                         geometry=geometry,
                         adaln_scale=adaln_scale,
                         head_weight=head,
@@ -626,7 +609,7 @@ def _observe_previous_error_anchor(
                 ).clamp_min(_base._DIRECTION_EPS)
                 full_final_ratio = _base._tensor_rms(
                     _base._final_layer_difference(
-                        actual_native.to(dtype=actual_native.dtype),
+                        actual_native,
                         full_prediction.to(dtype=actual_native.dtype),
                         geometry=geometry,
                         adaln_scale=adaln_scale,
@@ -634,11 +617,28 @@ def _observe_previous_error_anchor(
                     )
                 ) / final_hold
 
+            # Only after counterfactual scoring do we derive N's error evidence.
+            current_residual = actual - predicted
+            residual_instant = _instantaneous_alpha(
+                current_residual,
+                residual_norm.direction,
+                residual_norm.eligible,
+            )
+            static_instant = _instantaneous_alpha(
+                current_residual,
+                static_norm.direction,
+                static_norm.eligible,
+            )
+            full_instant = _instantaneous_alpha(
+                current_residual,
+                full_norm.direction,
+                full_norm.eligible,
+            )
             current_output_residual = None
             if geometry is not None and adaln_scale is not None:
                 current_output_residual = _base._final_layer_difference(
-                    actual_native.to(dtype=actual_native.dtype),
-                    predicted.to(dtype=actual_native.dtype),
+                    actual_native,
+                    predicted_native,
                     geometry=geometry,
                     adaln_scale=adaln_scale,
                     head_weight=head,
@@ -680,9 +680,7 @@ def _observe_previous_error_anchor(
                     full_bound.eligible.to(torch.float32),
                 )
             ).detach().to(device="cpu").tolist()
-            controller._feature3_error_scalar_transfer_seconds += (
-                time.perf_counter() - transfer_started
-            )
+            controller._feature3_error_scalar_transfer_seconds += time.perf_counter() - transfer_started
             (
                 generic_ratio_v,
                 exact_ratio_v,
@@ -797,8 +795,7 @@ def _observe_previous_error_anchor(
             if bool(full_direction_eligible_v):
                 _update_alpha(controller, stream, "full", full_instant_v)
 
-            # Only after scoring/current-alpha fitting do we publish anchor N's
-            # residuals for a later target. This prevents same-anchor hindsight.
+            # Publish N only after scoring and calibration; N cannot affect itself.
             controller._feature3_error_previous[stream] = PreviousErrorState(
                 anchor_id=int(step.step_id),
                 hidden_residual=current_residual.detach().to(torch.float32).contiguous(),
@@ -880,10 +877,7 @@ def _observe_previous_error_anchor(
     except (RuntimeError, TypeError, ValueError) as exc:
         controller._feature3_error_failures += 1
         controller._feature3_error_disabled_reason = str(exc)
-        LOG.warning(
-            "Spectrum H3 previous-error telemetry disabled for this run: %s",
-            exc,
-        )
+        LOG.warning("Spectrum H3 previous-error telemetry disabled for this run: %s", exc)
     finally:
         controller._feature3_error_compute_seconds += time.perf_counter() - started
 
@@ -898,8 +892,7 @@ def _comparison_summary(
     mean = getattr(controller, f"{prefix}_advantage_sum") / count if count else 0.0
     return (
         f"{comparison}:{getattr(controller, f'{prefix}_wins')}/"
-        f"{getattr(controller, f'{prefix}_losses')}:"
-        f"mean_adv={mean:.6f}:"
+        f"{getattr(controller, f'{prefix}_losses')}:mean_adv={mean:.6f}:"
         f"max_abs={getattr(controller, f'{prefix}_advantage_abs_max'):.6f}"
     )
 
@@ -948,10 +941,10 @@ def _summary(runtime: SpectrumH3Runtime) -> str:
             "full_vs_static",
             "full_vs_generic",
         ):
-            parts.append(f"feature3_error_{stream}_{_comparison_summary(controller, stream, comparison)}")
-    parts.append(
-        f"feature3_error_reason={controller._feature3_error_disabled_reason!r}"
-    )
+            parts.append(
+                f"feature3_error_{stream}_{_comparison_summary(controller, stream, comparison)}"
+            )
+    parts.append(f"feature3_error_reason={controller._feature3_error_disabled_reason!r}")
     return " ".join(parts)
 
 
@@ -997,9 +990,7 @@ def install_feature3_previous_error_experiment() -> None:
         controller._feature3_error_row_indices = dict(state.get("_feature3_error_row_indices", {}))
         controller._feature3_error_row_shapes = dict(state.get("_feature3_error_row_shapes", {}))
         controller._feature3_error_last = dict(state.get("_feature3_error_last", {}))
-        controller._feature3_error_disabled_reason = state.get(
-            "_feature3_error_disabled_reason"
-        )
+        controller._feature3_error_disabled_reason = state.get("_feature3_error_disabled_reason")
 
     def start(runtime: SpectrumH3Runtime, *args, **kwargs):
         runtime._feature3_error_pending_geometry = {}
@@ -1021,9 +1012,7 @@ def install_feature3_previous_error_experiment() -> None:
         try:
             original_abort(runtime, run_id, step_id)
         finally:
-            getattr(runtime, "_feature3_error_pending_geometry", {}).pop(
-                int(step_id), None
-            )
+            getattr(runtime, "_feature3_error_pending_geometry", {}).pop(int(step_id), None)
 
     def disable(runtime: SpectrumH3Runtime, reason: str) -> bool:
         result = original_disable(runtime, reason)
@@ -1050,7 +1039,52 @@ def install_feature3_previous_error_experiment() -> None:
         kwargs,
         residual_probe=None,
     ):
-        result = original_execute_actual(
+        controller = runtime.model_aware
+        if (
+            runtime.config.model_aware_mode == "full"
+            and runtime._model_aware_enabled()
+            and runtime._offline_phase != "replay"
+            and controller._feature3_error_disabled_reason is None
+        ):
+            started = time.perf_counter()
+            try:
+                # This state depends only on target timestep/static model state.
+                # Capture it before actual N executes so candidate N cannot use
+                # any measurement produced by actual N.
+                state = _h3._prepare_output_state(
+                    inner,
+                    x[0],
+                    x[1],
+                    timestep,
+                    context,
+                    transformer_options,
+                    minimax_payload or {},
+                    layout,
+                )
+                geometry = _capture_geometry(
+                    inner,
+                    state,
+                    device=x[0].device,
+                    dtype=context.dtype,
+                )
+                runtime._feature3_error_pending_geometry.setdefault(
+                    int(step_id), {}
+                )[int(call_id)] = geometry
+            except torch.cuda.OutOfMemoryError:
+                raise
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                controller._feature3_error_failures += 1
+                controller._feature3_error_disabled_reason = (
+                    f"current FinalLayer geometry unavailable: {exc}"
+                )
+                LOG.warning(
+                    "Spectrum H3 previous-error geometry disabled for this run: %s",
+                    exc,
+                )
+            finally:
+                controller._feature3_error_geometry_seconds += time.perf_counter() - started
+
+        return original_execute_actual(
             executor,
             inner,
             runtime,
@@ -1066,48 +1100,6 @@ def install_feature3_previous_error_experiment() -> None:
             kwargs,
             residual_probe,
         )
-        controller = runtime.model_aware
-        if (
-            runtime.config.model_aware_mode != "full"
-            or not runtime._model_aware_enabled()
-            or runtime._offline_phase == "replay"
-            or controller._feature3_error_disabled_reason is not None
-        ):
-            return result
-        started = time.perf_counter()
-        try:
-            state = _h3._prepare_output_state(
-                inner,
-                x[0],
-                x[1],
-                timestep,
-                context,
-                transformer_options,
-                minimax_payload or {},
-                layout,
-            )
-            geometry = _capture_geometry(
-                inner,
-                state,
-                device=x[0].device,
-                dtype=context.dtype,
-            )
-            pending = runtime._feature3_error_pending_geometry
-            pending.setdefault(int(step_id), {})[int(call_id)] = geometry
-        except torch.cuda.OutOfMemoryError:
-            raise
-        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
-            controller._feature3_error_failures += 1
-            controller._feature3_error_disabled_reason = (
-                f"current FinalLayer geometry unavailable: {exc}"
-            )
-            LOG.warning(
-                "Spectrum H3 previous-error geometry disabled for this run: %s",
-                exc,
-            )
-        finally:
-            controller._feature3_error_geometry_seconds += time.perf_counter() - started
-        return result
 
     def debug_summary(runtime: SpectrumH3Runtime) -> str:
         return f"{original_debug_summary(runtime)} {_summary(runtime)}"
