@@ -106,6 +106,9 @@ class OfflineModelAwareDecision:
     video_blend_weight: float
     audio_correction_gain: float
     video_correction_gain: float
+    audio_correction_coefficients: tuple[float, ...] = ()
+    video_correction_coefficients: tuple[float, ...] = ()
+    correction_anchor_ids: tuple[int, ...] = ()
 
     @classmethod
     def from_runtime(
@@ -119,6 +122,25 @@ class OfflineModelAwareDecision:
             video_blend_weight=float(decision.video_blend_weight),
             audio_correction_gain=float(decision.audio_correction_gain),
             video_correction_gain=float(decision.video_correction_gain),
+            audio_correction_coefficients=(
+                tuple(decision.audio_subspace_telemetry.applied_coefficients)
+                if decision.audio_subspace_telemetry.eligible
+                else (
+                    (float(decision.audio_correction_gain),)
+                    if decision.audio_correction_gain != 0.0
+                    else ()
+                )
+            ),
+            video_correction_coefficients=(
+                tuple(decision.video_subspace_telemetry.applied_coefficients)
+                if decision.video_subspace_telemetry.eligible
+                else (
+                    (float(decision.video_correction_gain),)
+                    if decision.video_correction_gain != 0.0
+                    else ()
+                )
+            ),
+            correction_anchor_ids=tuple(decision.correction_anchor_ids),
         )
 
 
@@ -311,7 +333,12 @@ class OfflineSmoother:
             history_storage=archive.history_storage,
         )
         for anchor in archive.anchors:
-            self._forecaster.update(anchor.coordinate, anchor.feature, take_ownership=True)
+            self._forecaster.update(
+                anchor.coordinate,
+                anchor.feature,
+                anchor_id=anchor.step_id,
+                take_ownership=True,
+            )
         self._stream_ranges = self._resolve_stream_ranges()
         if (
             self._stream_ranges[0][0] == "packed"
@@ -545,20 +572,27 @@ class OfflineSmoother:
             local[position] = ratio
             for stream_index, (stream_name, _, _) in enumerate(self._stream_ranges):
                 configured_blend = self.configured_stream_blends[stream_name]
-                correction_gain = 0.0
+                correction_coefficients: tuple[float, ...] = ()
                 if decision is not None:
                     if stream_name == "audio":
                         configured_blend = decision.audio_blend_weight
-                        correction_gain = decision.audio_correction_gain
+                        correction_coefficients = decision.audio_correction_coefficients
                     elif stream_name == "video":
                         configured_blend = decision.video_blend_weight
-                        correction_gain = decision.video_correction_gain
+                        correction_coefficients = decision.video_correction_coefficients
                     else:
                         configured_blend = decision.video_blend_weight
-                        correction_gain = 0.5 * (
-                            decision.audio_correction_gain
-                            + decision.video_correction_gain
-                        )
+                        if len(decision.audio_correction_coefficients) == len(
+                            decision.video_correction_coefficients
+                        ):
+                            correction_coefficients = tuple(
+                                0.5 * (audio + video)
+                                for audio, video in zip(
+                                    decision.audio_correction_coefficients,
+                                    decision.video_correction_coefficients,
+                                    strict=True,
+                                )
+                            )
                 for branch in range(self._branch_count):
                     validation_score = self._validation_score_for_interval(
                         position,
@@ -569,12 +603,49 @@ class OfflineSmoother:
                     weights = (
                         effective_blend * spectral + (1.0 - effective_blend) * local
                     )
-                    if correction_gain != 0.0:
+                    if correction_coefficients and any(
+                        value != 0.0 for value in correction_coefficients
+                    ):
                         correction_started = time.perf_counter()
                         try:
                             weights = weights.clone()
-                            weights[position - 1] -= correction_gain
-                            weights[position] += correction_gain
+                            required = len(correction_coefficients) + 1
+                            if (
+                                decision is not None
+                                and len(decision.correction_anchor_ids) == required
+                            ):
+                                try:
+                                    correction_positions = [
+                                        self._anchor_ids.index(anchor_id)
+                                        for anchor_id in decision.correction_anchor_ids
+                                    ]
+                                except ValueError as exc:
+                                    raise RuntimeError(
+                                        "offline correction anchor stencil is missing"
+                                    ) from exc
+                                if (
+                                    correction_positions != sorted(correction_positions)
+                                    or len(set(correction_positions)) != required
+                                    or correction_positions[-1] >= position
+                                ):
+                                    raise RuntimeError(
+                                        "offline correction anchor stencil violates first-pass chronology"
+                                    )
+                            elif len(correction_coefficients) == 1:
+                                correction_positions = [position - 1, position]
+                            else:
+                                raise RuntimeError(
+                                    "offline K=2 correction is missing explicit causal anchor IDs"
+                                )
+                            if len(correction_coefficients) == 1:
+                                gain = correction_coefficients[0]
+                                weights[correction_positions[-2]] -= gain
+                                weights[correction_positions[-1]] += gain
+                            else:
+                                g0, g1 = correction_coefficients
+                                weights[correction_positions[-3]] -= g1
+                                weights[correction_positions[-2]] += -g0 + g1
+                                weights[correction_positions[-1]] += g0
                         finally:
                             self.model_aware_offline_correction_seconds += (
                                 time.perf_counter() - correction_started

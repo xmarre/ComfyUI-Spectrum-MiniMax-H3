@@ -10,12 +10,17 @@ import torch
 from .model_aware import AnchorEvidence, AnchorEvidenceTiming, StreamAnchorEvidence
 
 _EXACT_HEAD_SAMPLE_ROWS = 32
+_SUBSPACE_CONDITION_LIMIT = 1.0e6
+_SUBSPACE_RANK_RELATIVE_TOLERANCE = 1.0e-5
+_SUBSPACE_RIDGE = 1.0e-6
+_SUBSPACE_WORKSPACE_BYTES_PER_STREAM = 256
 
 
 @dataclass(slots=True)
 class _HistoryEntry:
     coordinate: float
     feature_flat: torch.Tensor
+    anchor_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -137,6 +142,15 @@ class HistoryWeightForecaster:
     @property
     def history_length(self) -> int:
         return len(self._history)
+
+    def latest_anchor_ids(self, count: int) -> tuple[int, ...]:
+        requested = int(count)
+        if requested < 0 or requested > len(self._history):
+            raise ValueError("requested anchor ID count is outside retained history")
+        entries = self._history[-requested:] if requested else []
+        if any(entry.anchor_id is None for entry in entries):
+            return ()
+        return tuple(int(entry.anchor_id) for entry in entries if entry.anchor_id is not None)
 
     @property
     def feature_shape(self) -> tuple[int, ...] | None:
@@ -267,6 +281,7 @@ class HistoryWeightForecaster:
         coordinate: float,
         feature: torch.Tensor,
         *,
+        anchor_id: int | None = None,
         take_ownership: bool = False,
         evidence_segments: Sequence[tuple[str, int, int]] | None = None,
         exact_head_weights: dict[str, torch.Tensor] | None = None,
@@ -373,7 +388,14 @@ class HistoryWeightForecaster:
                 .contiguous()
                 .reshape(-1)
             )
-        self._history.append(_HistoryEntry(float(coordinate), archived))
+        resolved_anchor_id = None if anchor_id is None else int(anchor_id)
+        if resolved_anchor_id is not None and any(
+            entry.anchor_id == resolved_anchor_id for entry in self._history
+        ):
+            raise ValueError("actual anchor ID was retained more than once")
+        self._history.append(
+            _HistoryEntry(float(coordinate), archived, resolved_anchor_id)
+        )
         if sampled_evidence is not None:
             self._evidence_segments = normalized_segments
             self._evidence_history.append(sampled_evidence)
@@ -520,6 +542,8 @@ class HistoryWeightForecaster:
         degree: int,
         ridge_lambda: float,
         correction_gain: float = 0.0,
+        correction_coefficients: tuple[float, ...] = (),
+        correction_anchor_ids: tuple[int, ...] = (),
     ) -> torch.Tensor:
         fit_started = time.perf_counter()
         blend = float(blend_weight)
@@ -538,13 +562,49 @@ class HistoryWeightForecaster:
         gain = float(correction_gain)
         if not math.isfinite(gain) or not -0.25 <= gain <= 0.25:
             raise ValueError("model-aware correction gain must be finite and in [-0.25, 0.25]")
-        if gain != 0.0:
+        if correction_coefficients and gain != 0.0:
+            raise ValueError("scalar and subspace corrections are mutually exclusive")
+        coefficients = (
+            tuple(float(value) for value in correction_coefficients)
+            if correction_coefficients
+            else ((gain,) if gain != 0.0 else ())
+        )
+        if len(coefficients) not in {0, 1, 2} or not all(
+            math.isfinite(value) for value in coefficients
+        ):
+            raise ValueError("model-aware correction coefficients are invalid")
+        if coefficients:
             correction_started = time.perf_counter()
-            if len(self._history) < 2:
-                raise RuntimeError("model-aware correction requires two actual history entries")
+            required = len(coefficients) + 1
+            if len(self._history) < required:
+                raise RuntimeError(
+                    f"model-aware K={len(coefficients)} correction requires {required} actual history entries"
+                )
+            if correction_anchor_ids:
+                if len(correction_anchor_ids) != required:
+                    raise ValueError("correction anchor stencil has the wrong size")
+                positions_by_id = {
+                    entry.anchor_id: index
+                    for index, entry in enumerate(self._history)
+                    if entry.anchor_id is not None
+                }
+                try:
+                    positions = [positions_by_id[int(value)] for value in correction_anchor_ids]
+                except KeyError as exc:
+                    raise RuntimeError("correction anchor stencil is no longer retained") from exc
+                if positions != sorted(positions) or len(set(positions)) != required:
+                    raise RuntimeError("correction anchor stencil is not chronological")
+            else:
+                positions = list(range(len(self._history) - required, len(self._history)))
             weights = weights.clone()
-            weights[-2] -= gain
-            weights[-1] += gain
+            if len(coefficients) == 1:
+                weights[positions[-2]] -= coefficients[0]
+                weights[positions[-1]] += coefficients[0]
+            else:
+                g0, g1 = coefficients
+                weights[positions[-3]] -= g1
+                weights[positions[-2]] += -g0 + g1
+                weights[positions[-1]] += g0
             self.model_aware_correction_seconds += time.perf_counter() - correction_started
         return weights
 
@@ -605,12 +665,103 @@ class HistoryWeightForecaster:
         sampled = sensitivity.index_select(0, positions.remainder(hidden))
         return sampled.repeat(branch_count).contiguous()
 
+    @staticmethod
+    def _two_direction_system(
+        residual: torch.Tensor,
+        direction0: torch.Tensor,
+        direction1: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        flattened0 = direction0.reshape(-1).to(dtype=torch.float32)
+        flattened1 = direction1.reshape(-1).to(dtype=torch.float32)
+        target = residual.reshape(-1).to(dtype=torch.float32)
+        cross = torch.dot(flattened0, flattened1)
+        gram = torch.stack(
+            (
+                torch.stack((torch.dot(flattened0, flattened0), cross)),
+                torch.stack((cross, torch.dot(flattened1, flattened1))),
+            )
+        )
+        rhs = torch.stack(
+            (torch.dot(flattened0, target), torch.dot(flattened1, target))
+        )
+        return gram, rhs
+
+    @staticmethod
+    def _solve_two_by_two(
+        gram: torch.Tensor,
+        rhs: torch.Tensor,
+        *,
+        scalar_fallback: torch.Tensor,
+        epsilon: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if gram.shape != (2, 2) or rhs.shape != (2,):
+            raise ValueError("subspace solver requires a 2x2 Gram system")
+        system_finite = torch.isfinite(gram).all() & torch.isfinite(rhs).all()
+        safe_gram = torch.where(torch.isfinite(gram), gram, torch.zeros_like(gram))
+        safe_rhs = torch.where(torch.isfinite(rhs), rhs, torch.zeros_like(rhs))
+        diagonal_scale = torch.diagonal(safe_gram).amax().clamp_min(epsilon)
+        normalized_gram = safe_gram / diagonal_scale
+        normalized_rhs = safe_rhs / diagonal_scale
+        numeric_epsilon = torch.as_tensor(
+            torch.finfo(normalized_gram.dtype).eps,
+            dtype=normalized_gram.dtype,
+            device=normalized_gram.device,
+        )
+        eigenvalues = torch.linalg.eigvalsh(normalized_gram)
+        largest = eigenvalues[-1].clamp_min(numeric_epsilon)
+        rank_threshold = torch.maximum(
+            numeric_epsilon,
+            largest * _SUBSPACE_RANK_RELATIVE_TOLERANCE,
+        )
+        rank = (eigenvalues > rank_threshold).sum()
+        condition = largest / eigenvalues[0].clamp_min(numeric_epsilon)
+        regularization = torch.maximum(
+            numeric_epsilon,
+            largest * _SUBSPACE_RIDGE,
+        ).clamp_max(1.0e-3)
+        regularized = normalized_gram + regularization * torch.eye(
+            2,
+            dtype=normalized_gram.dtype,
+            device=normalized_gram.device,
+        )
+        solved, info = torch.linalg.solve_ex(regularized, normalized_rhs)
+        eligible = (
+            system_finite
+            & torch.isfinite(scalar_fallback)
+            & (rank == 2)
+            & (condition <= _SUBSPACE_CONDITION_LIMIT)
+            & (info == 0)
+            & torch.isfinite(solved).all()
+        )
+        fallback = torch.stack(
+            (scalar_fallback.to(dtype=torch.float32), torch.zeros_like(scalar_fallback)),
+        )
+        coefficients = torch.where(eligible, solved, fallback)
+        condition = torch.where(
+            system_finite,
+            condition,
+            torch.full_like(condition, _SUBSPACE_CONDITION_LIMIT * 10.0),
+        )
+        return coefficients, condition, rank, eligible, regularization
+
     def sampled_anchor_evidence(
         self,
         coordinate: float,
         actual_feature: torch.Tensor,
         stream_parameters: Sequence[
-            tuple[str, int, int, float, float, float, float, float]
+            tuple[
+                str,
+                int,
+                int,
+                float,
+                float,
+                float,
+                float,
+                float,
+                tuple[float, float],
+                tuple[float, float],
+                tuple[float, float],
+            ]
         ],
         *,
         degree: int,
@@ -630,16 +781,39 @@ class HistoryWeightForecaster:
         scalar_transfer_seconds = 0.0
         reduction_seconds = 0.0
         exact_head_projection_seconds = 0.0
-        for (
-            name,
-            start,
-            end,
-            blend,
-            model_gain,
-            generic_gain,
-            diagonal_candidate_gain,
-            model_candidate_gain,
-        ) in stream_parameters:
+        subspace_gram_seconds = 0.0
+        subspace_solve_seconds = 0.0
+        for parameters in stream_parameters:
+            if len(parameters) == 8:
+                (
+                    name,
+                    start,
+                    end,
+                    blend,
+                    model_gain,
+                    generic_gain,
+                    diagonal_candidate_gain,
+                    model_candidate_gain,
+                ) = parameters
+                generic_2d_coefficients = (float(generic_gain), 0.0)
+                exact_2d_coefficients = (float(model_candidate_gain), 0.0)
+                applied_2d_coefficients = (float(model_gain), 0.0)
+            elif len(parameters) == 11:
+                (
+                    name,
+                    start,
+                    end,
+                    blend,
+                    model_gain,
+                    generic_gain,
+                    diagonal_candidate_gain,
+                    model_candidate_gain,
+                    generic_2d_coefficients,
+                    exact_2d_coefficients,
+                    applied_2d_coefficients,
+                ) = parameters
+            else:
+                raise ValueError("model-aware stream parameters have an invalid shape")
             fit_started = time.perf_counter()
             raw_weights = self.model_aware_weights(
                 coordinate,
@@ -771,6 +945,122 @@ class HistoryWeightForecaster:
                     flattened_delta_head,
                     flattened_delta_head,
                 ).clamp_min(head_dot_epsilon)
+
+            direction1 = (
+                previous - history_samples[-3]
+                if len(history_samples) >= 3
+                else torch.zeros_like(delta)
+            )
+            gram_started = time.perf_counter()
+            generic_gram, generic_rhs = self._two_direction_system(
+                residual,
+                delta,
+                direction1,
+            )
+            application_gram, _ = self._two_direction_system(
+                torch.zeros_like(actual),
+                actual - latest,
+                latest - previous,
+            )
+            subspace_gram_seconds += time.perf_counter() - gram_started
+            application_eligible = application_gram[0, 0] > dot_epsilon
+            if len(history_samples) >= 3:
+                solve_started = time.perf_counter()
+                (
+                    instantaneous_generic_coefficients,
+                    generic_2d_condition,
+                    generic_2d_rank,
+                    generic_2d_eligible,
+                    generic_regularization,
+                ) = self._solve_two_by_two(
+                    generic_gram,
+                    generic_rhs,
+                    scalar_fallback=projection,
+                    epsilon=dot_epsilon,
+                )
+                subspace_solve_seconds += time.perf_counter() - solve_started
+            else:
+                instantaneous_generic_coefficients = torch.stack(
+                    (projection, torch.zeros_like(projection))
+                )
+                generic_2d_condition = torch.zeros_like(projection)
+                generic_2d_rank = torch.ones((), dtype=torch.int64, device=actual.device)
+                generic_2d_eligible = torch.zeros((), dtype=torch.bool, device=actual.device)
+                generic_regularization = torch.zeros_like(projection)
+
+            direction1_head = None
+            if actual_head is not None:
+                assert residual_head is not None
+                assert delta_head is not None
+                direction1_head = (
+                    history_head[-2] - history_head[-3]
+                    if len(history_head) >= 3
+                    else torch.zeros_like(delta_head)
+                )
+                gram_started = time.perf_counter()
+                head_gram, head_rhs = self._two_direction_system(
+                    residual_head,
+                    delta_head,
+                    direction1_head,
+                )
+                subspace_gram_seconds += time.perf_counter() - gram_started
+                if len(history_head) >= 3:
+                    solve_started = time.perf_counter()
+                    (
+                        instantaneous_exact_coefficients,
+                        exact_2d_condition,
+                        exact_2d_rank,
+                        exact_2d_eligible,
+                        exact_regularization,
+                    ) = self._solve_two_by_two(
+                        head_gram,
+                        head_rhs,
+                        scalar_fallback=model_projection,
+                        epsilon=head_dot_epsilon,
+                    )
+                    subspace_solve_seconds += time.perf_counter() - solve_started
+                else:
+                    instantaneous_exact_coefficients = torch.stack(
+                        (model_projection, torch.zeros_like(model_projection))
+                    )
+                    exact_2d_condition = torch.zeros_like(model_projection)
+                    exact_2d_rank = torch.ones((), dtype=torch.int64, device=actual.device)
+                    exact_2d_eligible = torch.zeros((), dtype=torch.bool, device=actual.device)
+                    exact_regularization = torch.zeros_like(model_projection)
+            else:
+                instantaneous_exact_coefficients = instantaneous_generic_coefficients
+                exact_2d_condition = generic_2d_condition
+                exact_2d_rank = generic_2d_rank
+                exact_2d_eligible = generic_2d_eligible
+                exact_regularization = generic_regularization
+
+            generic_coefficients_tensor = torch.tensor(
+                generic_2d_coefficients,
+                dtype=torch.float32,
+                device=actual.device,
+            )
+            exact_coefficients_tensor = torch.tensor(
+                exact_2d_coefficients,
+                dtype=torch.float32,
+                device=actual.device,
+            )
+            applied_coefficients_tensor = torch.tensor(
+                applied_2d_coefficients,
+                dtype=torch.float32,
+                device=actual.device,
+            )
+            generic_2d_correction = (
+                generic_coefficients_tensor[0] * delta
+                + generic_coefficients_tensor[1] * direction1
+            )
+            exact_2d_correction = (
+                exact_coefficients_tensor[0] * delta
+                + exact_coefficients_tensor[1] * direction1
+            )
+            applied_2d_correction = (
+                applied_coefficients_tensor[0] * delta
+                + applied_coefficients_tensor[1] * direction1
+            )
             forecast_ratio = forecast_rms / hold_rms
             model_predicted = predicted + float(model_gain) * delta
             generic_predicted = predicted + float(generic_gain) * delta
@@ -790,11 +1080,23 @@ class HistoryWeightForecaster:
             model_candidate_ratio = (
                 torch.sqrt(torch.mean(model_candidate_error.square())) / hold_rms
             )
+            generic_2d_ratio = torch.sqrt(
+                torch.mean((residual - generic_2d_correction).square())
+            ) / hold_rms
+            exact_2d_ratio = torch.sqrt(
+                torch.mean((residual - exact_2d_correction).square())
+            ) / hold_rms
+            applied_2d_ratio = torch.sqrt(
+                torch.mean((residual - applied_2d_correction).square())
+            ) / hold_rms
             if actual_head is None:
                 model_head_ratio = model_ratio
                 generic_head_ratio = generic_ratio
                 diagonal_candidate_head_ratio = diagonal_candidate_ratio
                 model_candidate_head_ratio = model_candidate_ratio
+                generic_2d_head_ratio = generic_2d_ratio
+                exact_2d_head_ratio = exact_2d_ratio
+                applied_2d_head_ratio = applied_2d_ratio
             else:
                 assert predicted_head is not None
                 assert latest_head is not None
@@ -841,6 +1143,30 @@ class HistoryWeightForecaster:
                         ).square()
                     )
                 ) / head_hold_rms
+                assert residual_head is not None
+                assert delta_head is not None
+                assert direction1_head is not None
+                generic_2d_head_correction = (
+                    generic_coefficients_tensor[0] * delta_head
+                    + generic_coefficients_tensor[1] * direction1_head
+                )
+                exact_2d_head_correction = (
+                    exact_coefficients_tensor[0] * delta_head
+                    + exact_coefficients_tensor[1] * direction1_head
+                )
+                applied_2d_head_correction = (
+                    applied_coefficients_tensor[0] * delta_head
+                    + applied_coefficients_tensor[1] * direction1_head
+                )
+                generic_2d_head_ratio = torch.sqrt(
+                    torch.mean((residual_head - generic_2d_head_correction).square())
+                ) / head_hold_rms
+                exact_2d_head_ratio = torch.sqrt(
+                    torch.mean((residual_head - exact_2d_head_correction).square())
+                ) / head_hold_rms
+                applied_2d_head_ratio = torch.sqrt(
+                    torch.mean((residual_head - applied_2d_head_correction).square())
+                ) / head_hold_rms
             if len(history_samples) >= 3:
                 curvature = latest - 2.0 * previous + history_samples[-3]
                 curvature_ratio = torch.sqrt(torch.mean(curvature.square())) / torch.sqrt(
@@ -863,6 +1189,29 @@ class HistoryWeightForecaster:
                     generic_head_ratio,
                     diagonal_candidate_head_ratio,
                     model_candidate_head_ratio,
+                    generic_2d_ratio,
+                    exact_2d_ratio,
+                    applied_2d_ratio,
+                    generic_2d_head_ratio,
+                    exact_2d_head_ratio,
+                    applied_2d_head_ratio,
+                    instantaneous_generic_coefficients[0],
+                    instantaneous_generic_coefficients[1],
+                    instantaneous_exact_coefficients[0],
+                    instantaneous_exact_coefficients[1],
+                    generic_2d_condition,
+                    exact_2d_condition,
+                    generic_2d_rank.to(dtype=torch.float32),
+                    exact_2d_rank.to(dtype=torch.float32),
+                    (generic_2d_eligible & application_eligible).to(dtype=torch.float32),
+                    (exact_2d_eligible & application_eligible).to(dtype=torch.float32),
+                    torch.maximum(generic_regularization, exact_regularization),
+                    generic_gram[0, 0],
+                    generic_gram[0, 1],
+                    generic_gram[1, 1],
+                    application_gram[0, 0],
+                    application_gram[0, 1],
+                    application_gram[1, 1],
                 )
             )
             reduction_seconds += time.perf_counter() - reduction_started
@@ -881,6 +1230,29 @@ class HistoryWeightForecaster:
                 generic_head_ratio_value,
                 diagonal_candidate_head_ratio_value,
                 model_candidate_head_ratio_value,
+                generic_2d_ratio_value,
+                exact_2d_ratio_value,
+                applied_2d_ratio_value,
+                generic_2d_head_ratio_value,
+                exact_2d_head_ratio_value,
+                applied_2d_head_ratio_value,
+                generic_2d_g0,
+                generic_2d_g1,
+                exact_2d_g0,
+                exact_2d_g1,
+                generic_2d_condition_value,
+                exact_2d_condition_value,
+                generic_2d_rank_value,
+                exact_2d_rank_value,
+                generic_2d_eligible_value,
+                exact_2d_eligible_value,
+                subspace_regularization_value,
+                direction_g00,
+                direction_g01,
+                direction_g11,
+                application_g00,
+                application_g01,
+                application_g11,
             ) = scalar_values.detach().to(device="cpu").tolist()
             scalar_transfer_seconds += time.perf_counter() - transfer_started
             stream_evidence[str(name)] = StreamAnchorEvidence(
@@ -897,6 +1269,27 @@ class HistoryWeightForecaster:
                 generic_corrected_head_ratio=generic_head_ratio_value,
                 diagonal_candidate_head_ratio=diagonal_candidate_head_ratio_value,
                 model_candidate_head_ratio=model_candidate_head_ratio_value,
+                generic_2d_ratio=generic_2d_ratio_value,
+                exact_2d_ratio=exact_2d_ratio_value,
+                applied_2d_ratio=applied_2d_ratio_value,
+                generic_2d_head_ratio=generic_2d_head_ratio_value,
+                exact_2d_head_ratio=exact_2d_head_ratio_value,
+                applied_2d_head_ratio=applied_2d_head_ratio_value,
+                generic_2d_coefficients=(generic_2d_g0, generic_2d_g1),
+                exact_2d_coefficients=(exact_2d_g0, exact_2d_g1),
+                generic_2d_condition=generic_2d_condition_value,
+                exact_2d_condition=exact_2d_condition_value,
+                generic_2d_rank=int(generic_2d_rank_value),
+                exact_2d_rank=int(exact_2d_rank_value),
+                generic_2d_eligible=bool(generic_2d_eligible_value),
+                exact_2d_eligible=bool(exact_2d_eligible_value),
+                subspace_regularization=subspace_regularization_value,
+                direction_gram=(direction_g00, direction_g01, direction_g11),
+                application_direction_gram=(
+                    application_g00,
+                    application_g01,
+                    application_g11,
+                ),
             )
         if "packed" in stream_evidence:
             audio = video = stream_evidence["packed"]
@@ -920,6 +1313,19 @@ class HistoryWeightForecaster:
                 evidence.generic_corrected_head_ratio,
                 evidence.diagonal_candidate_head_ratio,
                 evidence.model_candidate_head_ratio,
+                evidence.generic_2d_ratio,
+                evidence.exact_2d_ratio,
+                evidence.applied_2d_ratio,
+                evidence.generic_2d_head_ratio,
+                evidence.exact_2d_head_ratio,
+                evidence.applied_2d_head_ratio,
+                *evidence.generic_2d_coefficients,
+                *evidence.exact_2d_coefficients,
+                evidence.generic_2d_condition,
+                evidence.exact_2d_condition,
+                evidence.subspace_regularization,
+                *evidence.direction_gram,
+                *evidence.application_direction_gram,
             )
         ]
         if not values or not all(math.isfinite(value) for value in values):
@@ -943,6 +1349,9 @@ class HistoryWeightForecaster:
             ),
             audio=audio,
             video=video,
+            subspace_workspace_bytes=(
+                len(stream_evidence) * _SUBSPACE_WORKSPACE_BYTES_PER_STREAM
+            ),
             timing=AnchorEvidenceTiming(
                 weight_fit_seconds=weight_fit_seconds,
                 sample_index_seconds=sample_index_seconds,
@@ -954,6 +1363,8 @@ class HistoryWeightForecaster:
                 reduction_seconds=reduction_seconds,
                 exact_head_projection_seconds=exact_head_projection_seconds,
                 fit_condition_seconds=fit_condition_seconds,
+                subspace_gram_seconds=subspace_gram_seconds,
+                subspace_solve_seconds=subspace_solve_seconds,
             ),
         )
 

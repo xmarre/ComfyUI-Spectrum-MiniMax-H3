@@ -18,6 +18,7 @@ from comfyui_spectrum_h3.model_aware import (
     StreamAnchorEvidence,
     clear_model_profile_cache,
     get_model_forecastability_profile,
+    radially_bound_coefficients,
 )
 from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
 
@@ -1028,6 +1029,381 @@ def test_exact_projection_minimizes_instantaneous_head_space_scalar_objective():
     optimum = evidence.model_projection
     assert objective(optimum) <= objective(optimum - 0.1)
     assert objective(optimum) <= objective(optimum + 0.1)
+
+
+def _two_direction_evidence(
+    weight: torch.Tensor,
+    direction0: torch.Tensor,
+    direction1: torch.Tensor,
+    residual: torch.Tensor,
+):
+    forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.0, max_history=5)
+    segments = (("audio", 0, 1), ("video", 1, 2))
+    exact = {"audio": weight, "video": weight}
+    hidden0 = torch.zeros_like(direction0)
+    hidden1 = direction1
+    hidden2 = direction1 + direction0
+    for anchor_id, (coordinate, hidden) in enumerate(
+        ((0.0, hidden0), (1.0, hidden1), (2.0, hidden2))
+    ):
+        feature = torch.stack((hidden, hidden), dim=0).reshape(1, 2, -1)
+        forecaster.update(
+            coordinate,
+            feature,
+            anchor_id=anchor_id,
+            evidence_segments=segments,
+            exact_head_weights=exact,
+        )
+    predicted = direction1 + 2.0 * direction0
+    actual_hidden = predicted + residual
+    actual = torch.stack((actual_hidden, actual_hidden), dim=0).reshape(1, 2, -1)
+    evidence = forecaster.sampled_anchor_evidence(
+        3.0,
+        actual,
+        (
+            ("audio", 0, 1, 0.0, 0.0, 0.0, 0.0, 0.0),
+            ("video", 1, 2, 0.0, 0.0, 0.0, 0.0, 0.0),
+        ),
+        degree=1,
+        ridge_lambda=0.0,
+        stream_diagonals={"audio": torch.ones_like(direction0), "video": torch.ones_like(direction0)},
+        exact_head_weights=exact,
+    )
+    assert evidence is not None
+    return forecaster, evidence.audio
+
+
+def test_k1_radial_bound_reproduces_scalar_soft_limit():
+    for gain in (-2.0, -0.25, 0.0, 0.1, 1.0):
+        bounded, raw_ratio, scale, bounded_ratio, active = radially_bound_coefficients(
+            (gain,),
+            (),
+        )
+        expected = gain / (1.0 + abs(gain) / 0.25)
+        assert bounded == pytest.approx((expected,))
+        assert raw_ratio == pytest.approx(abs(gain))
+        assert bounded_ratio == pytest.approx(abs(expected))
+        assert scale == pytest.approx(expected / gain if gain else 1.0)
+        assert active is (abs(gain) >= 0.25)
+
+
+def test_generic_k2_matches_explicit_tiny_least_squares_and_uses_second_direction():
+    direction0 = torch.tensor([1.0, 0.0, 0.0])
+    direction1 = torch.tensor([0.0, 1.0, 0.0])
+    residual = torch.tensor([0.25, 0.75, 0.0])
+    _, evidence = _two_direction_evidence(torch.eye(3), direction0, direction1, residual)
+    design = torch.stack((direction0, direction1), dim=1)
+    expected = torch.linalg.solve(
+        design.transpose(0, 1) @ design + 1e-6 * torch.eye(2),
+        design.transpose(0, 1) @ residual,
+    )
+
+    assert evidence.generic_2d_eligible
+    assert evidence.generic_2d_rank == 2
+    assert evidence.generic_2d_coefficients == pytest.approx(expected.tolist(), abs=2e-6)
+    coefficients = torch.tensor(evidence.generic_2d_coefficients)
+    scalar_error = torch.linalg.vector_norm(
+        residual - evidence.residual_projection * direction0
+    )
+    subspace_error = torch.linalg.vector_norm(
+        residual - design @ coefficients
+    )
+    assert subspace_error < scalar_error
+
+
+def test_exact_k2_matches_projected_and_explicit_full_gram_formulations():
+    weight = torch.tensor([[1.0, 2.0, 0.0], [0.0, 1.0, 1.0]])
+    direction0 = torch.tensor([1.0, -0.5, 0.25])
+    direction1 = torch.tensor([0.25, 1.0, -0.5])
+    residual = torch.tensor([0.5, -0.25, 1.0])
+    _, evidence = _two_direction_evidence(weight, direction0, direction1, residual)
+    directions = torch.stack((direction0, direction1), dim=1)
+    projected_directions = directions.transpose(0, 1) @ weight.transpose(0, 1)
+    projected_residual = residual @ weight.transpose(0, 1)
+    projected_gram = projected_directions @ projected_directions.transpose(0, 1)
+    projected_rhs = projected_directions @ projected_residual
+    projected_normalized = projected_gram / torch.diagonal(projected_gram).max()
+    projected_ridge = torch.linalg.eigvalsh(projected_normalized).max() * 1e-6
+    projected_expected = torch.linalg.solve(
+        projected_normalized + projected_ridge * torch.eye(2),
+        projected_rhs / torch.diagonal(projected_gram).max(),
+    )
+    full_gram = weight.transpose(0, 1) @ weight
+    explicit_gram = directions.transpose(0, 1) @ full_gram @ directions
+    explicit_rhs = directions.transpose(0, 1) @ full_gram @ residual
+    explicit_normalized = explicit_gram / torch.diagonal(explicit_gram).max()
+    explicit_ridge = torch.linalg.eigvalsh(explicit_normalized).max() * 1e-6
+    explicit_expected = torch.linalg.solve(
+        explicit_normalized + explicit_ridge * torch.eye(2),
+        explicit_rhs / torch.diagonal(explicit_gram).max(),
+    )
+
+    assert evidence.exact_2d_eligible
+    assert evidence.exact_2d_coefficients == pytest.approx(
+        projected_expected.tolist(), abs=2e-5
+    )
+    torch.testing.assert_close(projected_expected, explicit_expected)
+
+
+def test_exact_and_generic_k2_agree_for_identity_metric_and_diverge_when_weighting_matters():
+    direction0 = torch.tensor([1.0, 0.0, 1.0])
+    direction1 = torch.tensor([0.0, 1.0, 1.0])
+    residual = torch.tensor([1.0, -0.25, 0.5])
+    _, identity = _two_direction_evidence(
+        torch.eye(3), direction0, direction1, residual
+    )
+    weight = torch.tensor([[4.0, 1.0, 0.0], [0.0, 1.0, 0.25]])
+    _, weighted = _two_direction_evidence(
+        weight,
+        direction0,
+        direction1,
+        residual,
+    )
+
+    assert identity.exact_2d_coefficients == pytest.approx(
+        identity.generic_2d_coefficients, abs=2e-6
+    )
+    assert weighted.exact_2d_coefficients != pytest.approx(
+        weighted.generic_2d_coefficients, abs=1e-3
+    )
+    projected_directions = weight @ torch.stack((direction0, direction1), dim=1)
+    projected_residual = weight @ residual
+    generic_error = torch.linalg.vector_norm(
+        projected_residual
+        - projected_directions @ torch.tensor(weighted.generic_2d_coefficients)
+    )
+    exact_error = torch.linalg.vector_norm(
+        projected_residual
+        - projected_directions @ torch.tensor(weighted.exact_2d_coefficients)
+    )
+    assert exact_error < generic_error
+    expected_gram = torch.stack((direction0, direction1)) @ torch.stack(
+        (direction0, direction1)
+    ).transpose(0, 1)
+    assert weighted.direction_gram == pytest.approx(
+        (expected_gram[0, 0], expected_gram[0, 1], expected_gram[1, 1])
+    )
+
+
+def test_collinear_k2_falls_back_to_scalar_without_nonfinite_coefficients():
+    direction0 = torch.tensor([1.0, 2.0, 3.0])
+    direction1 = 2.0 * direction0
+    residual = torch.tensor([0.5, -1.0, 0.25])
+    _, evidence = _two_direction_evidence(torch.eye(3), direction0, direction1, residual)
+
+    assert not evidence.generic_2d_eligible
+    assert evidence.generic_2d_rank == 1
+    assert evidence.generic_2d_coefficients[0] == pytest.approx(
+        evidence.residual_projection
+    )
+    assert evidence.generic_2d_coefficients[1] == 0.0
+
+
+def test_nonfinite_k2_system_falls_back_to_finite_scalar_candidate():
+    coefficients, condition, rank, eligible, regularization = (
+        HistoryWeightForecaster._solve_two_by_two(
+            torch.tensor([[float("nan"), 0.0], [0.0, 1.0]]),
+            torch.tensor([1.0, 2.0]),
+            scalar_fallback=torch.tensor(0.5),
+            epsilon=torch.tensor(torch.finfo(torch.float32).eps),
+        )
+    )
+
+    torch.testing.assert_close(coefficients, torch.tensor((0.5, 0.0)))
+    assert not bool(eligible)
+    assert torch.isfinite(condition)
+    assert torch.isfinite(regularization)
+    assert int(rank) < 2
+
+
+def test_k2_radial_bound_limits_combined_vector_budget_and_preserves_direction():
+    coefficients = (0.25, 0.25)
+    gram = (1.0, 0.0, 1.0)
+    bounded, raw_ratio, scale, bounded_ratio, active = radially_bound_coefficients(
+        coefficients,
+        gram,
+    )
+
+    assert raw_ratio == pytest.approx(2.0**0.5 * 0.25)
+    assert bounded_ratio < 0.25
+    assert active
+    assert bounded[0] / coefficients[0] == pytest.approx(scale)
+    assert bounded[1] / coefficients[1] == pytest.approx(scale)
+
+
+def test_k2_temporal_stencil_targets_explicit_causal_anchor_ids():
+    forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.1, max_history=5)
+    for anchor_id, coordinate in enumerate((-1.0, -0.5, 0.0, 0.5)):
+        forecaster.update(
+            coordinate,
+            torch.full((1, 1, 2), float(anchor_id)),
+            anchor_id=anchor_id,
+        )
+    base = forecaster.model_aware_weights(
+        0.75,
+        0.5,
+        degree=1,
+        ridge_lambda=0.1,
+    )
+    corrected = forecaster.model_aware_weights(
+        0.75,
+        0.5,
+        degree=1,
+        ridge_lambda=0.1,
+        correction_coefficients=(0.1, -0.05),
+        correction_anchor_ids=(0, 1, 2),
+    )
+
+    torch.testing.assert_close(
+        corrected - base,
+        torch.tensor((0.05, -0.15, 0.1, 0.0), dtype=torch.float32),
+    )
+
+
+def _eligible_subspace_stream(*, generic_head_ratio: float, exact_head_ratio: float):
+    return StreamAnchorEvidence(
+        forecast_ratio=1.0,
+        curvature_ratio=0.1,
+        residual_projection=0.2,
+        diagonal_projection=0.2,
+        model_projection=0.3,
+        model_corrected_ratio=1.0,
+        generic_corrected_ratio=1.0,
+        diagonal_candidate_ratio=1.0,
+        model_candidate_ratio=1.0,
+        model_corrected_head_ratio=1.0,
+        generic_corrected_head_ratio=1.0,
+        diagonal_candidate_head_ratio=1.0,
+        model_candidate_head_ratio=1.0,
+        generic_2d_ratio=generic_head_ratio,
+        exact_2d_ratio=exact_head_ratio,
+        applied_2d_ratio=generic_head_ratio,
+        generic_2d_head_ratio=generic_head_ratio,
+        exact_2d_head_ratio=exact_head_ratio,
+        applied_2d_head_ratio=generic_head_ratio,
+        generic_2d_coefficients=(0.5, 0.25),
+        exact_2d_coefficients=(0.25, 0.5),
+        generic_2d_condition=2.0,
+        exact_2d_condition=3.0,
+        generic_2d_rank=2,
+        exact_2d_rank=2,
+        generic_2d_eligible=True,
+        exact_2d_eligible=True,
+        subspace_regularization=1e-6,
+        direction_gram=(2.0, 0.25, 1.5),
+        application_direction_gram=(2.0, 0.25, 1.5),
+    )
+
+
+@pytest.mark.parametrize(
+    ("generic_ratio", "exact_ratio", "direction"),
+    ((1.0, 0.8, "rises"), (0.8, 1.0, "falls")),
+)
+def test_k2_model_trust_tracks_exact_2d_against_matching_generic_2d(
+    generic_ratio,
+    exact_ratio,
+    direction,
+):
+    controller = ModelAwareController("full", risk_threshold=1.0)
+    controller.set_profile(_profile())
+    seed = _eligible_subspace_stream(generic_head_ratio=1.0, exact_head_ratio=1.0)
+    controller.observe_anchor(
+        AnchorEvidence(1.0, 0.1, 2.0, 0.2, 0.2, 1.0, 1.0, audio=seed, video=seed)
+    )
+    decision = controller.decision(
+        forecast_horizon=1.0,
+        history_length=4,
+        configured_degree=2,
+        configured_ridge_lambda=0.1,
+        configured_audio_blend=0.0,
+        configured_video_blend=0.5,
+    )
+    assert decision.audio_subspace_telemetry.eligible
+    assert decision.audio_subspace_telemetry.applied_bounded_norm_ratio < 0.25
+    scalar_trust_before = controller.audio_model_trust
+    measured = _eligible_subspace_stream(
+        generic_head_ratio=generic_ratio,
+        exact_head_ratio=exact_ratio,
+    )
+    controller.observe_anchor(
+        AnchorEvidence(
+            1.0,
+            0.1,
+            2.0,
+            0.2,
+            0.2,
+            1.0,
+            1.0,
+            audio=measured,
+            video=measured,
+        ),
+        decision,
+    )
+
+    if direction == "rises":
+        assert controller.audio_subspace_model_trust > 0.5
+        assert controller.video_subspace_model_trust > 0.5
+    else:
+        assert controller.audio_subspace_model_trust < 0.5
+        assert controller.video_subspace_model_trust < 0.5
+    assert controller.audio_exact_2d_vs_generic_2d_comparison_count == 1
+    assert controller.audio_model_trust == scalar_trust_before
+
+
+def test_schedule_confidence_retains_k2_evidence_without_applying_correction():
+    controller = ModelAwareController("schedule_confidence", risk_threshold=1.0)
+    controller.set_profile(_profile())
+    stream = _eligible_subspace_stream(generic_head_ratio=1.0, exact_head_ratio=0.8)
+    controller.observe_anchor(
+        AnchorEvidence(1.0, 0.1, 2.0, 0.2, 0.2, 1.0, 1.0, audio=stream, video=stream)
+    )
+    decision = controller.decision(
+        forecast_horizon=1.0,
+        history_length=4,
+        configured_degree=2,
+        configured_ridge_lambda=0.1,
+        configured_audio_blend=0.0,
+        configured_video_blend=0.5,
+    )
+
+    assert decision.audio_correction_gain == 0.0
+    assert decision.video_correction_gain == 0.0
+    assert not decision.audio_subspace_telemetry.eligible
+    assert not decision.video_subspace_telemetry.eligible
+
+
+def test_controller_snapshot_restore_carries_k2_calibration_exactly():
+    controller = ModelAwareController("full", risk_threshold=1.0)
+    controller.set_profile(_profile())
+    stream = _eligible_subspace_stream(generic_head_ratio=1.0, exact_head_ratio=0.8)
+    controller.observe_anchor(
+        AnchorEvidence(1.0, 0.1, 2.0, 0.2, 0.2, 1.0, 1.0, audio=stream, video=stream)
+    )
+    snapshot = controller.snapshot()
+    expected = controller.decision(
+        forecast_horizon=1.0,
+        history_length=4,
+        configured_degree=2,
+        configured_ridge_lambda=0.1,
+        configured_audio_blend=0.0,
+        configured_video_blend=0.5,
+    )
+    controller.observe_anchor(
+        AnchorEvidence(1.0, 0.1, 2.0, 0.2, 0.2, 1.0, 1.0, audio=stream, video=stream),
+        expected,
+    )
+    controller.restore(snapshot)
+    restored = controller.decision(
+        forecast_horizon=1.0,
+        history_length=4,
+        configured_degree=2,
+        configured_ridge_lambda=0.1,
+        configured_audio_blend=0.0,
+        configured_video_blend=0.5,
+    )
+
+    assert restored.audio_subspace_telemetry == expected.audio_subspace_telemetry
+    assert restored.video_subspace_telemetry == expected.video_subspace_telemetry
 
 
 def test_exact_head_evidence_snapshot_restore_and_system_ram_history_are_independent():

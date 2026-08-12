@@ -89,6 +89,35 @@ class CorrectionGainTelemetry:
 
 
 @dataclass(frozen=True, slots=True)
+class SubspaceCorrectionTelemetry:
+    eligible: bool = False
+    used_scalar_fallback: bool = True
+    generic_condition: float = 0.0
+    exact_condition: float = 0.0
+    generic_rank: int = 0
+    exact_rank: int = 0
+    regularization: float = 0.0
+    raw_generic_coefficients: tuple[float, float] = (0.0, 0.0)
+    raw_exact_coefficients: tuple[float, float] = (0.0, 0.0)
+    generic_coefficients: tuple[float, float] = (0.0, 0.0)
+    exact_coefficients: tuple[float, float] = (0.0, 0.0)
+    applied_coefficients: tuple[float, float] = (0.0, 0.0)
+    generic_raw_norm_ratio: float = 0.0
+    exact_raw_norm_ratio: float = 0.0
+    applied_raw_norm_ratio: float = 0.0
+    generic_bound_scale: float = 1.0
+    exact_bound_scale: float = 1.0
+    applied_bound_scale: float = 1.0
+    generic_bounded_norm_ratio: float = 0.0
+    exact_bounded_norm_ratio: float = 0.0
+    applied_bounded_norm_ratio: float = 0.0
+    generic_bound_active: bool = False
+    exact_bound_active: bool = False
+    applied_bound_active: bool = False
+    model_trust: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class ModelAwareForecastDecision:
     trajectory_risk: float
     model_risk: float
@@ -109,6 +138,13 @@ class ModelAwareForecastDecision:
     video_correction_telemetry: CorrectionGainTelemetry = field(
         default_factory=CorrectionGainTelemetry
     )
+    audio_subspace_telemetry: SubspaceCorrectionTelemetry = field(
+        default_factory=SubspaceCorrectionTelemetry
+    )
+    video_subspace_telemetry: SubspaceCorrectionTelemetry = field(
+        default_factory=SubspaceCorrectionTelemetry
+    )
+    correction_anchor_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +162,23 @@ class StreamAnchorEvidence:
     generic_corrected_head_ratio: float = 0.0
     diagonal_candidate_head_ratio: float = 0.0
     model_candidate_head_ratio: float = 0.0
+    generic_2d_ratio: float = 0.0
+    exact_2d_ratio: float = 0.0
+    applied_2d_ratio: float = 0.0
+    generic_2d_head_ratio: float = 0.0
+    exact_2d_head_ratio: float = 0.0
+    applied_2d_head_ratio: float = 0.0
+    generic_2d_coefficients: tuple[float, float] = (0.0, 0.0)
+    exact_2d_coefficients: tuple[float, float] = (0.0, 0.0)
+    generic_2d_condition: float = 0.0
+    exact_2d_condition: float = 0.0
+    generic_2d_rank: int = 0
+    exact_2d_rank: int = 0
+    generic_2d_eligible: bool = False
+    exact_2d_eligible: bool = False
+    subspace_regularization: float = 0.0
+    direction_gram: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    application_direction_gram: tuple[float, float, float] = (1.0, 0.0, 0.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +191,8 @@ class AnchorEvidenceTiming:
     reduction_seconds: float = 0.0
     exact_head_projection_seconds: float = 0.0
     fit_condition_seconds: float = 0.0
+    subspace_gram_seconds: float = 0.0
+    subspace_solve_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +206,7 @@ class AnchorEvidence:
     generic_corrected_ratio: float
     audio: StreamAnchorEvidence = field(default_factory=StreamAnchorEvidence)
     video: StreamAnchorEvidence = field(default_factory=StreamAnchorEvidence)
+    subspace_workspace_bytes: int = 0
     timing: AnchorEvidenceTiming = field(default_factory=AnchorEvidenceTiming)
 
 
@@ -183,6 +239,36 @@ def _soft_limit(value: float, limit: float) -> float:
     if not math.isfinite(resolved) or not math.isfinite(bound) or bound <= 0.0:
         raise ValueError("soft limit requires a finite value and positive finite bound")
     return resolved / (1.0 + abs(resolved) / bound)
+
+
+def radially_bound_coefficients(
+    coefficients: tuple[float, ...],
+    direction_gram: tuple[float, ...],
+    *,
+    limit: float = _CORRECTION_GAIN_LIMIT,
+) -> tuple[tuple[float, ...], float, float, float, bool]:
+    """Soft-bound a trajectory correction using the latest-delta norm as budget."""
+    values = tuple(float(value) for value in coefficients)
+    if len(values) not in {1, 2} or not all(math.isfinite(value) for value in values):
+        raise ValueError("correction coefficients must contain one or two finite values")
+    if len(values) == 1:
+        norm_ratio = abs(values[0])
+    else:
+        if len(direction_gram) != 3:
+            raise ValueError("K=2 radial bounding requires the normalized 2x2 Gram triangle")
+        g00, g01, g11 = (float(value) for value in direction_gram)
+        if not all(math.isfinite(value) for value in (g00, g01, g11)) or g00 <= 0.0:
+            raise ValueError("direction Gram must be finite with a positive latest-delta norm")
+        norm_squared = (
+            values[0] * values[0] * g00
+            + 2.0 * values[0] * values[1] * g01
+            + values[1] * values[1] * g11
+        )
+        norm_ratio = math.sqrt(max(0.0, norm_squared / g00))
+    bounded_ratio = abs(_soft_limit(norm_ratio, limit))
+    scale = bounded_ratio / norm_ratio if norm_ratio > 1e-12 else 1.0
+    bounded = tuple(value * scale for value in values)
+    return bounded, norm_ratio, scale, bounded_ratio, norm_ratio >= float(limit)
 
 
 def _locate_inner(model_patcher: Any) -> Any | None:
@@ -832,6 +918,7 @@ class ModelAwareController:
             setattr(self, f"{stream}_diagonal_projection_ewma", 0.0)
             setattr(self, f"{stream}_model_projection_ewma", 0.0)
             setattr(self, f"{stream}_model_trust", 0.5)
+            setattr(self, f"{stream}_subspace_model_trust", 0.5)
             setattr(self, f"{stream}_diagonal_comparison_count", 0)
             setattr(self, f"{stream}_diagonal_candidate_win_count", 0)
             setattr(self, f"{stream}_diagonal_candidate_loss_count", 0)
@@ -859,6 +946,35 @@ class ModelAwareController:
             setattr(self, f"{stream}_gain_delta_applied_abs_max", 0.0)
             setattr(self, f"{stream}_gain_delta_exact_diagonal_abs_sum", 0.0)
             setattr(self, f"{stream}_gain_delta_exact_diagonal_abs_max", 0.0)
+            setattr(self, f"{stream}_subspace_evidence_count", 0)
+            setattr(self, f"{stream}_subspace_fallback_count", 0)
+            setattr(self, f"{stream}_subspace_condition_fallback_count", 0)
+            setattr(self, f"{stream}_generic_2d_g0_ewma", 0.0)
+            setattr(self, f"{stream}_generic_2d_g1_ewma", 0.0)
+            setattr(self, f"{stream}_exact_2d_g0_ewma", 0.0)
+            setattr(self, f"{stream}_exact_2d_g1_ewma", 0.0)
+            setattr(self, f"{stream}_direction_g01_ewma", 0.0)
+            setattr(self, f"{stream}_direction_g11_ewma", 0.0)
+            setattr(self, f"{stream}_generic_2d_condition_max", 0.0)
+            setattr(self, f"{stream}_exact_2d_condition_max", 0.0)
+            setattr(self, f"{stream}_subspace_regularization_max", 0.0)
+            setattr(self, f"{stream}_generic_2d_ratio_sum", 0.0)
+            setattr(self, f"{stream}_exact_2d_ratio_sum", 0.0)
+            setattr(self, f"{stream}_applied_2d_ratio_sum", 0.0)
+            setattr(self, f"{stream}_generic_2d_head_ratio_sum", 0.0)
+            setattr(self, f"{stream}_exact_2d_head_ratio_sum", 0.0)
+            setattr(self, f"{stream}_applied_2d_head_ratio_sum", 0.0)
+            for comparison in (
+                "generic_2d_vs_scalar",
+                "exact_2d_vs_exact_scalar",
+                "exact_2d_vs_generic_2d",
+                "exact_2d_vs_generic_scalar",
+            ):
+                setattr(self, f"{stream}_{comparison}_comparison_count", 0)
+                setattr(self, f"{stream}_{comparison}_win_count", 0)
+                setattr(self, f"{stream}_{comparison}_loss_count", 0)
+                setattr(self, f"{stream}_{comparison}_advantage_sum", 0.0)
+                setattr(self, f"{stream}_{comparison}_advantage_max", 0.0)
 
     def set_profile(self, profile: ModelForecastabilityProfile | None) -> None:
         self.profile = profile
@@ -935,6 +1051,9 @@ class ModelAwareController:
                 self, f"{stream}_model_projection_ewma"
             )
             state[f"{stream}_model_trust"] = getattr(self, f"{stream}_model_trust")
+            state[f"{stream}_subspace_model_trust"] = getattr(
+                self, f"{stream}_subspace_model_trust"
+            )
             for suffix in (
                 "forecast_ratio_sum",
                 "forecast_ratio_max",
@@ -957,6 +1076,21 @@ class ModelAwareController:
                 "gain_delta_applied_abs_max",
                 "gain_delta_exact_diagonal_abs_sum",
                 "gain_delta_exact_diagonal_abs_max",
+                "generic_2d_g0_ewma",
+                "generic_2d_g1_ewma",
+                "exact_2d_g0_ewma",
+                "exact_2d_g1_ewma",
+                "direction_g01_ewma",
+                "direction_g11_ewma",
+                "generic_2d_condition_max",
+                "exact_2d_condition_max",
+                "subspace_regularization_max",
+                "generic_2d_ratio_sum",
+                "exact_2d_ratio_sum",
+                "applied_2d_ratio_sum",
+                "generic_2d_head_ratio_sum",
+                "exact_2d_head_ratio_sum",
+                "applied_2d_head_ratio_sum",
             ):
                 key = f"{stream}_{suffix}"
                 state[key] = getattr(self, key)
@@ -967,9 +1101,27 @@ class ModelAwareController:
                 "model_comparison_count",
                 "model_candidate_win_count",
                 "model_candidate_loss_count",
+                "subspace_evidence_count",
+                "subspace_fallback_count",
+                "subspace_condition_fallback_count",
             ):
                 key = f"{stream}_{suffix}"
                 state[key] = getattr(self, key)
+            for comparison in (
+                "generic_2d_vs_scalar",
+                "exact_2d_vs_exact_scalar",
+                "exact_2d_vs_generic_2d",
+                "exact_2d_vs_generic_scalar",
+            ):
+                for suffix in (
+                    "comparison_count",
+                    "win_count",
+                    "loss_count",
+                    "advantage_sum",
+                    "advantage_max",
+                ):
+                    key = f"{stream}_{comparison}_{suffix}"
+                    state[key] = getattr(self, key)
         return state
 
     def restore(self, state: dict[str, float | int]) -> None:
@@ -999,6 +1151,11 @@ class ModelAwareController:
                 f"{stream}_model_trust",
                 float(state[f"{stream}_model_trust"]),
             )
+            setattr(
+                self,
+                f"{stream}_subspace_model_trust",
+                float(state[f"{stream}_subspace_model_trust"]),
+            )
             for suffix in (
                 "forecast_ratio_sum",
                 "forecast_ratio_max",
@@ -1018,6 +1175,21 @@ class ModelAwareController:
                 "gain_delta_applied_abs_max",
                 "gain_delta_exact_diagonal_abs_sum",
                 "gain_delta_exact_diagonal_abs_max",
+                "generic_2d_g0_ewma",
+                "generic_2d_g1_ewma",
+                "exact_2d_g0_ewma",
+                "exact_2d_g1_ewma",
+                "direction_g01_ewma",
+                "direction_g11_ewma",
+                "generic_2d_condition_max",
+                "exact_2d_condition_max",
+                "subspace_regularization_max",
+                "generic_2d_ratio_sum",
+                "exact_2d_ratio_sum",
+                "applied_2d_ratio_sum",
+                "generic_2d_head_ratio_sum",
+                "exact_2d_head_ratio_sum",
+                "applied_2d_head_ratio_sum",
             ):
                 key = f"{stream}_{suffix}"
                 setattr(self, key, float(state[key]))
@@ -1035,28 +1207,84 @@ class ModelAwareController:
                 "model_comparison_count",
                 "model_candidate_win_count",
                 "model_candidate_loss_count",
+                "subspace_evidence_count",
+                "subspace_fallback_count",
+                "subspace_condition_fallback_count",
             ):
                 key = f"{stream}_{suffix}"
                 setattr(self, key, int(state[key]))
+            for comparison in (
+                "generic_2d_vs_scalar",
+                "exact_2d_vs_exact_scalar",
+                "exact_2d_vs_generic_2d",
+                "exact_2d_vs_generic_scalar",
+            ):
+                for suffix in ("comparison_count", "win_count", "loss_count"):
+                    key = f"{stream}_{comparison}_{suffix}"
+                    setattr(self, key, int(state[key]))
+                for suffix in ("advantage_sum", "advantage_max"):
+                    key = f"{stream}_{comparison}_{suffix}"
+                    setattr(self, key, float(state[key]))
 
     def observe_anchor(
         self,
         evidence: AnchorEvidence,
         decision: ModelAwareForecastDecision | None = None,
     ) -> None:
+        def record_subspace_comparison(
+            stream: str,
+            comparison: str,
+            baseline: float,
+            candidate: float,
+        ) -> float | None:
+            if baseline <= 0.0 or candidate <= 0.0:
+                return None
+            relative_advantage = (baseline - candidate) / max(baseline, 1e-12)
+            prefix = f"{stream}_{comparison}"
+            setattr(
+                self,
+                f"{prefix}_comparison_count",
+                getattr(self, f"{prefix}_comparison_count") + 1,
+            )
+            setattr(
+                self,
+                f"{prefix}_advantage_sum",
+                getattr(self, f"{prefix}_advantage_sum") + relative_advantage,
+            )
+            setattr(
+                self,
+                f"{prefix}_advantage_max",
+                max(getattr(self, f"{prefix}_advantage_max"), abs(relative_advantage)),
+            )
+            if candidate < baseline:
+                setattr(
+                    self,
+                    f"{prefix}_win_count",
+                    getattr(self, f"{prefix}_win_count") + 1,
+                )
+            elif candidate > baseline:
+                setattr(
+                    self,
+                    f"{prefix}_loss_count",
+                    getattr(self, f"{prefix}_loss_count") + 1,
+                )
+            return relative_advantage
+
         stream_records = (
             (
                 "audio",
                 evidence.audio,
                 None if decision is None else decision.audio_correction_telemetry,
+                None if decision is None else decision.audio_subspace_telemetry,
             ),
             (
                 "video",
                 evidence.video,
                 None if decision is None else decision.video_correction_telemetry,
+                None if decision is None else decision.video_subspace_telemetry,
             ),
         )
-        for _, stream_evidence, correction in stream_records:
+        for _, stream_evidence, correction, subspace in stream_records:
             values = (
                 stream_evidence.forecast_ratio,
                 stream_evidence.curvature_ratio,
@@ -1071,6 +1299,19 @@ class ModelAwareController:
                 stream_evidence.generic_corrected_head_ratio,
                 stream_evidence.diagonal_candidate_head_ratio,
                 stream_evidence.model_candidate_head_ratio,
+                stream_evidence.generic_2d_ratio,
+                stream_evidence.exact_2d_ratio,
+                stream_evidence.applied_2d_ratio,
+                stream_evidence.generic_2d_head_ratio,
+                stream_evidence.exact_2d_head_ratio,
+                stream_evidence.applied_2d_head_ratio,
+                *stream_evidence.generic_2d_coefficients,
+                *stream_evidence.exact_2d_coefficients,
+                stream_evidence.generic_2d_condition,
+                stream_evidence.exact_2d_condition,
+                stream_evidence.subspace_regularization,
+                *stream_evidence.direction_gram,
+                *stream_evidence.application_direction_gram,
             )
             if not all(math.isfinite(float(value)) for value in values):
                 raise ValueError("per-stream model-aware evidence is nonfinite")
@@ -1091,6 +1332,30 @@ class ModelAwareController:
                 )
             ):
                 raise ValueError("model-aware correction telemetry is nonfinite")
+            if subspace is not None and not all(
+                math.isfinite(value)
+                for value in (
+                    *subspace.raw_generic_coefficients,
+                    *subspace.raw_exact_coefficients,
+                    *subspace.generic_coefficients,
+                    *subspace.exact_coefficients,
+                    *subspace.applied_coefficients,
+                    subspace.generic_condition,
+                    subspace.exact_condition,
+                    subspace.regularization,
+                    subspace.generic_raw_norm_ratio,
+                    subspace.exact_raw_norm_ratio,
+                    subspace.applied_raw_norm_ratio,
+                    subspace.generic_bound_scale,
+                    subspace.exact_bound_scale,
+                    subspace.applied_bound_scale,
+                    subspace.generic_bounded_norm_ratio,
+                    subspace.exact_bounded_norm_ratio,
+                    subspace.applied_bounded_norm_ratio,
+                    subspace.model_trust,
+                )
+            ):
+                raise ValueError("model-aware subspace correction telemetry is nonfinite")
         alpha = 0.5 if self.anchor_count < 2 else 0.3
         self.forecast_ratio_ewma = (1.0 - alpha) * self.forecast_ratio_ewma + alpha * _clamp(
             evidence.forecast_ratio, 0.0, 8.0
@@ -1113,7 +1378,7 @@ class ModelAwareController:
             self.model_corrected_ratio_sum += evidence.model_corrected_ratio
             self.generic_corrected_ratio_sum += evidence.generic_corrected_ratio
             self.ablation_count += 1
-        for stream, stream_evidence, correction in stream_records:
+        for stream, stream_evidence, correction, subspace in stream_records:
             forecast_ratio = float(stream_evidence.forecast_ratio)
             model_ratio = float(stream_evidence.model_corrected_ratio)
             generic_ratio = float(stream_evidence.generic_corrected_ratio)
@@ -1164,9 +1429,86 @@ class ModelAwareController:
                     stream_evidence.diagonal_candidate_head_ratio,
                 ),
                 ("model_candidate_head_ratio_sum", stream_evidence.model_candidate_head_ratio),
+                ("generic_2d_ratio_sum", stream_evidence.generic_2d_ratio),
+                ("exact_2d_ratio_sum", stream_evidence.exact_2d_ratio),
+                ("applied_2d_ratio_sum", stream_evidence.applied_2d_ratio),
+                ("generic_2d_head_ratio_sum", stream_evidence.generic_2d_head_ratio),
+                ("exact_2d_head_ratio_sum", stream_evidence.exact_2d_head_ratio),
+                ("applied_2d_head_ratio_sum", stream_evidence.applied_2d_head_ratio),
             ):
                 name = f"{stream}_{suffix}"
                 setattr(self, name, getattr(self, name) + float(value))
+            subspace_eligible = bool(
+                stream_evidence.generic_2d_eligible
+                and stream_evidence.exact_2d_eligible
+            )
+            if subspace_eligible:
+                count_name = f"{stream}_subspace_evidence_count"
+                prior_count = getattr(self, count_name)
+                coefficient_alpha = 0.5 if prior_count < 2 else 0.3
+                for prefix, coefficients in (
+                    ("generic_2d", stream_evidence.generic_2d_coefficients),
+                    ("exact_2d", stream_evidence.exact_2d_coefficients),
+                ):
+                    for index, value in enumerate(coefficients):
+                        name = f"{stream}_{prefix}_g{index}_ewma"
+                        setattr(
+                            self,
+                            name,
+                            (1.0 - coefficient_alpha) * getattr(self, name)
+                            + coefficient_alpha * _soft_limit(float(value), 2.0),
+                        )
+                g00, g01, g11 = stream_evidence.application_direction_gram
+                normalized_g01 = float(g01) / max(float(g00), 1e-12)
+                normalized_g11 = float(g11) / max(float(g00), 1e-12)
+                for suffix, value in (
+                    ("direction_g01_ewma", normalized_g01),
+                    ("direction_g11_ewma", normalized_g11),
+                ):
+                    name = f"{stream}_{suffix}"
+                    if prior_count == 0:
+                        setattr(self, name, float(value))
+                    else:
+                        setattr(
+                            self,
+                            name,
+                            (1.0 - coefficient_alpha) * getattr(self, name)
+                            + coefficient_alpha * float(value),
+                        )
+                setattr(self, count_name, prior_count + 1)
+            else:
+                name = f"{stream}_subspace_fallback_count"
+                setattr(self, name, getattr(self, name) + 1)
+                if (
+                    stream_evidence.generic_2d_condition > 0.0
+                    or stream_evidence.exact_2d_condition > 0.0
+                ):
+                    name = f"{stream}_subspace_condition_fallback_count"
+                    setattr(self, name, getattr(self, name) + 1)
+            setattr(
+                self,
+                f"{stream}_generic_2d_condition_max",
+                max(
+                    getattr(self, f"{stream}_generic_2d_condition_max"),
+                    float(stream_evidence.generic_2d_condition),
+                ),
+            )
+            setattr(
+                self,
+                f"{stream}_exact_2d_condition_max",
+                max(
+                    getattr(self, f"{stream}_exact_2d_condition_max"),
+                    float(stream_evidence.exact_2d_condition),
+                ),
+            )
+            setattr(
+                self,
+                f"{stream}_subspace_regularization_max",
+                max(
+                    getattr(self, f"{stream}_subspace_regularization_max"),
+                    float(stream_evidence.subspace_regularization),
+                ),
+            )
             if correction is not None:
                 if correction.diagonal_bound_active:
                     setattr(
@@ -1261,6 +1603,41 @@ class ModelAwareController:
                     elif candidate_ratio > baseline_ratio:
                         loss_name = f"{stream}_model_candidate_loss_count"
                         setattr(self, loss_name, getattr(self, loss_name) + 1)
+            if subspace is not None and subspace.eligible and subspace_eligible:
+                record_subspace_comparison(
+                    stream,
+                    "generic_2d_vs_scalar",
+                    float(stream_evidence.generic_corrected_ratio),
+                    float(stream_evidence.generic_2d_ratio),
+                )
+                record_subspace_comparison(
+                    stream,
+                    "exact_2d_vs_exact_scalar",
+                    float(stream_evidence.model_candidate_head_ratio),
+                    float(stream_evidence.exact_2d_head_ratio),
+                )
+                relative_advantage = record_subspace_comparison(
+                    stream,
+                    "exact_2d_vs_generic_2d",
+                    float(stream_evidence.generic_2d_head_ratio),
+                    float(stream_evidence.exact_2d_head_ratio),
+                )
+                record_subspace_comparison(
+                    stream,
+                    "exact_2d_vs_generic_scalar",
+                    float(stream_evidence.generic_corrected_head_ratio),
+                    float(stream_evidence.exact_2d_head_ratio),
+                )
+                if relative_advantage is not None:
+                    target_trust = _clamp(
+                        0.5 + 2.0 * _clamp(relative_advantage, -0.25, 0.25)
+                    )
+                    trust_name = f"{stream}_subspace_model_trust"
+                    setattr(
+                        self,
+                        trust_name,
+                        0.65 * getattr(self, trust_name) + 0.35 * target_trust,
+                    )
         self.stream_evidence_count += 1
         self.anchor_count += 1
 
@@ -1330,6 +1707,126 @@ class ModelAwareController:
             model_bound_active=abs(raw_model) >= _CORRECTION_GAIN_LIMIT,
         )
 
+    def _subspace_telemetry(
+        self,
+        stream: str,
+        scale: float,
+        scalar: CorrectionGainTelemetry,
+    ) -> SubspaceCorrectionTelemetry:
+        evidence_count = int(getattr(self, f"{stream}_subspace_evidence_count"))
+        trust = _clamp(getattr(self, f"{stream}_subspace_model_trust"))
+        if evidence_count == 0:
+            generic_scale = (
+                scalar.generic_gain / scalar.raw_generic_gain
+                if abs(scalar.raw_generic_gain) > 1e-12
+                else 1.0
+            )
+            exact_scale = (
+                scalar.model_candidate_gain / scalar.raw_model_gain
+                if abs(scalar.raw_model_gain) > 1e-12
+                else 1.0
+            )
+            return SubspaceCorrectionTelemetry(
+                raw_generic_coefficients=(scalar.raw_generic_gain, 0.0),
+                raw_exact_coefficients=(scalar.raw_model_gain, 0.0),
+                generic_coefficients=(scalar.generic_gain, 0.0),
+                exact_coefficients=(scalar.model_candidate_gain, 0.0),
+                applied_coefficients=(scalar.model_gain, 0.0),
+                generic_raw_norm_ratio=abs(scalar.raw_generic_gain),
+                exact_raw_norm_ratio=abs(scalar.raw_model_gain),
+                applied_raw_norm_ratio=abs(scalar.model_gain),
+                generic_bound_scale=generic_scale,
+                exact_bound_scale=exact_scale,
+                applied_bound_scale=1.0,
+                generic_bounded_norm_ratio=abs(scalar.generic_gain),
+                exact_bounded_norm_ratio=abs(scalar.model_candidate_gain),
+                applied_bounded_norm_ratio=abs(scalar.model_gain),
+                generic_bound_active=scalar.generic_bound_active,
+                exact_bound_active=scalar.model_bound_active,
+                applied_bound_active=False,
+                model_trust=trust,
+            )
+
+        direction_gram = (
+            1.0,
+            float(getattr(self, f"{stream}_direction_g01_ewma")),
+            max(0.0, float(getattr(self, f"{stream}_direction_g11_ewma"))),
+        )
+        raw_generic = (
+            float(getattr(self, f"{stream}_generic_2d_g0_ewma")) * float(scale),
+            float(getattr(self, f"{stream}_generic_2d_g1_ewma")) * float(scale),
+        )
+        raw_exact = (
+            float(getattr(self, f"{stream}_exact_2d_g0_ewma")) * float(scale),
+            float(getattr(self, f"{stream}_exact_2d_g1_ewma")) * float(scale),
+        )
+        (
+            generic,
+            generic_raw_ratio,
+            generic_scale,
+            generic_ratio,
+            generic_active,
+        ) = radially_bound_coefficients(raw_generic, direction_gram)
+        (
+            exact,
+            exact_raw_ratio,
+            exact_scale,
+            exact_ratio,
+            exact_active,
+        ) = radially_bound_coefficients(raw_exact, direction_gram)
+        interpolated = tuple(
+            generic[index] + trust * (exact[index] - generic[index])
+            for index in range(2)
+        )
+        (
+            radially_bounded_applied,
+            applied_raw_ratio,
+            radial_scale,
+            radial_ratio,
+            radial_active,
+        ) = radially_bound_coefficients(interpolated, direction_gram)
+        if not radial_active:
+            applied = interpolated
+            applied_scale = 1.0
+            applied_ratio = applied_raw_ratio
+        else:
+            applied = radially_bounded_applied
+            applied_scale = radial_scale
+            applied_ratio = radial_ratio
+        return SubspaceCorrectionTelemetry(
+            eligible=True,
+            used_scalar_fallback=False,
+            generic_condition=float(
+                getattr(self, f"{stream}_generic_2d_condition_max")
+            ),
+            exact_condition=float(
+                getattr(self, f"{stream}_exact_2d_condition_max")
+            ),
+            generic_rank=2,
+            exact_rank=2,
+            regularization=float(
+                getattr(self, f"{stream}_subspace_regularization_max")
+            ),
+            raw_generic_coefficients=raw_generic,
+            raw_exact_coefficients=raw_exact,
+            generic_coefficients=(float(generic[0]), float(generic[1])),
+            exact_coefficients=(float(exact[0]), float(exact[1])),
+            applied_coefficients=(float(applied[0]), float(applied[1])),
+            generic_raw_norm_ratio=generic_raw_ratio,
+            exact_raw_norm_ratio=exact_raw_ratio,
+            applied_raw_norm_ratio=applied_raw_ratio,
+            generic_bound_scale=generic_scale,
+            exact_bound_scale=exact_scale,
+            applied_bound_scale=applied_scale,
+            generic_bounded_norm_ratio=generic_ratio,
+            exact_bounded_norm_ratio=exact_ratio,
+            applied_bounded_norm_ratio=applied_ratio,
+            generic_bound_active=generic_active,
+            exact_bound_active=exact_active,
+            applied_bound_active=radial_active,
+            model_trust=trust,
+        )
+
     def decision(
         self,
         *,
@@ -1359,6 +1856,8 @@ class ModelAwareController:
 
         audio_correction = CorrectionGainTelemetry()
         video_correction = CorrectionGainTelemetry()
+        audio_subspace = SubspaceCorrectionTelemetry()
+        video_subspace = SubspaceCorrectionTelemetry()
         if self.mode == "full" and self.anchor_count > 0 and self.profile is not None:
             horizon_scale = min(1.5, max(0.5, float(forecast_horizon)))
             scale = confidence * horizon_scale
@@ -1376,6 +1875,12 @@ class ModelAwareController:
                 scale,
                 self.video_model_trust,
             )
+            audio_subspace = self._subspace_telemetry(
+                "audio", scale, audio_correction
+            )
+            video_subspace = self._subspace_telemetry(
+                "video", scale, video_correction
+            )
         return ModelAwareForecastDecision(
             trajectory_risk=trajectory,
             model_risk=model_risk,
@@ -1392,6 +1897,8 @@ class ModelAwareController:
             force_actual=combined >= self.risk_threshold,
             audio_correction_telemetry=audio_correction,
             video_correction_telemetry=video_correction,
+            audio_subspace_telemetry=audio_subspace,
+            video_subspace_telemetry=video_subspace,
         )
 
     def generic_correction_gains(
@@ -1426,6 +1933,12 @@ class ModelAwareController:
             "generic_corrected_head_ratio",
             "diagonal_candidate_head_ratio",
             "model_candidate_head_ratio",
+            "generic_2d_ratio",
+            "exact_2d_ratio",
+            "applied_2d_ratio",
+            "generic_2d_head_ratio",
+            "exact_2d_head_ratio",
+            "applied_2d_head_ratio",
             "gain_delta_pre_abs",
             "gain_delta_post_abs",
             "gain_delta_applied_abs",
@@ -1439,6 +1952,23 @@ class ModelAwareController:
             / self.stream_evidence_count
         )
 
+    def subspace_advantage_mean(self, stream: str, comparison: str) -> float:
+        if stream not in {"audio", "video"}:
+            raise ValueError("stream must be 'audio' or 'video'")
+        if comparison not in {
+            "generic_2d_vs_scalar",
+            "exact_2d_vs_exact_scalar",
+            "exact_2d_vs_generic_2d",
+            "exact_2d_vs_generic_scalar",
+        }:
+            raise ValueError("unknown subspace comparison")
+        count = getattr(self, f"{stream}_{comparison}_comparison_count")
+        return (
+            getattr(self, f"{stream}_{comparison}_advantage_sum") / count
+            if count
+            else 0.0
+        )
+
 
 __all__ = [
     "AnchorEvidence",
@@ -1449,6 +1979,8 @@ __all__ = [
     "ModelForecastabilityProfile",
     "ProfileLookup",
     "StreamAnchorEvidence",
+    "SubspaceCorrectionTelemetry",
     "clear_model_profile_cache",
     "get_model_forecastability_profile",
+    "radially_bound_coefficients",
 ]

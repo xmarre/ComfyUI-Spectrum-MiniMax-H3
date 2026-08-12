@@ -146,6 +146,9 @@ class RuntimeStats:
     model_aware_evidence_reduction_seconds: float = 0.0
     model_aware_evidence_exact_head_projection_seconds: float = 0.0
     model_aware_evidence_fit_condition_seconds: float = 0.0
+    model_aware_subspace_gram_seconds: float = 0.0
+    model_aware_subspace_solve_seconds: float = 0.0
+    model_aware_subspace_workspace_bytes: int = 0
     model_aware_head_materialization_seconds: float = 0.0
     model_aware_head_materialized_bytes: int = 0
     model_aware_exact_head_projection_seconds: float = 0.0
@@ -523,10 +526,22 @@ class SpectrumH3Runtime:
         for name, start, end in self._stream_ranges(call):
             if name == "audio":
                 blend = decision.audio_blend_weight
-                correction = decision.audio_correction_gain
+                subspace = decision.audio_subspace_telemetry
+                correction = (
+                    0.0 if subspace.eligible else decision.audio_correction_gain
+                )
+                coefficients = (
+                    subspace.applied_coefficients if subspace.eligible else ()
+                )
             elif name == "video":
                 blend = decision.video_blend_weight
-                correction = decision.video_correction_gain
+                subspace = decision.video_subspace_telemetry
+                correction = (
+                    0.0 if subspace.eligible else decision.video_correction_gain
+                )
+                coefficients = (
+                    subspace.applied_coefficients if subspace.eligible else ()
+                )
             else:
                 if not math.isclose(
                     decision.audio_blend_weight,
@@ -538,23 +553,42 @@ class SpectrumH3Runtime:
                         "model-aware packed prediction requires target audio/video row metadata"
                     )
                 blend = decision.video_blend_weight
-                correction = max(
-                    -0.25,
-                    min(
-                        0.25,
+                if (
+                    decision.audio_subspace_telemetry.eligible
+                    and decision.video_subspace_telemetry.eligible
+                ):
+                    correction = 0.0
+                    coefficients = tuple(
                         0.5
                         * (
-                            decision.audio_correction_gain
-                            + decision.video_correction_gain
+                            decision.audio_subspace_telemetry.applied_coefficients[index]
+                            + decision.video_subspace_telemetry.applied_coefficients[index]
+                        )
+                        for index in range(2)
+                    )
+                else:
+                    correction = max(
+                        -0.25,
+                        min(
+                            0.25,
+                            0.5
+                            * (
+                                decision.audio_correction_gain
+                                + decision.video_correction_gain
+                            ),
                         ),
-                    ),
-                )
+                    )
+                    coefficients = ()
             weights = self.forecaster.model_aware_weights(
                 coordinate,
                 blend,
                 degree=decision.degree,
                 ridge_lambda=decision.ridge_lambda,
                 correction_gain=correction,
+                correction_coefficients=coefficients,
+                correction_anchor_ids=(
+                    decision.correction_anchor_ids if coefficients else ()
+                ),
             )
             weighted.append((start, end, weights))
         fit_elapsed = self.forecaster.model_aware_fit_seconds - fit_before
@@ -896,6 +930,15 @@ class SpectrumH3Runtime:
                     configured_audio_blend=self.config.audio_blend_weight,
                     configured_video_blend=self.config.blend_weight,
                 )
+                if (
+                    model_aware_decision.audio_subspace_telemetry.eligible
+                    or model_aware_decision.video_subspace_telemetry.eligible
+                ):
+                    anchor_ids = self.forecaster.latest_anchor_ids(3)
+                    model_aware_decision = replace(
+                        model_aware_decision,
+                        correction_anchor_ids=anchor_ids,
+                    )
                 self.stats.model_aware_risk_max = max(
                     self.stats.model_aware_risk_max,
                     model_aware_decision.combined_risk,
@@ -908,6 +951,8 @@ class SpectrumH3Runtime:
                     self.stats.model_aware_correction_max,
                     abs(model_aware_decision.audio_correction_gain),
                     abs(model_aware_decision.video_correction_gain),
+                    model_aware_decision.audio_subspace_telemetry.applied_bounded_norm_ratio,
+                    model_aware_decision.video_subspace_telemetry.applied_bounded_norm_ratio,
                 )
                 if model_aware_decision.force_actual:
                     actual = True
@@ -1483,6 +1528,7 @@ class SpectrumH3Runtime:
                     model_candidate_gain = (
                         decision.audio_correction_telemetry.model_candidate_gain
                     )
+                    subspace = decision.audio_subspace_telemetry
                 elif name == "video":
                     blend = decision.video_blend_weight
                     model_gain = decision.video_correction_gain
@@ -1493,6 +1539,7 @@ class SpectrumH3Runtime:
                     model_candidate_gain = (
                         decision.video_correction_telemetry.model_candidate_gain
                     )
+                    subspace = decision.video_subspace_telemetry
                 else:
                     if not math.isclose(
                         decision.audio_blend_weight,
@@ -1516,6 +1563,36 @@ class SpectrumH3Runtime:
                         decision.audio_correction_telemetry.model_candidate_gain
                         + decision.video_correction_telemetry.model_candidate_gain
                     )
+                    audio_subspace = decision.audio_subspace_telemetry
+                    video_subspace = decision.video_subspace_telemetry
+                    subspace = replace(
+                        audio_subspace,
+                        eligible=audio_subspace.eligible and video_subspace.eligible,
+                        generic_coefficients=tuple(
+                            0.5
+                            * (
+                                audio_subspace.generic_coefficients[index]
+                                + video_subspace.generic_coefficients[index]
+                            )
+                            for index in range(2)
+                        ),
+                        exact_coefficients=tuple(
+                            0.5
+                            * (
+                                audio_subspace.exact_coefficients[index]
+                                + video_subspace.exact_coefficients[index]
+                            )
+                            for index in range(2)
+                        ),
+                        applied_coefficients=tuple(
+                            0.5
+                            * (
+                                audio_subspace.applied_coefficients[index]
+                                + video_subspace.applied_coefficients[index]
+                            )
+                            for index in range(2)
+                        ),
+                    )
                 parameters.append(
                     (
                         name,
@@ -1526,6 +1603,9 @@ class SpectrumH3Runtime:
                         generic_gain,
                         diagonal_candidate_gain,
                         model_candidate_gain,
+                        subspace.generic_coefficients,
+                        subspace.exact_coefficients,
+                        subspace.applied_coefficients,
                     )
                 )
             evidence = self.forecaster.sampled_anchor_evidence(
@@ -1570,6 +1650,16 @@ class SpectrumH3Runtime:
                 self.stats.model_aware_evidence_fit_condition_seconds += (
                     evidence.timing.fit_condition_seconds
                 )
+                self.stats.model_aware_subspace_gram_seconds += (
+                    evidence.timing.subspace_gram_seconds
+                )
+                self.stats.model_aware_subspace_solve_seconds += (
+                    evidence.timing.subspace_solve_seconds
+                )
+                self.stats.model_aware_subspace_workspace_bytes = max(
+                    self.stats.model_aware_subspace_workspace_bytes,
+                    evidence.subspace_workspace_bytes,
+                )
                 self.stats.model_aware_model_corrected_ratio_mean = (
                     self.model_aware.model_corrected_ratio_mean
                 )
@@ -1579,6 +1669,8 @@ class SpectrumH3Runtime:
                 if self.config.debug:
                     audio_gain = decision.audio_correction_telemetry
                     video_gain = decision.video_correction_telemetry
+                    audio_subspace = decision.audio_subspace_telemetry
+                    video_subspace = decision.video_subspace_telemetry
                     LOG.warning(
                         "Spectrum H3 model-aware anchor step=%s "
                         "forecast_ratio_audio=%.6f forecast_ratio_video=%.6f "
@@ -1688,11 +1780,104 @@ class SpectrumH3Runtime:
                         video_gain.applied_delta,
                     )
                     LOG.warning(
+                        "Spectrum H3 model-aware K=2 step=%s "
+                        "audio_eligible=%s audio_fallback=%s "
+                        "audio_solve_generic=(%.6f,%.6f) audio_solve_exact=(%.6f,%.6f) "
+                        "audio_condition_generic=%.6f audio_condition_exact=%.6f "
+                        "audio_rank_generic=%s audio_rank_exact=%s "
+                        "audio_raw_generic=(%.6f,%.6f) audio_raw_exact=(%.6f,%.6f) "
+                        "audio_generic=(%.6f,%.6f) audio_exact=(%.6f,%.6f) "
+                        "audio_applied=(%.6f,%.6f) "
+                        "audio_raw_norm_generic=%.6f audio_raw_norm_exact=%.6f "
+                        "audio_bound_scale_generic=%.6f audio_bound_scale_exact=%.6f "
+                        "audio_bound_norm_generic=%.6f audio_bound_norm_exact=%.6f "
+                        "audio_radial_bound_generic=%s audio_radial_bound_exact=%s "
+                        "audio_generic_2d_ratio=%.6f audio_exact_2d_ratio=%.6f "
+                        "audio_applied_2d_ratio=%.6f audio_generic_2d_head_ratio=%.6f "
+                        "audio_exact_2d_head_ratio=%.6f audio_applied_2d_head_ratio=%.6f "
+                        "audio_exact_2d_trust=%.6f audio_exact_2d_trust_next=%.6f "
+                        "video_eligible=%s video_fallback=%s "
+                        "video_solve_generic=(%.6f,%.6f) video_solve_exact=(%.6f,%.6f) "
+                        "video_condition_generic=%.6f video_condition_exact=%.6f "
+                        "video_rank_generic=%s video_rank_exact=%s "
+                        "video_raw_generic=(%.6f,%.6f) video_raw_exact=(%.6f,%.6f) "
+                        "video_generic=(%.6f,%.6f) video_exact=(%.6f,%.6f) "
+                        "video_applied=(%.6f,%.6f) "
+                        "video_raw_norm_generic=%.6f video_raw_norm_exact=%.6f "
+                        "video_bound_scale_generic=%.6f video_bound_scale_exact=%.6f "
+                        "video_bound_norm_generic=%.6f video_bound_norm_exact=%.6f "
+                        "video_radial_bound_generic=%s video_radial_bound_exact=%s "
+                        "video_generic_2d_ratio=%.6f video_exact_2d_ratio=%.6f "
+                        "video_applied_2d_ratio=%.6f video_generic_2d_head_ratio=%.6f "
+                        "video_exact_2d_head_ratio=%.6f video_applied_2d_head_ratio=%.6f "
+                        "video_exact_2d_trust=%.6f video_exact_2d_trust_next=%.6f",
+                        step.step_id,
+                        audio_subspace.eligible,
+                        not evidence.audio.generic_2d_eligible or not evidence.audio.exact_2d_eligible,
+                        *evidence.audio.generic_2d_coefficients,
+                        *evidence.audio.exact_2d_coefficients,
+                        evidence.audio.generic_2d_condition,
+                        evidence.audio.exact_2d_condition,
+                        evidence.audio.generic_2d_rank,
+                        evidence.audio.exact_2d_rank,
+                        *audio_subspace.raw_generic_coefficients,
+                        *audio_subspace.raw_exact_coefficients,
+                        *audio_subspace.generic_coefficients,
+                        *audio_subspace.exact_coefficients,
+                        *audio_subspace.applied_coefficients,
+                        audio_subspace.generic_raw_norm_ratio,
+                        audio_subspace.exact_raw_norm_ratio,
+                        audio_subspace.generic_bound_scale,
+                        audio_subspace.exact_bound_scale,
+                        audio_subspace.generic_bounded_norm_ratio,
+                        audio_subspace.exact_bounded_norm_ratio,
+                        audio_subspace.generic_bound_active,
+                        audio_subspace.exact_bound_active,
+                        evidence.audio.generic_2d_ratio,
+                        evidence.audio.exact_2d_ratio,
+                        evidence.audio.applied_2d_ratio,
+                        evidence.audio.generic_2d_head_ratio,
+                        evidence.audio.exact_2d_head_ratio,
+                        evidence.audio.applied_2d_head_ratio,
+                        audio_subspace.model_trust,
+                        self.model_aware.audio_subspace_model_trust,
+                        video_subspace.eligible,
+                        not evidence.video.generic_2d_eligible or not evidence.video.exact_2d_eligible,
+                        *evidence.video.generic_2d_coefficients,
+                        *evidence.video.exact_2d_coefficients,
+                        evidence.video.generic_2d_condition,
+                        evidence.video.exact_2d_condition,
+                        evidence.video.generic_2d_rank,
+                        evidence.video.exact_2d_rank,
+                        *video_subspace.raw_generic_coefficients,
+                        *video_subspace.raw_exact_coefficients,
+                        *video_subspace.generic_coefficients,
+                        *video_subspace.exact_coefficients,
+                        *video_subspace.applied_coefficients,
+                        video_subspace.generic_raw_norm_ratio,
+                        video_subspace.exact_raw_norm_ratio,
+                        video_subspace.generic_bound_scale,
+                        video_subspace.exact_bound_scale,
+                        video_subspace.generic_bounded_norm_ratio,
+                        video_subspace.exact_bounded_norm_ratio,
+                        video_subspace.generic_bound_active,
+                        video_subspace.exact_bound_active,
+                        evidence.video.generic_2d_ratio,
+                        evidence.video.exact_2d_ratio,
+                        evidence.video.applied_2d_ratio,
+                        evidence.video.generic_2d_head_ratio,
+                        evidence.video.exact_2d_head_ratio,
+                        evidence.video.applied_2d_head_ratio,
+                        video_subspace.model_trust,
+                        self.model_aware.video_subspace_model_trust,
+                    )
+                    LOG.warning(
                         "Spectrum H3 model-aware evidence timing step=%s "
                         "evidence_weight_fit_s=%.6f evidence_sample_index_s=%.6f "
                         "evidence_device_transfer_s=%.6f evidence_scalar_transfer_s=%.6f "
                         "evidence_reduction_s=%.6f evidence_exact_head_projection_s=%.6f "
-                        "evidence_fit_condition_s=%.6f",
+                        "evidence_fit_condition_s=%.6f subspace_gram_s=%.6f "
+                        "subspace_solve_s=%.6f",
                         step.step_id,
                         evidence.timing.weight_fit_seconds,
                         evidence.timing.sample_index_seconds,
@@ -1701,6 +1886,8 @@ class SpectrumH3Runtime:
                         evidence.timing.reduction_seconds,
                         evidence.timing.exact_head_projection_seconds,
                         evidence.timing.fit_condition_seconds,
+                        evidence.timing.subspace_gram_seconds,
+                        evidence.timing.subspace_solve_seconds,
                     )
         except torch.cuda.OutOfMemoryError:
             raise
@@ -1880,6 +2067,7 @@ class SpectrumH3Runtime:
                     self.forecaster.update(
                         step.coordinate,
                         combined,
+                        anchor_id=step.step_id,
                         take_ownership=True,
                         evidence_segments=(
                             self._stream_ranges(step.calls[0])
@@ -2023,6 +2211,8 @@ class SpectrumH3Runtime:
             "model_aware_evidence_reduction_seconds",
             "model_aware_evidence_exact_head_projection_seconds",
             "model_aware_evidence_fit_condition_seconds",
+            "model_aware_subspace_gram_seconds",
+            "model_aware_subspace_solve_seconds",
             "model_aware_head_materialization_seconds",
             "model_aware_exact_head_projection_seconds",
             "model_aware_fit_seconds",
@@ -2081,6 +2271,10 @@ class SpectrumH3Runtime:
         restored.model_aware_exact_head_workspace_bytes = max(
             restored.model_aware_exact_head_workspace_bytes,
             current.model_aware_exact_head_workspace_bytes,
+        )
+        restored.model_aware_subspace_workspace_bytes = max(
+            restored.model_aware_subspace_workspace_bytes,
+            current.model_aware_subspace_workspace_bytes,
         )
 
         self._run.next_step_id = snapshot.next_step_id
@@ -2192,6 +2386,48 @@ class SpectrumH3Runtime:
             and controller.profile.audio_head_gram_diagonal is not None
             and controller.profile.video_head_gram_diagonal is not None
         )
+        subspace_parts = []
+        for stream in ("audio", "video"):
+            for metric in (
+                "generic_2d_ratio",
+                "exact_2d_ratio",
+                "applied_2d_ratio",
+                "generic_2d_head_ratio",
+                "exact_2d_head_ratio",
+                "applied_2d_head_ratio",
+            ):
+                subspace_parts.append(
+                    f"model_aware_{stream}_{metric}_mean="
+                    f"{controller.stream_mean(stream, metric):.6f}"
+                )
+            subspace_parts.extend(
+                (
+                    f"model_aware_{stream}_2d_eligible={getattr(controller, f'{stream}_subspace_evidence_count')}",
+                    f"model_aware_{stream}_2d_fallbacks={getattr(controller, f'{stream}_subspace_fallback_count')}",
+                    f"model_aware_{stream}_2d_condition_fallbacks={getattr(controller, f'{stream}_subspace_condition_fallback_count')}",
+                    f"model_aware_{stream}_2d_generic_condition_max={getattr(controller, f'{stream}_generic_2d_condition_max'):.6f}",
+                    f"model_aware_{stream}_2d_exact_condition_max={getattr(controller, f'{stream}_exact_2d_condition_max'):.6f}",
+                    f"model_aware_{stream}_2d_regularization_max={getattr(controller, f'{stream}_subspace_regularization_max'):.6f}",
+                    f"model_aware_{stream}_exact_2d_trust={getattr(controller, f'{stream}_subspace_model_trust'):.6f}",
+                )
+            )
+            for comparison in (
+                "generic_2d_vs_scalar",
+                "exact_2d_vs_exact_scalar",
+                "exact_2d_vs_generic_2d",
+                "exact_2d_vs_generic_scalar",
+            ):
+                prefix = f"{stream}_{comparison}"
+                subspace_parts.extend(
+                    (
+                        f"model_aware_{prefix}_comparisons={getattr(controller, f'{prefix}_comparison_count')}",
+                        f"model_aware_{prefix}_wins={getattr(controller, f'{prefix}_win_count')}",
+                        f"model_aware_{prefix}_losses={getattr(controller, f'{prefix}_loss_count')}",
+                        f"model_aware_{prefix}_advantage_mean={controller.subspace_advantage_mean(stream, comparison):.6f}",
+                        f"model_aware_{prefix}_advantage_abs_max={getattr(controller, f'{prefix}_advantage_max'):.6f}",
+                    )
+                )
+        subspace_summary = " ".join(subspace_parts)
         return (
             f"run_id={self.stats.run_id} sampler={self.stats.sampler_name} "
             f"steps={self.stats.total_steps} actual_steps={self.stats.actual_steps} "
@@ -2288,6 +2524,9 @@ class SpectrumH3Runtime:
             f"model_aware_evidence_reduction_s={self.stats.model_aware_evidence_reduction_seconds:.6f} "
             f"model_aware_evidence_exact_head_projection_s={self.stats.model_aware_evidence_exact_head_projection_seconds:.6f} "
             f"model_aware_evidence_fit_condition_s={self.stats.model_aware_evidence_fit_condition_seconds:.6f} "
+            f"model_aware_subspace_gram_s={self.stats.model_aware_subspace_gram_seconds:.6f} "
+            f"model_aware_subspace_solve_s={self.stats.model_aware_subspace_solve_seconds:.6f} "
+            f"model_aware_subspace_workspace_bytes={self.stats.model_aware_subspace_workspace_bytes} "
             f"model_aware_head_materialization_s={self.stats.model_aware_head_materialization_seconds:.6f} "
             f"model_aware_head_materialized_bytes={self.stats.model_aware_head_materialized_bytes} "
             f"model_aware_exact_head_projection_s={self.stats.model_aware_exact_head_projection_seconds:.6f} "
@@ -2301,10 +2540,14 @@ class SpectrumH3Runtime:
             f"model_aware_scheduler_forecast_aggregate=max(audio,video) "
             f"model_aware_scheduler_curvature_aggregate=max(audio,video) "
             f"model_aware_correction_metric=final_layer_exact_linear_head_space "
+            f"model_aware_correction_subspace=two_causal_actual_deltas "
+            f"model_aware_subspace_model_comparison=exact_2d_vs_generic_2d_head_rms "
             f"model_aware_diagonal_ablation_metric=final_layer_gram_diagonal "
             f"model_aware_model_comparison_metric=exact_linear_head_space_rms "
             f"model_aware_head_metric_available={head_metric_available} "
             f"model_aware_correction_bound=rational_softsign_0.25 "
+            f"model_aware_subspace_bound=radial_rational_softsign_0.25 "
+            f"{subspace_summary} "
             f"model_aware_forecast_ratio_ewma={controller.forecast_ratio_ewma:.6f} "
             f"model_aware_curvature_ratio_ewma={controller.curvature_ratio_ewma:.6f} "
             f"model_aware_audio_forecast_ratio_mean={audio_forecast_mean:.6f} "

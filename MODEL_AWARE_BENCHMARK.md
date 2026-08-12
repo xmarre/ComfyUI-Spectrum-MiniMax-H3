@@ -31,9 +31,11 @@ Capture the debug summary plus:
 - sampled counterfactual forecast/hold error and curvature at every actual anchor, separately for audio and video;
 - the explicit aggregate rule and value consumed by the scheduler (`max(audio, video)` in this revision);
 - generic Euclidean, Gram-diagonal, and exact linear-head-space projections for each stream;
+- generic-Euclidean K=2 and exact-head K=2 coefficient vectors over the identical two-delta trajectory span, their 2x2 condition/rank/regularization state, scalar fallbacks, and radial-bound telemetry;
 - raw and smoothly bounded generic/diagonal/exact gains, applied trust-mixed gain, bound-active flags, exact-versus-generic deltas, and exact-versus-diagonal deltas;
 - per-stream applied, pure generic, pure diagonal, and pure exact error ratios in ordinary feature RMS and exact linear-head RMS;
 - per-stream online exact-candidate trust, eligible comparison count, exact wins, and exact losses;
+- generic-2D versus generic-scalar, exact-2D versus exact-scalar, exact-2D versus generic-2D, and exact-2D versus generic-scalar counts, wins/losses, and mean/maximum relative advantages;
 - anchor-evidence timing split into temporal-weight fitting, sample/index selection, one-time head materialization, exact-head projection, scalar device transfer, reductions/error calculations, and fit-condition calculation;
 - retained generic-sample and exact-head evidence bytes, device-materialized head bytes, exact-row temporary workspace, and the separately configured full-history/archive memory;
 - causal correction time and offline-replay correction-weight construction time/application count as separate fields;
@@ -55,20 +57,28 @@ A clean paired 20-step base-H3 `schedule_confidence` / `full` run then held the 
 
 The current experiment therefore keeps generic and diagonal candidates independently auditable and makes the full linear output-head operator primary. It samples complete hidden rows and computes `<rW^T,dW^T>/<dW^T,dW^T>` without materializing `W^T W`. The result is exact for the linear head and remains explicitly incomplete for timestep RMSNorm/AdaLN.
 
-## Immediate base-H3 Feature 3 gate
+A subsequent mechanically stable `full -> schedule_confidence -> full` sequence retained the 20-step ER-SDE 11-actual/9-forecast schedule, step IDs, Feature-2 decisions, ridge/blend values, and zero extra NFEs. The two `full` runs reproduced their correction behavior. Mean ordinary RMS for audio was generic `1.566913`, diagonal `1.563894`, exact `1.563496`, and trust-mixed applied `1.565194`; video was generic `1.284368`, diagonal `1.286266`, exact `1.283642`, and applied `1.284004`. Exact-head scalar produced 8/0 wins/losses for both streams while the diagonal produced 8/0 for audio and 1/7 for video. Preserving cross-hidden-channel terms therefore fixed the diagonal's qualitative video failure, but exact scalar improved over generic scalar by only about 0.22% for audio and 0.06% for video, far below the 2% materiality threshold. The model information is consistent; the one-direction scalar correction cannot exploit enough of it to produce a material gain. Scalar metric iteration stops at this result.
 
-Use base H3 with no active LoRA for the next correction benchmark. Run `schedule_confidence` and `full` with the same seed and unchanged workflow. Require the same actual/forecast step IDs and total transformer NFE count; stop the comparison if the schedules differ. Do not change `model_aware_risk_threshold` or add refreshes for this gate.
+## K=2 correction-dimensionality experiment
+
+The next implementation keeps the exact static linear `FinalLayer` head metric and changes only correction dimensionality. For each stream it forms `d0=h[-1]-h[-2]` and `d1=h[-2]-h[-3]` from already-observed actual history. Generic K=2 solves `min ||r-g0*d0-g1*d1||^2`; exact K=2 solves the same span after projecting `r`, `d0`, and `d1` through the stream output head. Both use a regularized 2x2 Gram solve with rank/condition checks and scalar fallback. No feature-sized Gram, extra NFE, second model pass, RMSNorm/AdaLN weighting, or scheduler input is added.
+
+The two coefficient candidates are radially soft-bounded in the generic sampled evidence norm relative to `||d0||`, preserving the existing scalar-equivalent 0.25 total correction budget. A separate K=2 model trust is calibrated only from exact-K=2 versus generic-K=2 error in exact-head space; the existing exact-scalar trust and scalar applied ablation remain unchanged. The final correction interpolates between the matching-span K=2 vectors and remains inside the same radial budget. Causal anchor IDs and the bounded two-coefficient stencil are archived for offline replay, so replay applies the first-pass decision to the exact three actual anchors available at that time.
+
+## Immediate base-H3 K=2 gate
+
+Use base H3 with no active LoRA. Run the same saved workflow in the order `full`, `schedule_confidence`, `full`, changing only `model_aware_mode`. Keep the exact checkpoint, prompt, seed, sampler/scheduler, 20 steps, resolution, frame count, CFG, Spectrum controls, storage settings, risk threshold, and correction bound. Require identical actual/forecast step IDs, Feature-2 risk/confidence/ridge/blend decisions, and transformer NFE count; reject the comparison if any differ.
 
 For every eligible actual anchor and separately for audio/video, record:
 
-1. generic, diagonal, and exact raw gains; all smoothly bounded candidates; exact-versus-generic and exact-versus-diagonal post-bound deltas; trust; and final applied gain;
-2. pure generic, diagonal, exact, and applied counterfactual error in ordinary feature RMS and exact linear-head RMS;
-3. cumulative eligible exact-versus-generic comparisons, exact wins, and exact losses;
-4. exact trust before the applied forecast and ending trust after the observed anchor;
-5. total model-aware evidence time, one-time head materialization, exact-head projection time, scalar transfer, reductions, retained generic/exact evidence bytes, head device bytes, temporary workspace, and the `full - schedule_confidence` wall-clock delta;
-6. decoded video, audio, and synchronization comparison between paired C/D outputs.
+1. schedule-confidence raw ratios plus generic scalar, diagonal scalar, exact scalar, generic K=2, exact-head K=2, and final applied K=2 ratios in ordinary feature RMS and exact-head RMS where available;
+2. raw and bounded K=2 coefficient vectors, raw/bounded correction norm ratios, bound scale/activity, 2x2 condition/rank/regularization, eligibility, and scalar fallback counts;
+3. generic-K=2 versus generic-scalar, exact-K=2 versus exact-scalar, exact-K=2 versus generic-K=2, and exact-K=2 versus generic-scalar wins/losses and mean/maximum relative advantages;
+4. exact-K=2 trust before each applied forecast and ending trust;
+5. K=2 Gram/reduction and solve time, total evidence time, head materialization/projection time, scalar transfer, retained generic/exact evidence bytes, device head bytes, temporary workspace, and `full - schedule_confidence` wall-clock delta;
+6. decoded video, audio, and synchronization comparison across the paired outputs.
 
-The exact candidate is supported only when `model_aware_head_metric_available=True`. A zero post-bound exact/generic delta with unequal raw candidates, hidden-feature CPU transfer in the exact path, a changed C/D NFE schedule, or a missing head operator invalidates the run. A falling trust value and zero applied exact delta are valid negative results when the pure exact candidate loses. Compare exact directly with diagonal to determine whether cross-hidden-channel Gram terms added useful information.
+Answer three separate hypotheses: whether generic K=2 materially improves on generic scalar; whether exact K=2 materially improves on generic K=2 over the same span; and whether final trust-mixed K=2 materially improves on the exact scalar architecture. Use the existing 2% forecast-error materiality threshold. If K=2 remains at approximately 0.1%-scale improvement, stop and report the negative result; do not expand to K=3, larger bases, PCA, or another correction metric without positive evidence that the second direction helped.
 
 ## Required ablations
 
