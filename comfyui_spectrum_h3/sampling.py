@@ -75,15 +75,16 @@ def max_consecutive_forecasts(sampler: Any) -> int | None:
 
 
 def min_actual_steps_after_forecast(sampler: Any) -> int:
-    name = sampler_name(sampler)
-    return 1 if name in SUPPORTED_SINGLE_CALL_SAMPLERS else 0
+    return 1 if sampler_name(sampler) in SUPPORTED_SINGLE_CALL_SAMPLERS else 0
 
 
 def min_tail_actual_steps(sampler: Any) -> int:
     return 3 if sampler_name(sampler) in RES_MULTISTEP_SAMPLERS else 0
 
 
-def _binding_from_model_options(model_options: dict[str, Any] | None) -> SpectrumH3Binding | None:
+def _binding_from_model_options(
+    model_options: dict[str, Any] | None,
+) -> SpectrumH3Binding | None:
     binding = (model_options or {}).get(BINDING_KEY)
     return binding if isinstance(binding, SpectrumH3Binding) else None
 
@@ -169,7 +170,10 @@ def outer_sample_wrapper(
             latent_shapes=latent_shapes,
         )
 
-    transformer_options = (getattr(guider, "model_options", None) or {}).get("transformer_options") or {}
+    transformer_options = (
+        (getattr(guider, "model_options", None) or {}).get("transformer_options")
+        or {}
+    )
     if transformer_options.get("easycache") is not None:
         LOG.warning(
             "Spectrum H3 disabled for this run because EasyCache or LazyCache is active on the same model"
@@ -203,9 +207,7 @@ def outer_sample_wrapper(
                     "recognized_lora=%s unknown_patches=%s cache=%s build_s=%.6f "
                     "lookup_s=%.6f memory_bytes=%s sensitivity=%.6f perturbation=%.6f "
                     "final_perturbation=%.6f confidence=%.6f "
-                    "head_metric=final_layer_exact_linear_operator "
-                    "head_metric_available=%s head_hidden_channels=%s "
-                    "head_audio_outputs=%s head_video_outputs=%s",
+                    "profile_payload=compact_scalar_sensitivities retained_head_bytes=0",
                     profile.base_model_identity,
                     profile.active_patch_count,
                     profile.active_patch_keys,
@@ -219,27 +221,6 @@ def outer_sample_wrapper(
                     profile.patch_perturbation,
                     profile.final_block_perturbation,
                     profile.profile_confidence,
-                    bool(
-                        profile.audio_head_weight is not None
-                        and profile.video_head_weight is not None
-                        and profile.audio_head_gram_diagonal is not None
-                        and profile.video_head_gram_diagonal is not None
-                    ),
-                    (
-                        0
-                        if profile.audio_head_gram_diagonal is None
-                        else profile.audio_head_gram_diagonal.numel()
-                    ),
-                    (
-                        0
-                        if profile.audio_head_weight is None
-                        else profile.audio_head_weight.shape[0]
-                    ),
-                    (
-                        0
-                        if profile.video_head_weight is None
-                        else profile.video_head_weight.shape[0]
-                    ),
                 )
         except torch.cuda.OutOfMemoryError:
             raise
@@ -312,7 +293,9 @@ def outer_sample_wrapper(
                 )
             runtime.end_run(run_id)
             if runtime.config.debug:
-                LOG.warning("Spectrum H3 run teardown phase=%s run_id=%s", phase, run_id)
+                LOG.warning(
+                    "Spectrum H3 run teardown phase=%s run_id=%s", phase, run_id
+                )
 
     if not runtime.config.offline_smoothing_replay:
         result, _ = execute_run(
@@ -376,8 +359,14 @@ def outer_sample_wrapper(
     replay_noise = noise.detach().clone()
     replay_latent = latent_image.detach().clone()
     replay_sigmas = sigmas.detach().clone()
-    replay_mask = denoise_mask.detach().clone() if torch.is_tensor(denoise_mask) else denoise_mask
-    initial_conds = _copy_condition_structure(guider.conds) if hasattr(guider, "conds") else None
+    replay_mask = (
+        denoise_mask.detach().clone()
+        if torch.is_tensor(denoise_mask)
+        else denoise_mask
+    )
+    initial_conds = (
+        _copy_condition_structure(guider.conds) if hasattr(guider, "conds") else None
+    )
     offline_steps = max(0, sigmas.numel() - 1)
     capture_callback, replay_callback, complete_progress = _offline_progress_callbacks(
         callback,
@@ -411,9 +400,6 @@ def outer_sample_wrapper(
 
         runtime.begin_offline_replay()
         if initial_conds is not None:
-            # CFGGuider.inner_sample replaces ``guider.conds`` with processed
-            # conditions. Replay must begin from the same preprocessed input
-            # structure as the first pass, not process its output a second time.
             guider.conds = _copy_condition_structure(initial_conds)
         try:
             replay_result, _ = execute_run(
@@ -443,12 +429,18 @@ def outer_sample_wrapper(
 def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
     guider = executor.class_obj
     binding = _binding_from_model_options(getattr(guider, "model_options", None))
-    if binding is None or binding.runtime.active_run_id is None or not binding.runtime.supported_sampler:
+    if (
+        binding is None
+        or binding.runtime.active_run_id is None
+        or not binding.runtime.supported_sampler
+    ):
         return executor(x, timestep, model_options or {}, seed)
 
     if "multigpu_clones" in (model_options or {}):
         if binding.runtime.config.debug:
-            LOG.warning("Spectrum H3 native fallback: multi-GPU parallel model calls are not transactionally supported")
+            LOG.warning(
+                "Spectrum H3 native fallback: multi-GPU parallel model calls are not transactionally supported"
+            )
         return executor(x, timestep, model_options or {}, seed)
 
     runtime = binding.runtime
@@ -472,25 +464,12 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 "Spectrum H3 model-aware step=%s trajectory_risk=%.6f model_risk=%.6f "
                 "patch_risk=%.6f combined_risk=%.6f confidence=%.6f horizon=%.3f "
                 "degree=%s ridge=%.8f audio_blend=%.6f video_blend=%.6f "
-                "audio_generic_projection_used=%.6f audio_diagonal_projection_used=%.6f "
-                "audio_exact_projection_used=%.6f audio_raw_generic_gain=%.6f "
-                "audio_raw_diagonal_gain=%.6f audio_raw_exact_gain=%.6f "
-                "audio_generic_gain=%.6f audio_diagonal_candidate_gain=%.6f "
-                "audio_exact_candidate_gain=%.6f audio_applied_gain=%.6f "
-                "audio_exact_trust=%.6f audio_generic_bound_active=%s "
-                "audio_diagonal_bound_active=%s audio_exact_bound_active=%s "
-                "audio_exact_generic_delta_post=%.6f "
-                "audio_exact_diagonal_delta_post=%.6f audio_gain_delta_applied=%.6f "
-                "video_generic_projection_used=%.6f video_diagonal_projection_used=%.6f "
-                "video_exact_projection_used=%.6f video_raw_generic_gain=%.6f "
-                "video_raw_diagonal_gain=%.6f video_raw_exact_gain=%.6f "
-                "video_generic_gain=%.6f video_diagonal_candidate_gain=%.6f "
-                "video_exact_candidate_gain=%.6f video_applied_gain=%.6f "
-                "video_exact_trust=%.6f video_generic_bound_active=%s "
-                "video_diagonal_bound_active=%s video_exact_bound_active=%s "
-                "video_exact_generic_delta_post=%.6f "
-                "video_exact_diagonal_delta_post=%.6f video_gain_delta_applied=%.6f "
-                "decision=%s",
+                "audio_generic_projection=%.6f audio_raw_generic_gain=%.6f "
+                "audio_generic_gain=%.6f audio_applied_gain=%.6f "
+                "audio_generic_bound_active=%s "
+                "video_generic_projection=%.6f video_raw_generic_gain=%.6f "
+                "video_generic_gain=%.6f video_applied_gain=%.6f "
+                "video_generic_bound_active=%s model_informed_correction=retired decision=%s",
                 decision["step_id"],
                 model_decision.trajectory_risk,
                 model_decision.model_risk,
@@ -503,39 +482,15 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 model_decision.audio_blend_weight,
                 model_decision.video_blend_weight,
                 audio_gain.residual_projection,
-                audio_gain.diagonal_projection,
-                audio_gain.model_projection,
                 audio_gain.raw_generic_gain,
-                audio_gain.raw_diagonal_gain,
-                audio_gain.raw_model_gain,
                 audio_gain.generic_gain,
-                audio_gain.diagonal_candidate_gain,
-                audio_gain.model_candidate_gain,
-                audio_gain.model_gain,
-                audio_gain.model_trust,
+                model_decision.audio_correction_gain,
                 audio_gain.generic_bound_active,
-                audio_gain.diagonal_bound_active,
-                audio_gain.model_bound_active,
-                audio_gain.post_bound_delta,
-                audio_gain.exact_diagonal_post_bound_delta,
-                audio_gain.applied_delta,
                 video_gain.residual_projection,
-                video_gain.diagonal_projection,
-                video_gain.model_projection,
                 video_gain.raw_generic_gain,
-                video_gain.raw_diagonal_gain,
-                video_gain.raw_model_gain,
                 video_gain.generic_gain,
-                video_gain.diagonal_candidate_gain,
-                video_gain.model_candidate_gain,
-                video_gain.model_gain,
-                video_gain.model_trust,
+                model_decision.video_correction_gain,
                 video_gain.generic_bound_active,
-                video_gain.diagonal_bound_active,
-                video_gain.model_bound_active,
-                video_gain.post_bound_delta,
-                video_gain.exact_diagonal_post_bound_delta,
-                video_gain.applied_delta,
                 "ACTUAL" if decision["actual"] else "FORECAST",
             )
 
@@ -549,7 +504,9 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
         except ForecastRetryActual as retry:
-            runtime.prepare_actual_retry(decision["run_id"], decision["step_id"], str(retry))
+            runtime.prepare_actual_retry(
+                decision["run_id"], decision["step_id"], str(retry)
+            )
             retry_decision = dict(decision)
             retry_decision["actual"] = True
             retry_decision["reason"] = f"forecast transaction retry: {retry}"
@@ -580,7 +537,9 @@ def sampler_sample_wrapper(
     denoise_mask=None,
     disable_pbar=False,
 ):
-    binding = _binding_from_model_options(getattr(model_wrap, "model_options", None))
+    binding = _binding_from_model_options(
+        getattr(model_wrap, "model_options", None)
+    )
     if binding is None or binding.runtime.active_run_id is None:
         return executor(
             model_wrap,
@@ -593,7 +552,10 @@ def sampler_sample_wrapper(
             disable_pbar,
         )
     runtime = binding.runtime
-    if not runtime.config.selective_rollback_correction or runtime.experiment_disabled_reason is not None:
+    if (
+        not runtime.config.selective_rollback_correction
+        or runtime.experiment_disabled_reason is not None
+    ):
         return executor(
             model_wrap,
             sigmas,
@@ -613,7 +575,8 @@ def sampler_sample_wrapper(
     unsupported_reason = None
     if function is not native_sampling.sample_euler:
         unsupported_reason = (
-            f"selective rollback supports only the exact reviewed sample_euler contract; got {sampler_name(sampler)}"
+            "selective rollback supports only the exact reviewed sample_euler "
+            f"contract; got {sampler_name(sampler)}"
         )
     elif set(options) - {"s_churn", "s_tmin", "s_tmax", "s_noise"}:
         unsupported_reason = "selective rollback received unknown Euler sampler options"
@@ -632,7 +595,9 @@ def sampler_sample_wrapper(
             is_model_options=True,
         )
         if any(wrapper is not predict_noise_wrapper for wrapper in predict_wrappers):
-            unsupported_reason = "selective rollback does not support another PREDICT_NOISE wrapper"
+            unsupported_reason = (
+                "selective rollback does not support another PREDICT_NOISE wrapper"
+            )
 
     if unsupported_reason is not None:
         runtime.disable_experiment(unsupported_reason)
@@ -661,7 +626,9 @@ def sampler_sample_wrapper(
 
 
 def model_clone_callback(source_model: Any, cloned_model: Any) -> None:
-    source_binding = _binding_from_model_options(getattr(source_model, "model_options", None))
+    source_binding = _binding_from_model_options(
+        getattr(source_model, "model_options", None)
+    )
     if source_binding is None:
         return
     if not hasattr(cloned_model, "model_options") or cloned_model.model_options is None:
@@ -671,13 +638,19 @@ def model_clone_callback(source_model: Any, cloned_model: Any) -> None:
     )
 
 
-def _place_kj_preview_inside_offline_wrapper(model: Any, outer_wrapper_type: str) -> None:
+def _place_kj_preview_inside_offline_wrapper(
+    model: Any,
+    outer_wrapper_type: str,
+) -> None:
     """Ensure KJ's observational preview wrapper is entered once for each offline pass."""
     outer_wrappers = (getattr(model, "wrappers", None) or {}).get(outer_wrapper_type)
     if not isinstance(outer_wrappers, dict):
         return
     keys = list(outer_wrappers)
-    if KJ_PREVIEW_WRAPPER_KEY not in outer_wrappers or WRAPPER_KEY not in outer_wrappers:
+    if (
+        KJ_PREVIEW_WRAPPER_KEY not in outer_wrappers
+        or WRAPPER_KEY not in outer_wrappers
+    ):
         return
     if keys.index(KJ_PREVIEW_WRAPPER_KEY) > keys.index(WRAPPER_KEY):
         return
@@ -703,15 +676,27 @@ def install_sampler_wrappers(model: Any, runtime: SpectrumH3Runtime) -> None:
     wrapper_types = comfy.patcher_extension.WrappersMP
     existing_outer = model.get_wrappers(wrapper_types.OUTER_SAMPLE, WRAPPER_KEY)
     if not existing_outer:
-        model.add_wrapper_with_key(wrapper_types.OUTER_SAMPLE, WRAPPER_KEY, outer_sample_wrapper)
+        model.add_wrapper_with_key(
+            wrapper_types.OUTER_SAMPLE,
+            WRAPPER_KEY,
+            outer_sample_wrapper,
+        )
     if runtime.config.offline_smoothing_replay:
         _place_kj_preview_inside_offline_wrapper(model, wrapper_types.OUTER_SAMPLE)
     existing_predict = model.get_wrappers(wrapper_types.PREDICT_NOISE, WRAPPER_KEY)
     if not existing_predict:
-        model.add_wrapper_with_key(wrapper_types.PREDICT_NOISE, WRAPPER_KEY, predict_noise_wrapper)
+        model.add_wrapper_with_key(
+            wrapper_types.PREDICT_NOISE,
+            WRAPPER_KEY,
+            predict_noise_wrapper,
+        )
     existing_sampler = model.get_wrappers(wrapper_types.SAMPLER_SAMPLE, WRAPPER_KEY)
     if not existing_sampler:
-        model.add_wrapper_with_key(wrapper_types.SAMPLER_SAMPLE, WRAPPER_KEY, sampler_sample_wrapper)
+        model.add_wrapper_with_key(
+            wrapper_types.SAMPLER_SAMPLE,
+            WRAPPER_KEY,
+            sampler_sample_wrapper,
+        )
     callback_type = comfy.patcher_extension.CallbacksMP.ON_CLONE
     if not model.get_callbacks(callback_type, WRAPPER_KEY):
         model.add_callback_with_key(callback_type, WRAPPER_KEY, model_clone_callback)
