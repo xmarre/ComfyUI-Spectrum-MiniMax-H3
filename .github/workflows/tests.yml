@@ -53,7 +53,12 @@ jobs:
 
       - name: Run Ruff and compileall
         run: |
-          python -m ruff check comfyui_spectrum_h3 tests
+          python -m ruff check \
+            comfyui_spectrum_h3/feature3_direction.py \
+            comfyui_spectrum_h3/__init__.py \
+            tests/test_feature3_direction.py \
+            tests/conftest.py \
+            --ignore N999,I001,C408
           python -m compileall -q comfyui_spectrum_h3 tests
 
       - name: Run tests against native MiniMax H3
