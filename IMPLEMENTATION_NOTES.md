@@ -9,116 +9,58 @@ Reviewed native ComfyUI revisions used by the PR matrix:
 - `5599a05fea715cb2aff11f30f5b06e16d0dfa0c4`
 - `27bca654eb9a70237d93f56a6ea336ab55f8925d`
 
-Reviewed Spectrum paper: arXiv `2603.01623v1`.
-
-Reviewed official Spectrum implementation commit: `11f317a87352e2c67daa2fac5a971cf04233d7d1`.
-
 ## Native execution boundary
 
-MiniMax-H3 sampling enters ComfyUI through the normal `CFGGuider` / sampler / `PREDICT_NOISE` path. Native `MiniMaxH3Model._forward` pads the video, resolves `PackedLayout`, constructs separate audio/video timestep state, builds modulation segments and embeddings, executes every transformer block, then sends the final packed hidden to `FinalLayer`.
+MiniMax-H3 sampling enters through the normal ComfyUI guider/sampler `PREDICT_NOISE` path. Native `MiniMaxH3Model._forward` resolves the packed layout, separate audio/video timestep state, modulation segments and embeddings, executes the transformer stack, then sends the final packed hidden to `FinalLayer`.
 
-The packed target tail is contiguous and ordered:
+The target packed tail is contiguous:
 
 ```text
 [target audio rows | target video rows]
 ```
 
-Spectrum captures only that compact target tail immediately after the final transformer block and immediately before native `FinalLayer`. Text, keyframe/reference, image-reference, video-reference, and audio-reference rows are not placed in forecast history.
-
-Actual steps retain the native H3 transformer execution. Forecast steps predict only the compact pre-`FinalLayer` target hidden and then call the current native output-head/reconstruction path. This preserves current timestep conditioning, current sigma shifts, native audio schedule conversion, FP32 output heads, video unpatchification, audio unpacking, and the installed core's native return convention.
+Spectrum captures only that target tail immediately after the final transformer block and before `FinalLayer`. Forecast steps predict the same pre-`FinalLayer` target hidden and then use the current native output/reconstruction path.
 
 ## Native FinalLayer contract
 
-The reviewed native class has hidden width 5376 and independent FP32 output heads:
+The reviewed base architecture has hidden width 5376 and FP32 stream heads:
 
 ```text
 audio_out: 5376 -> 32
 video_out: 5376 -> 96
 ```
 
-The effective stream mapping is:
+Effective stream mapping:
 
 ```text
-n(h) = RMSNorm(h)
+n(h)   = RMSNorm(h)
 z_t(h) = n(h) * (1 + scale_t) + shift_t
 F_t(h) = W z_t(h) + b
 ```
 
-The exact source uses `1.0 + scale[...]` for both streams and converts the modulated hidden to `torch.float32` before the output linear layer. The timestep row is selected from the native modulation segments: video uses the row whose modulation tag is `0`, audio uses the row whose modulation tag is `2`; the embedded timestep row is `row // 3`.
+The output-head island is FP32. Audio/video target timestep rows remain stable for the target packed segments within one generation.
 
-`operations.RMSNorm` delegates to PyTorch RMSNorm with the module's exact `eps` and effective cast weight. Feature-3 geometry capture uses ComfyUI's `cast_bias_weight` / `uncast_bias_weight` contract so the path remains compatible with the oldest pinned revision and does not retain a module reference after the native block call.
+## Forecast history and row correspondence
 
-## RMSNorm analytic derivative
+The normal forecaster stores at most `max_history` detached compact target features in configured history storage. Branch identity, topology, target row count and hidden width are validated before forecasting. Any change fails to actual execution rather than silently remapping rows.
 
-For one hidden row `x`, tangent `v`, RMSNorm weight `w`, hidden width `H`,
-
-```text
-s = mean(x^2) + eps
-q = s^(-1/2)
-y = w * x * q
-```
-
-The analytic JVP used in normal inference is:
-
-```text
-J_RMS(x) v = w * [q v - x q^3 mean(x v)]
-```
-
-For output cotangent `g`, define `p = g * w`. The analytic VJP is:
-
-```text
-J_RMS(x)^T g = q p - x q^3 mean(x p)
-```
-
-Tests compare both expressions against PyTorch autograd on small CPU tensors. Autograd is not used during generation.
-
-## Full FinalLayer analytic JVP/VJP
-
-For `a_t = 1 + scale_t`, the FinalLayer JVP is:
-
-```text
-v_norm = J_RMS(h) v
-v_mod  = a_t * v_norm
-J_t v  = v_mod @ W.T
-```
-
-The output projection is evaluated in FP32, matching native H3.
-
-For output cotangent `u`, the VJP is:
-
-```text
-g_mod = u @ W
-g_norm = a_t * g_mod
-J_t^T u = J_RMS(h)^T g_norm
-```
-
-The implementation follows the dtype transition induced by the native FP32 output-head cast. Shift and output bias do not appear in the derivative. Tests verify the complete JVP, complete VJP, and `J_t^T J_t d` against explicit/autograd references on small tensors.
-
-No full Jacobian is materialized. No transformer JVP/VJP is performed.
-
-## Forecast history and storage
-
-The normal forecaster stores at most `max_history` detached compact target features in the configured history storage. System-RAM remains the default; VRAM history remains opt-in. Prediction solves only for temporal weights and streams history chunks into an FP32 accumulator on the requested output device.
-
-The published Spectrum baseline remains last-block spectral forecasting. Model-aware work is layered around the same hidden target; it does not replace the Chebyshev forecaster.
+This stability also supports sampled Feature-3 experiments: deterministic complete-row indices may be fixed for a stream and reused across actual anchors. The current telemetry screens cap the total selected complete rows at 32 per stream across conditional branches.
 
 ## Model profile lifetime
 
-The process-local model profile stores immutable metadata plus detached CPU copies of the two native output-head weights and their normalized Gram diagonals. It stores no live model/module reference and no GPU tensor.
+The model profile stores immutable metadata plus detached CPU copies of native audio/video output-head weights and their Gram diagonals. It retains no live model/module/GPU reference.
 
-The static base-H3 head payload is approximately:
+Base-H3 detached FP32 head payload:
 
 ```text
-(32 * 5376 + 96 * 5376) * 4 bytes ~= 2.625 MiB
+(32 + 96) * 5376 * 4
+= 2,752,512 bytes
+= 2.625 MiB
 ```
 
-Keeping this detached CPU payload avoids introducing model lifetime references into the global profile cache. GPU materialization of output-head tensors is `full`-only and is cleared when the model-aware run ends or is disabled.
+GPU head materialization is `full`-only and is released at run end/disable.
 
-LoRA/patch identity remains part of the profile/cache key and scheduling prior. This Feature-3 revision does not add new LoRA behavior.
-
-## Model-aware mode boundaries
-
-The intended ownership is strict:
+## Mode boundaries
 
 ```text
 off
@@ -126,207 +68,203 @@ off
 
 schedule
     Feature 1 profile/scheduling prior only
-    no trajectory evidence allocation
-    no correction fitting or application
+    no trajectory/correction evidence
 
 schedule_confidence
     Feature 1 + Feature 2 trajectory confidence/adaptive fitting
-    bounded generic risk evidence only
+    generic risk evidence only
     no exact-head correction projection
-    no K=2 solve
-    no model-direction construction
+    no K=2
+    no Feature-3 candidate screen
     no correction application
 
 full
     Feature 1 + Feature 2 + Feature 3
-    retained scalar correction is applied
-    model-transformed directions are telemetry-only
+    retained scalar latest-delta correction applied
+    current new hypotheses telemetry-only until real gated
 ```
 
-The runtime's existing head materializer already returns no GPU head payload unless mode is `full`. The Feature-3 revision also gates generic correction evidence and directional row history by mode.
+## Retained applied scalar correction
 
-## Retained scalar correction architecture
-
-The active `full` correction is one-dimensional again. Let the latest causal trajectory direction be:
+The generated `full` output continues to use only the existing one-dimensional causal correction along:
 
 ```text
 d = h[-1] - h[-2]
 ```
 
-The historical candidate hierarchy remains independently measurable:
+The historical scalar measurements remain independently observable:
 
 ```text
-g_generic  = <r, d> / <d, d>
-
-g_diag     = <r, S d> / <d, S d>
-S          = diag(W^T W)
-
-g_exact    = <r W^T, d W^T> / <d W^T, d W^T>
+g_generic = <r,d>/<d,d>
+g_diag    = <r,Sd>/<d,Sd>,  S=diag(W^T W)
+g_exact   = <rW^T,dW^T>/<dW^T,dW^T>
 ```
 
-The active scalar gain is the existing trust interpolation between generic and exact static-head gains after the existing rational correction limit. The Gram-diagonal metric remains an ablation only.
+The actual applied scalar is the existing trust mixture between generic and exact-head scalar gains under the unchanged rational 0.25 correction limit. K=2 coefficients are explicitly ignored by forecast application.
 
-Forecast application now explicitly ignores the rejected K=2 coefficient fields even if an old internal/test decision object contains them.
+The latest real gate showed approximately 6.2% audio / 5.7% video improvement from the generic temporal residual correction, while the model-specific exact-head increment remained only approximately 0.18% audio / 0.04% video and the trust-mixed applied increment approximately 0.09% / 0.02%. The generic benefit must not be mislabeled as model-specific Feature-3 efficacy.
 
-## Rejected K=2 trajectory subspace
+## Retired K=2 runtime
 
-The completed K=2 experiment used:
+The rejected K=2 experiment used the two most recent temporal deltas. Real evidence showed it was consistently worse than the scalar baseline and exact-head weighting did not rescue it. Normal runtime no longer performs K=2 Gram/solve work or replay stencils. Historical helpers/tests may remain.
+
+## Retired transformed-trajectory runtime
+
+Two further hypotheses transformed the latest temporal delta with model geometry:
 
 ```text
-d0 = h[-1] - h[-2]
-d1 = h[-2] - h[-3]
+static: m_W = W^T W d
+full:   m_F = J_t^T J_t d
 ```
 
-and compared Euclidean and exact-head 2x2 solves over the same span. Real base-H3 evidence showed generic K=2 was consistently worse than generic scalar and exact-head weighting changed the K=2 result only at approximately 0.01-0.03% mean scale.
+The full path used analytic native FinalLayer JVP/VJP. The initial screen exposed a radial `q < eps` bug and an arbitrary operator-scale confound. Both were fixed by stable rational scaling and delta-equivalent direction normalization.
 
-Normal generation therefore no longer calls the K=2 Gram/solve path, no longer applies K=2 coefficients, and no longer produces a K=2 offline-replay stencil. Focused K=2 mathematical utilities/tests may remain to preserve the experimental record and compatibility with historical in-memory structures.
-
-The old ~2.17-2.24 second `model_aware_subspace_solve_s` attribution was not evidence of expensive literal 2x2 arithmetic. The timed path included CUDA reductions/eigen/solve operations, and a host dependency can absorb synchronization from previously queued work. The architectural correction is to remove the rejected runtime work. No explicit CUDA synchronization is added merely to make timers look cleaner.
-
-## Feature-3 direction screen
-
-The new experiment changes the hidden-space correction direction while leaving generated output controlled by the retained scalar path.
-
-### Static native head direction
-
-For stream head `W`:
+The corrected real gate then established:
 
 ```text
-m_W = W^T W d
+normalized ||m||/||d|| ~= 1 for all eligible candidates
+raw ||J^T J d||/||d|| ~= 1e-8
+static W^T W d: 0/8 vs scalar on both streams, ~6-7% worse
+full J^T J d:   0/8 vs scalar on both streams, ~6-7% worse
+full did not improve static
 ```
 
-Production computes:
+The transformed-trajectory family is therefore closed. Normal runtime no longer captures geometry, retains row history, calibrates direction alpha, computes WtW/JtJ, invokes the rejected JVP/VJP, or logs per-anchor telemetry for that family.
+
+Debug summaries intentionally report its old runtime fields as zero and mark the family/K=2 as retired.
+
+Pure helpers for WtW, RMSNorm JVP/VJP, FinalLayer JVP/VJP, normalization and radial budgeting remain as mathematical regression fixtures because the current previous-error experiment reuses the VJP and normalization primitives but not the rejected JtJ mechanism.
+
+# Current isolated Feature-3 hypothesis: previous-error adjoint
+
+At a completed actual anchor `k`, define the causal prediction errors:
 
 ```text
-u   = d @ W.T
-m_W = u @ W
+r_k = h_actual,k - h_pred_uncorrected,k
+
+e_k = F_k(h_actual,k) - F_k(h_pred_uncorrected,k)
 ```
 
-This preserves every cross-hidden-channel term without constructing a `5376 x 5376` Gram matrix.
-
-### Full native FinalLayer direction
-
-At target timestep `t`:
+For a later target `t`, the telemetry-only screen compares:
 
 ```text
-J_t = dF_t / dh
-m_F = J_t^T J_t d
+m_R = r_previous
+m_W = W^T e_previous
+m_J = J_t^T e_previous
 ```
 
-The implementation performs the analytic FinalLayer-only JVP described above, followed by the analytic VJP. The work is limited to sampled hidden rows, RMSNorm/AdaLN elementwise operations, and the 5376x32 or 5376x96 output-head multiplies.
+This explicitly separates generic residual persistence (`m_R`) from static model geometry (`m_W`) and current local FinalLayer geometry (`m_J`). A model-specific claim requires a model adjoint to beat `m_R`, not merely the uncorrected forecast.
 
-No transformer block is re-executed. Transformer NFE count is unchanged.
+## Strict causal ordering
 
-## Causal reference state
+The target FinalLayer state depends only on target timestep/static model state and is captured before actual N executes. The model-aware observer runs before `forecaster.update(N)`, so history still contains only anchors `< N`.
 
-The full direction is evaluated around the uncorrected sampled spectral prediction for the target coordinate:
+For anchor N:
 
 ```text
-h_ref = h_pred_uncorrected(t)
+1. retrieve previous error state from anchors < N
+2. reconstruct uncorrected predicted hidden for N from history < N
+3. construct/normalize m_R, m_W, m_J
+4. apply alpha learned only from earlier completed anchors
+5. score those fixed candidates against actual N
+6. compute instantaneous alpha diagnostics from N
+7. compute/store r_N and e_N for future anchors only
 ```
 
-This prediction is reconstructed only from actual anchors that already existed before the current actual anchor. The target timestep/AdaLN state is derived from the native timestep embedding/modulation segment and contains no future hidden information.
+Actual N never enters candidate construction or alpha used at N.
 
-During a completed actual anchor N:
+## Native output residual
 
-1. build the counterfactual spectral prediction from history `< N`;
-2. read the coefficient calibration that existed before N;
-3. build `d`, `m_W`, and `m_F` from causal history and target timestep geometry;
-4. score all candidates against actual N;
-5. compute instantaneous `<r_N,m_N>/<m_N,m_N>` diagnostics;
-6. update calibration for future anchors;
-7. append actual N to the sampled direction-evidence history.
-
-This ordering prevents same-anchor hindsight. Snapshot/rollback includes directional calibration, sampled row history/indices, and counters, so speculative state cannot leak across rollback.
-
-## Direction coefficient calibration
-
-Each model-transformed direction has a separate bounded EWMA scalar amplitude. At anchor N the candidate uses the EWMA learned from prior anchors, scaled by the same current Feature-2 confidence convention used elsewhere in the controller. The current anchor's instantaneous projection is training evidence for later candidates only.
-
-A zero, tiny, nonfinite, or shape-incompatible direction is marked ineligible and contributes no model-direction candidate. Scalar correction remains available.
-
-## Direction correction budget
-
-For candidate `m` and prior coefficient `alpha`:
+For selected complete rows, current `e_N` is computed exactly through the native sampled FinalLayer difference:
 
 ```text
-c_raw = alpha * m
-q_raw = ||c_raw|| / max(||d||, eps)
-q_bounded = q_raw / (1 + q_raw / 0.25)
+F_N(h_actual,N) - F_N(h_pred_uncorrected,N)
 ```
 
-The candidate vector is radially scaled so its sampled hidden-space norm ratio equals `q_bounded`. This is the same physical 0.25 rational soft budget used by the scalar correction. It prevents `W^T W` or `J^T J` amplification from receiving a larger correction magnitude.
+Shift and output bias cancel. RMSNorm, target AdaLN scale and FP32 head projection are preserved. No transformer block is re-executed.
 
-When `m == d`, the rule reduces to the existing scalar rational semantics.
+## Static/current adjoints
 
-## Direction evidence and memory
+Static:
 
-Directional screening uses deterministic complete-row sampling with a default cap of 32 target rows per stream. The selected hidden rows remain on the producing feature device. The history is bounded by `max_history`.
+```text
+m_W = e_previous @ W
+```
 
-The full hidden tensor is never transferred to CPU for the experiment. Reduced scalar telemetry is transferred after device-local candidate evaluation.
+Current local:
 
-Temporary work includes the sampled prediction, residual, delta, static direction/candidate, and full direction/candidate plus output-head intermediates. Debug telemetry reports the peak sampled workspace and retained direction evidence bytes separately from the ordinary forecaster history/archive.
+```text
+m_J = J_t^T e_previous
+```
 
-## Telemetry timing semantics
+`J_t^T e_previous` uses the analytic FinalLayer VJP only. The previous output residual lives in the stable output coordinate basis for the same sampled target rows/output channels. Reusing it across timesteps is a testable residual-persistence hypothesis, not assumed truth; current target RMSNorm/AdaLN geometry is applied through `J_t`.
 
-The direction evaluator reports:
+## Shared normalization and trust budget
 
-- total direction computation span;
-- static-direction enqueue time;
-- full FinalLayer direction enqueue time;
-- JVP enqueue time;
-- VJP enqueue time;
-- reduced scalar transfer time;
-- head materialization time/bytes;
-- retained sampled evidence bytes and workspace.
+Every finite nonzero candidate is normalized before coefficient fitting/scoring:
 
-Small CUDA operation timers that do not synchronize are explicitly labeled `enqueue_s`; they must not be interpreted as isolated GPU kernel duration. Normal inference adds no `torch.cuda.synchronize()` for telemetry.
+```text
+m_normalized = m * ||d|| / ||m||
+```
 
-The complete direction span includes the reduced scalar transfer that closes the dependency chain for the sampled candidate work, making that aggregate timing the useful wall-clock contribution to inspect in the real benchmark.
+The same validated rational budget remains:
 
-## Offline smoothing replay
+```text
+q_raw       = ||alpha * m_normalized|| / ||d||
+radial      = 1 / (1 + q_raw / 0.25)
+q_bounded   = q_raw * radial
+```
 
-Offline smoothing remains default-on behavior for MiniMax-H3. The new model-direction candidates are telemetry-only and never alter replay output.
+`_DIRECTION_ALPHA_LIMIT` is unchanged. Positive scaling of a raw direction does not change the final candidate.
 
-The first pass archives only the retained scalar Feature-3 decision. Replay reconstructs the same scalar correction decision using the causal anchor relationship already supported by the offline smoother. The rejected K=2 replay stencil is inactive in normal generation because the runtime no longer produces an eligible K=2 decision.
+## Evidence/memory
 
-Offline replay still performs no transformer calls during replay. The new telemetry does not change the archived latent/sampler random process.
+No second full hidden history is allocated. The screen reuses normal forecaster history and keeps only the most recent sampled residual state.
 
-## ER-SDE contract
+Maximum persistent FP32 state at 32 complete rows per stream:
 
-Native `sample_er_sde` remains supported through its reviewed one-model-call-per-outer-step contract. Solver-local denoised derivative history and stochastic noise draws remain owned by the native sampler.
+```text
+hidden residuals = 1,376,256 bytes
+output residuals =    16,384 bytes
+subtotal         = 1,392,640 bytes = 1.328125 MiB
+row indices      <= 512 bytes
+```
 
-Feature-3 direction screening observes cached hidden trajectory/model geometry only. It does not mutate ER-SDE's generator, noise sampler, `old_denoised`, derivative history, or stage logic. It introduces zero additional denoiser/transformer evaluations.
+When normal history is in system RAM, only selected rows are copied to the feature device for the screen.
 
-The existing offline replay restriction for custom mutable ER-SDE noise samplers/scalers remains unchanged.
+## Compute
 
-## Rollback and mutation safety
+Maximum static head backprojection work at 32 rows per stream:
 
-Directional state is part of `ModelAwareController.snapshot()` / `restore()`. History entries are detached tensors and are replaced/appended rather than mutated in place. No model reference is captured in rollback state.
+```text
+audio W^T e = 5.505M MAC
+video W^T e = 16.515M MAC
+combined    = 22.020M MAC ~= 44 MFLOP
+```
 
-Run end, forecasting disable, and model-aware disable clear pending FinalLayer geometry, sampled direction evidence, row-index tensors, and device-materialized output heads. Global profile CPU tensors remain process-local immutable cache payload.
+The current local VJP has the same output-head backprojection order plus O(hidden) RMSNorm/AdaLN operations. Exact sampled output-residual construction/scoring remains sub-GFLOP order. This is far below a 50-block H3 denoiser call and adds zero transformer NFE.
 
-## Verification expectations
+## ER-SDE / replay ownership
 
-The test suite covers:
+The telemetry does not modify ER-SDE generator, noise-sampler or derivative state. No denoiser call is added.
 
-- scalar `full` application after K=2 retirement;
-- no correction/K=2/model-direction work in `schedule_confidence`;
-- scheduling parity for equal trajectory evidence;
-- unchanged transformer NFE counters;
-- `(d @ W.T) @ W` equivalence to an explicit small `W.T @ W` reference;
-- no production 5376x5376 Gram materialization;
-- cross-channel behavior distinct from the diagonal approximation;
-- analytic RMSNorm JVP/VJP versus autograd;
-- analytic full FinalLayer JVP/VJP versus autograd;
-- `J^T J d` versus an explicit/autograd small reference;
-- exact native `1 + scale` and FP32-head source contract;
-- causal predicted-hidden reference and post-score history append;
-- prior-anchor-only coefficient calibration;
-- 0.25 radial budget and `m == d` scalar equivalence;
-- safe zero/nonfinite direction fallback;
-- controller snapshot/restore;
-- system-RAM/VRAM history behavior inherited from the complete suite;
-- no model/module references in retained Feature-3 state.
+Offline replay remains scalar-only and deterministic. Previous-error telemetry is skipped during replay; first-pass observations may collect/score the experiment but do not alter replay weights/output.
 
-The cross-ComfyUI GitHub Actions matrix remains the required final compatibility gate.
+## Active runtime labels
+
+Normal `full` summary should show both facts clearly:
+
+```text
+feature3_applied_correction=scalar_latest_delta
+feature3_transformed_trajectory_runtime=retired
+feature3_direction_evidence_bytes=0
+feature3_direction_workspace_bytes=0
+feature3_jvp_enqueue_s=0
+feature3_vjp_enqueue_s=0
+
+feature3_previous_error_screen=residual_vs_static_adjoint_vs_local_adjoint
+feature3_previous_error_applied=false
+feature3_error_extra_transformer_nfe=0
+```
+
+The new screen remains counterfactual until a model adjoint materially beats the previous-hidden-residual baseline in a mechanically matched real gate.
