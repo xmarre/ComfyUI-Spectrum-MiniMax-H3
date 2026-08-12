@@ -1,8 +1,8 @@
 # MiniMax H3 integration notes
 
-Source review date: 2026-08-08
+Source review date: 2026-08-12
 
-Reviewed native ComfyUI commits: `e377e263049f9338b4d12a3dd417b36ae62948ff`, `0dd9b154a1654fc699dcdc3af066c7cce096045a`, and `5599a05fea715cb2aff11f30f5b06e16d0dfa0c4`
+Reviewed native ComfyUI commits: `e377e263049f9338b4d12a3dd417b36ae62948ff`, `0dd9b154a1654fc699dcdc3af066c7cce096045a`, `5599a05fea715cb2aff11f30f5b06e16d0dfa0c4`, and current master `27bca654eb9a70237d93f56a6ea336ab55f8925d`
 
 Reviewed Spectrum paper: arXiv `2603.01623v1`
 
@@ -41,7 +41,13 @@ This preserves:
 
 ## Sampler contract
 
-Solver-step IDs are assigned by a `PREDICT_NOISE` wrapper inside an `OUTER_SAMPLE` run transaction. Forecasting is allowlisted only for deterministic native `sample_euler`, `sample_res_multistep`, and `sample_res_multistep_cfg_pp`, whose reviewed implementations perform exactly one `predict_noise` call per solver iteration. Euler requires one completed actual H3 evaluation after every forecast. RES stores each current denoised result for the following second-order update. The actual step after a forecast consumes that forecast-derived value, then replaces `old_denoised` with its native result; one completed actual evaluation therefore clears the retained forecast before forecasting resumes. RES also enforces a three-step actual tail. These sampler floors are applied at run time and cannot be weakened by an older saved workflow. Ancestral variants remain native because they inject noise between model evaluations. Other samplers remain native and report a debug fallback reason.
+Solver-step IDs are assigned by a `PREDICT_NOISE` wrapper inside an `OUTER_SAMPLE` run transaction. Forecasting is allowlisted only for the reviewed native `sample_euler`, `sample_er_sde`, `sample_res_multistep`, and `sample_res_multistep_cfg_pp` functions plus Larryvrh's reviewed `_turbo_sampler`. Each performs exactly one `predict_noise` call per outer solver iteration. Euler, ER-SDE, and Turbo require one completed actual H3 evaluation after every forecast. RES stores each current denoised result for the following second-order update. The actual step after a forecast consumes that forecast-derived value, then replaces `old_denoised` with its native result; one completed actual evaluation therefore clears the retained forecast before forecasting resumes. RES also enforces a three-step actual tail. These sampler floors are applied at run time and cannot be weakened by an older saved workflow. Unreviewed ancestral variants and other samplers remain native and report a debug fallback reason.
+
+Current ComfyUI `sample_er_sde` has one `model(x, sigmas[i] * s_in, ...)` evaluation in its sole outer loop. `stage_used = min(max_stage, i + 1)` changes only how that denoised result is combined with solver-local history. Stage 2 carries `old_denoised` and the current finite difference `denoised_d`; stage 3 additionally carries `old_denoised_d`. Both histories are initialized inside the function and replaced during the invocation, so no native ER state survives a separate sampler call. The final sigma-zero iteration assigns `x = denoised`, still invokes the callback once, and skips every ER update and SDE noise draw.
+
+With native defaults, the function constructs `default_noise_sampler(x, seed=extra_args["seed"])` once per invocation. ComfyUI's `CFGGuider.inner_sample` rebuilds `extra_args` with the same outer seed on each Spectrum pass. The default sampler owns a fresh device generator seeded identically for each invocation (with the same CPU seed offset), so identical initial packed noise, latent, sigmas, seed, and sampler options reconstruct the same random sequence. On every nonterminal iteration with effective `s_noise > 0`, one noise sample is generated after the stage update and injected into `x`; `s_noise <= 0` or a model `noise_scale <= 0` suppresses the draw. `max_stage` does not alter model-call or noise-draw counts. `s_noise`, `max_stage`, and the native default `noise_scaler` therefore preserve the reviewed logical-step contract.
+
+A custom `noise_sampler` or `noise_scaler` object is stored in the persistent KSampler's `extra_options` and can retain mutable state between the capture and replay invocations. Spectrum cannot prove that such an override restarts deterministically. Ordinary single-pass Spectrum remains eligible because the one-model-call topology is unchanged; default-on offline replay detects either override before opening a run and executes one native pass. ER-SDE does not enable `anchor_residual_feedback` or `selective_rollback_correction`; those experiments remain limited to their independently reviewed contracts.
 
 Coordinates are derived from the actual supplied sigma sequence. Evaluated sigma values are affinely normalized between the run's evaluated minimum and maximum into `[-1, 1]`; no fixed step count is assumed.
 

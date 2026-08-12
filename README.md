@@ -136,7 +136,7 @@ Offline smoothing replay is the standard default-on H3 path because it removed t
 |---|---|---|---:|---|
 | `anchor_residual_feedback` | Experimental / off | Euler, RES multistep, RES multistep CFG++ | 1 | Ordinary Spectrum/native fallback rules remain active. |
 | `selective_rollback_correction` | Experimental / off | Exact deterministic `sample_euler`, with `s_churn=0` | 1, with local replay on a trigger | RES, CFG++, churned, ancestral, unknown, intercepted, and multi-GPU paths log once and run ordinary Spectrum. |
-| `offline_smoothing_replay` | Standard / on | Euler, Larryvrh MiniMax H3 Turbo, RES multistep, RES multistep CFG++ | 2 | Unsupported samplers run one valid native pass. An incomplete first-pass archive returns the valid local-only first-pass result. |
+| `offline_smoothing_replay` | Standard / on | Euler, native ER-SDE, Larryvrh MiniMax H3 Turbo, RES multistep, RES multistep CFG++ | 2 | Unsupported or replay-unsafe sampler configurations run one valid native pass. An incomplete first-pass archive returns the valid local-only first-pass result. |
 
 ### Shared anchor residual
 
@@ -305,11 +305,16 @@ This option changes the denoising trajectory and is experimental. Validate video
 Forecasting is currently allowlisted for:
 
 - Euler (`sample_euler`)
+- native ER-SDE (`sample_er_sde`, KSampler name `er_sde`)
 - Larryvrh MiniMax H3 Turbo (`_turbo_sampler`)
 - RES multistep (`sample_res_multistep`)
 - RES multistep CFG++ (`sample_res_multistep_cfg_pp`)
 
-The reviewed implementations make one `predict_noise` call per solver iteration. Euler feeds each approximate denoised result into the latent used by the next evaluation, so it requires one completed actual H3 evaluation after every forecast. Larryvrh's reviewed MiniMax H3 Turbo sampler follows the same deterministic single-call contract and uses the same conservative limit of one consecutive forecast plus one completed actual refresh. RES multistep stores each current denoised result as `old_denoised` for the following second-order update. The actual evaluation immediately after a forecast still consumes forecast-derived history, then replaces `old_denoised` with its native result before another forecast is allowed. This prevents any RES update from combining two forecasted denoised results. RES also keeps its final three solver steps native; this tail floor applies even when a saved workflow supplies a smaller `tail_actual_steps` value. Ancestral samplers execute native MiniMax H3 because injected noise invalidates the smooth deterministic feature trajectory used by the forecaster. Debug mode logs the exact fallback, tail, or post-forecast refresh reason. Multi-GPU parallel sampling also remains native because distributed forecast-row transactions are not yet validated.
+The reviewed implementations make one `predict_noise` call per solver iteration. Euler feeds each approximate denoised result into the latent used by the next evaluation, so it requires one completed actual H3 evaluation after every forecast. ER-SDE also makes exactly one model call per outer iteration: `max_stage` reuses the current and previous denoised results for its higher-stage finite differences and does not add model evaluations. Its native default noise sampler is recreated from the same workflow seed for each offline pass, draws once after each nonterminal deterministic update when effective `s_noise > 0`, and does not draw on the final sigma-zero step. Custom `noise_sampler` or `noise_scaler` callables may carry mutable state across invocations, so offline replay fails closed to one native pass when either override is supplied. ER-SDE uses the same conservative limit of one consecutive forecast followed by one completed actual refresh and has no additional forced tail.
+
+Larryvrh's reviewed MiniMax H3 Turbo sampler follows the same deterministic single-call contract and refresh policy. RES multistep stores each current denoised result as `old_denoised` for the following second-order update. The actual evaluation immediately after a forecast still consumes forecast-derived history, then replaces `old_denoised` with its native result before another forecast is allowed. This prevents any RES update from combining two forecasted denoised results. RES also keeps its final three solver steps native; this tail floor applies even when a saved workflow supplies a smaller `tail_actual_steps` value. Other unreviewed ancestral samplers execute native MiniMax H3. Debug mode logs the exact fallback, tail, or post-forecast refresh reason. Multi-GPU parallel sampling also remains native because distributed forecast-row transactions are not yet validated.
+
+ER-SDE support applies to ordinary Spectrum and the standard offline smoothing replay path. The default-off `anchor_residual_feedback` and `selective_rollback_correction` experiments remain restricted to their separately reviewed sampler contracts.
 
 Native EasyCache and LazyCache must not accelerate the same model branch as Spectrum. Either cache can return an approximate diffusion result without invoking MiniMax H3, so Spectrum cannot capture the actual post-transformer feature required by its solver-step transaction. If both are attached, Spectrum now logs one warning and remains inactive for that run while the cache continues normally. Use one of these accelerators on a model branch.
 
@@ -377,7 +382,7 @@ Automated tests cover:
 - model detection and clone runtime isolation;
 - exact native versus wrapped forced-actual video/audio output on a deterministic tiny native H3 fixture;
 - proof that a forecast fixture invokes zero H3 transformer blocks;
-- exact MiniMax H3 Turbo sampler recognition, prefix rejection, Euler-safe refresh policy, and complete offline capture/replay coverage;
+- exact MiniMax H3 Turbo and native ER-SDE recognition, prefix rejection, conservative refresh policies, seeded ER-SDE replay guards, and complete offline capture/replay coverage;
 - refresh-only anchor feedback with video-only policy scoring, a `1.5` threshold, a three-refresh budget, and no retained/injected hidden residual;
 - terminal feedback-probe elimination while preserving the final rollback validation probe;
 - rollback threshold and three-correction budget enforcement;

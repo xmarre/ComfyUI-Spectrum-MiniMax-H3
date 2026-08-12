@@ -20,6 +20,7 @@ from comfyui_spectrum_h3.sampling import (
     sampler_is_supported,
     sampler_name,
     sampler_sample_wrapper,
+    sampler_supports_seeded_replay,
 )
 
 
@@ -36,6 +37,7 @@ def _sampler(function_name: str) -> SimpleNamespace:
     (
         "_turbo_sampler",
         "sample_euler",
+        "sample_er_sde",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
     ),
@@ -68,6 +70,7 @@ def test_unreviewed_sampler_names_do_not_match_by_prefix(function_name):
     (
         "_turbo_sampler",
         "sample_euler",
+        "sample_er_sde",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
     ),
@@ -84,8 +87,8 @@ def test_res_multistep_policy_refreshes_once_and_protects_tail(function_name):
     assert min_tail_actual_steps(sampler) == 3
 
 
-@pytest.mark.parametrize("function_name", ("sample_euler", "_turbo_sampler"))
-def test_euler_policy_keeps_one_refresh_and_user_tail(function_name):
+@pytest.mark.parametrize("function_name", ("sample_euler", "sample_er_sde", "_turbo_sampler"))
+def test_non_res_policy_keeps_one_refresh_and_user_tail(function_name):
     sampler = _sampler(function_name)
 
     assert min_actual_steps_after_forecast(sampler) == 1
@@ -98,6 +101,23 @@ def test_unsupported_sampler_has_no_forecast_streak_policy():
     assert max_consecutive_forecasts(sampler) is None
     assert min_actual_steps_after_forecast(sampler) == 0
     assert min_tail_actual_steps(sampler) == 0
+
+
+def test_er_sde_native_sampler_components_are_seeded_replay_safe():
+    sampler = _sampler("sample_er_sde")
+    sampler.extra_options = {"max_stage": 2, "s_noise": 0.75}
+
+    assert sampler_is_supported(sampler)
+    assert sampler_supports_seeded_replay(sampler)
+
+
+@pytest.mark.parametrize("option_name", ("noise_sampler", "noise_scaler"))
+def test_er_sde_custom_sampler_components_are_not_seeded_replay_safe(option_name):
+    sampler = _sampler("sample_er_sde")
+    sampler.extra_options = {option_name: lambda *args: args[0]}
+
+    assert sampler_is_supported(sampler)
+    assert not sampler_supports_seeded_replay(sampler)
 
 
 class _WrapperTestModel:
@@ -254,7 +274,7 @@ def test_predict_noise_passthrough_survives_a_downstream_model_bypass(caplog):
         runtime.end_run(run_id)
 
 
-@pytest.mark.parametrize("function_name", ("sample_euler", "_turbo_sampler"))
+@pytest.mark.parametrize("function_name", ("sample_euler", "sample_er_sde", "_turbo_sampler"))
 def test_default_offline_outer_sample_reports_both_passes_and_callbacks_only_replay(
     monkeypatch, function_name
 ):
@@ -529,6 +549,95 @@ def test_offline_progress_finishes_when_replay_aborts(monkeypatch):
     assert callback_arguments == []
     assert runtime.active_run_id is None
     assert runtime.offline_archive is None
+
+
+@pytest.mark.parametrize("option_name", ("noise_sampler", "noise_scaler"))
+def test_offline_er_sde_custom_sampler_components_use_true_native_bypass(
+    option_name, caplog
+):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            bootstrap_first_forecast=False,
+            offline_smoothing_replay=True,
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}}
+    )
+    sampler = _sampler("sample_er_sde")
+    sampler.extra_options = {option_name: lambda *args: args[0]}
+    calls = []
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            assert runtime.active_run_id is None
+            calls.append((args, kwargs))
+            return "native-er-sde-result"
+
+    callback = object()
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            sampler,
+            torch.tensor([1.0, 0.0]),
+            callback=callback,
+            seed=7,
+        )
+
+    assert result == "native-er-sde-result"
+    assert len(calls) == 1
+    assert calls[0][0][5] is callback
+    assert runtime.active_run_id is None
+    assert "native seeded noise_sampler and noise_scaler" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "experiment_name",
+    ("anchor_residual_feedback", "selective_rollback_correction"),
+)
+def test_er_sde_does_not_enable_unreviewed_experimental_modes(
+    experiment_name, caplog
+):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            bootstrap_first_forecast=False,
+            offline_smoothing_replay=False,
+            **{experiment_name: True},
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}}
+    )
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            assert runtime.supported_sampler
+            assert runtime.experiment_disabled_reason is not None
+            return "ordinary-spectrum-er-sde"
+
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            _sampler("sample_er_sde"),
+            torch.tensor([1.0, 0.5, 0.0]),
+            seed=7,
+        )
+
+    assert result == "ordinary-spectrum-er-sde"
+    assert runtime.active_run_id is None
+    assert "reviewed only for ordinary Spectrum and offline smoothing replay" in caplog.text
 
 
 def test_offline_unsupported_sampler_uses_true_native_bypass(caplog):

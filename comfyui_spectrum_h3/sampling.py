@@ -26,6 +26,7 @@ SUPPORTED_SINGLE_CALL_SAMPLERS = frozenset(
     {
         "_turbo_sampler",
         "sample_euler",
+        "sample_er_sde",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
     }
@@ -37,6 +38,8 @@ RES_MULTISTEP_SAMPLERS = frozenset(
         "sample_res_multistep_cfg_pp",
     }
 )
+
+ER_SDE_SAMPLERS = frozenset({"sample_er_sde"})
 
 
 @dataclass(slots=True)
@@ -51,6 +54,19 @@ def sampler_name(sampler: Any) -> str:
 
 def sampler_is_supported(sampler: Any) -> bool:
     return sampler_name(sampler) in SUPPORTED_SINGLE_CALL_SAMPLERS
+
+
+def sampler_supports_seeded_replay(sampler: Any) -> bool:
+    """Return whether a fresh invocation can reconstruct the sampler's random stream."""
+    if not sampler_is_supported(sampler):
+        return False
+    if sampler_name(sampler) not in ER_SDE_SAMPLERS:
+        return True
+
+    options = getattr(sampler, "extra_options", {}) or {}
+    if not isinstance(options, dict):
+        return False
+    return options.get("noise_sampler") is None and options.get("noise_scaler") is None
 
 
 def max_consecutive_forecasts(sampler: Any) -> int | None:
@@ -191,6 +207,13 @@ def outer_sample_wrapper(
             min_actual_steps_after_forecast=min_actual_steps_after_forecast(sampler),
             min_tail_actual_steps=min_tail_actual_steps(sampler),
         )
+        if name in ER_SDE_SAMPLERS and (
+            runtime.config.anchor_residual_feedback
+            or runtime.config.selective_rollback_correction
+        ):
+            runtime.disable_experiment(
+                "ER-SDE is reviewed only for ordinary Spectrum and offline smoothing replay"
+            )
         if runtime.config.debug:
             LOG.warning(
                 "Spectrum H3 run start phase=%s run_id=%s sampler=%s steps=%s supported=%s",
@@ -245,6 +268,22 @@ def outer_sample_wrapper(
         LOG.warning(
             "Spectrum H3 offline smoothing replay is unsupported for sampler %s; running one native pass",
             name,
+        )
+        return executor(
+            noise,
+            latent_image,
+            sampler,
+            sigmas,
+            denoise_mask,
+            callback,
+            disable_pbar,
+            seed,
+            latent_shapes=latent_shapes,
+        )
+    if not sampler_supports_seeded_replay(sampler):
+        LOG.warning(
+            "Spectrum H3 offline smoothing replay requires ER-SDE's native seeded "
+            "noise_sampler and noise_scaler; running one native pass"
         )
         return executor(
             noise,
