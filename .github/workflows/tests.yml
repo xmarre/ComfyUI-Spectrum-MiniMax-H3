@@ -56,6 +56,7 @@ jobs:
           python -m ruff check \
             comfyui_spectrum_h3/generic_correction.py \
             comfyui_spectrum_h3/nodes.py \
+            comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
             tests/test_generic_correction.py \
             tests/test_model_aware.py \
