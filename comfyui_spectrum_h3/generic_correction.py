@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from dataclasses import replace
 from typing import Any
@@ -24,6 +25,35 @@ from .runtime import SpectrumH3Runtime
 LOG = logging.getLogger(__name__)
 _EPS = torch.finfo(torch.float32).eps
 
+_RETIRED_SUMMARY_FIELDS = (
+    "model_aware_evidence_exact_head_projection_s",
+    "model_aware_subspace_gram_s",
+    "model_aware_subspace_solve_s",
+    "model_aware_subspace_workspace_bytes",
+    "model_aware_head_materialization_s",
+    "model_aware_head_materialized_bytes",
+    "model_aware_exact_head_projection_s",
+    "model_aware_exact_head_projection_calls",
+    "model_aware_exact_head_workspace_bytes",
+    "model_aware_correction_subspace",
+    "model_aware_subspace_model_comparison",
+    "model_aware_diagonal_ablation_metric",
+    "model_aware_model_comparison_metric",
+    "model_aware_head_metric_available",
+    "model_aware_subspace_bound",
+    "model_corrected_ratio_mean",
+    "model_aware_exact_head_evidence_bytes",
+)
+_RETIRED_SUMMARY_PATTERNS = (
+    r"model_aware_(?:audio|video)_model_corrected_ratio_mean",
+    r"model_aware_(?:audio|video)_diagonal\S*",
+    r"model_aware_(?:audio|video)_exact\S*",
+    r"model_aware_(?:audio|video)_generic_head_ratio_mean",
+    r"model_aware_(?:audio|video)_gain_delta\S*",
+    r"model_aware_\S*2d\S*",
+    r"model_aware_subspace_\S*",
+)
+
 
 def _tensor_rms(value: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(torch.mean(value.to(torch.float32).square()))
@@ -35,25 +65,12 @@ def _compact_head_metric(_weight: Any, _hidden_size: int):
 
 
 def _generic_telemetry(source: CorrectionGainTelemetry) -> CorrectionGainTelemetry:
-    """Collapse the rejected exact/diagonal branches onto the surviving generic gain."""
-    raw = float(source.raw_generic_gain)
-    gain = float(source.generic_gain)
-    active = bool(source.generic_bound_active)
+    """Expose only the surviving generic gain; retired candidate fields stay zero."""
     return CorrectionGainTelemetry(
         residual_projection=float(source.residual_projection),
-        diagonal_projection=float(source.residual_projection),
-        model_projection=float(source.residual_projection),
-        raw_generic_gain=raw,
-        raw_diagonal_gain=raw,
-        raw_model_gain=raw,
-        generic_gain=gain,
-        diagonal_candidate_gain=gain,
-        model_candidate_gain=gain,
-        model_gain=gain,
-        model_trust=0.0,
-        generic_bound_active=active,
-        diagonal_bound_active=active,
-        model_bound_active=active,
+        raw_generic_gain=float(source.raw_generic_gain),
+        generic_gain=float(source.generic_gain),
+        generic_bound_active=bool(source.generic_bound_active),
     )
 
 
@@ -293,16 +310,7 @@ def _generic_anchor_evidence(
             forecast_ratio=float(forecast_value),
             curvature_ratio=float(curvature_value),
             residual_projection=float(projection_value),
-            diagonal_projection=float(projection_value),
-            model_projection=float(projection_value),
-            model_corrected_ratio=float(corrected_value),
             generic_corrected_ratio=float(corrected_value),
-            diagonal_candidate_ratio=float(corrected_value),
-            model_candidate_ratio=float(corrected_value),
-            model_corrected_head_ratio=float(corrected_value),
-            generic_corrected_head_ratio=float(corrected_value),
-            diagonal_candidate_head_ratio=float(corrected_value),
-            model_candidate_head_ratio=float(corrected_value),
         )
 
     if "packed" in stream_evidence:
@@ -319,10 +327,7 @@ def _generic_anchor_evidence(
         fit_condition=fit_condition,
         audio_projection=audio.residual_projection,
         video_projection=video.residual_projection,
-        model_corrected_ratio=max(
-            audio.generic_corrected_ratio,
-            video.generic_corrected_ratio,
-        ),
+        model_corrected_ratio=0.0,
         generic_corrected_ratio=max(
             audio.generic_corrected_ratio,
             video.generic_corrected_ratio,
@@ -462,16 +467,6 @@ def _observe_anchor(
             self.stats.model_aware_evidence_fit_condition_seconds += (
                 evidence.timing.fit_condition_seconds
             )
-            self.stats.model_aware_evidence_exact_head_projection_seconds = 0.0
-            self.stats.model_aware_exact_head_projection_seconds = 0.0
-            self.stats.model_aware_exact_head_projection_calls = 0
-            self.stats.model_aware_exact_head_workspace_bytes = 0
-            self.stats.model_aware_subspace_gram_seconds = 0.0
-            self.stats.model_aware_subspace_solve_seconds = 0.0
-            self.stats.model_aware_subspace_workspace_bytes = 0
-            self.stats.model_aware_model_corrected_ratio_mean = (
-                self.model_aware.generic_corrected_ratio_mean
-            )
             self.stats.model_aware_generic_corrected_ratio_mean = (
                 self.model_aware.generic_corrected_ratio_mean
             )
@@ -507,21 +502,25 @@ def _start_run(self: SpectrumH3Runtime, *args, **kwargs):
     return run_id
 
 
+def _remove_summary_field(summary: str, field_pattern: str) -> str:
+    return re.sub(
+        rf"(?<!\S){field_pattern}=\S+\s*",
+        "",
+        summary,
+    )
+
+
 def _debug_summary(self: SpectrumH3Runtime) -> str:
     summary = _ORIGINAL_RUNTIME_DEBUG_SUMMARY(self)
-    replacements = {
-        "model_aware_correction_subspace=two_causal_actual_deltas": (
-            "model_aware_correction_subspace=retired_k2_inactive"
-        ),
-        "model_aware_subspace_model_comparison=exact_2d_vs_generic_2d_head_rms": (
-            "model_aware_subspace_model_comparison=retired_k2_inactive"
-        ),
-        "model_aware_subspace_bound=radial_rational_softsign_0.25": (
-            "model_aware_subspace_bound=retired_k2_inactive"
-        ),
-    }
-    for old, new in replacements.items():
-        summary = summary.replace(old, new)
+    summary = summary.replace(
+        "model_aware_correction_metric=final_layer_exact_linear_head_space",
+        "model_aware_correction_metric=generic_latest_delta_hidden_residual_projection",
+    )
+    for field in _RETIRED_SUMMARY_FIELDS:
+        summary = _remove_summary_field(summary, re.escape(field))
+    for pattern in _RETIRED_SUMMARY_PATTERNS:
+        summary = _remove_summary_field(summary, pattern)
+    summary = " ".join(summary.split())
     return (
         f"{summary} "
         "feature3_model_informed_correction=retired_no_material_gain "
