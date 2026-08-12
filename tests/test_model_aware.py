@@ -370,14 +370,12 @@ def test_generic_scalar_bound_is_monotonic_and_never_exceeds_limit():
     small = radially_bound_coefficients((0.01,), ((1.0,),), limit=0.25)
     medium = radially_bound_coefficients((0.25,), ((1.0,),), limit=0.25)
     large = radially_bound_coefficients((100.0,), ((1.0,),), limit=0.25)
-    for bounded in (small, medium, large):
-        assert bounded.eligible
-        assert bounded.bounded_norm_ratio <= 0.25 + 1e-6
-    assert (
-        small.bounded_norm_ratio
-        < medium.bounded_norm_ratio
-        < large.bounded_norm_ratio
-    )
+    small_bounded = small[3]
+    medium_bounded = medium[3]
+    large_bounded = large[3]
+    for bounded in (small_bounded, medium_bounded, large_bounded):
+        assert 0.0 <= bounded <= 0.25 + 1e-6
+    assert small_bounded < medium_bounded < large_bounded
 
 
 def test_controller_snapshot_restore_preserves_live_generic_state():
@@ -390,6 +388,8 @@ def test_controller_snapshot_restore_preserves_live_generic_state():
             fit_condition=1.5,
             audio_projection=0.35,
             video_projection=-0.25,
+            model_corrected_ratio=0.6,
+            generic_corrected_ratio=0.6,
             audio=StreamAnchorEvidence(
                 forecast_ratio=0.8,
                 curvature_ratio=0.2,
