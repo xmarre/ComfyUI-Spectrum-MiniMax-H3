@@ -19,6 +19,8 @@ class _HistoryEntry:
 @dataclass(slots=True)
 class ForecasterSnapshot:
     history: list[_HistoryEntry]
+    evidence_history: list[dict[str, torch.Tensor]]
+    evidence_segments: tuple[tuple[str, int, int], ...] | None
     feature_shape: tuple[int, ...] | None
     feature_dtype: torch.dtype | None
     history_device: torch.device | None
@@ -65,6 +67,8 @@ class HistoryWeightForecaster:
 
     def reset(self) -> None:
         self._history: list[_HistoryEntry] = []
+        self._evidence_history: list[dict[str, torch.Tensor]] = []
+        self._evidence_segments: tuple[tuple[str, int, int], ...] | None = None
         self._feature_shape: tuple[int, ...] | None = None
         self._feature_dtype: torch.dtype | None = None
         self._history_device: torch.device | None = None
@@ -82,6 +86,8 @@ class HistoryWeightForecaster:
     def snapshot(self) -> ForecasterSnapshot:
         return ForecasterSnapshot(
             history=list(self._history),
+            evidence_history=[dict(entry) for entry in self._evidence_history],
+            evidence_segments=self._evidence_segments,
             feature_shape=self._feature_shape,
             feature_dtype=self._feature_dtype,
             history_device=self._history_device,
@@ -97,6 +103,8 @@ class HistoryWeightForecaster:
         if not isinstance(snapshot, ForecasterSnapshot):
             raise TypeError("snapshot must be a ForecasterSnapshot")
         self._history = list(snapshot.history)
+        self._evidence_history = [dict(entry) for entry in snapshot.evidence_history]
+        self._evidence_segments = snapshot.evidence_segments
         self._feature_shape = snapshot.feature_shape
         self._feature_dtype = snapshot.feature_dtype
         self._history_device = snapshot.history_device
@@ -136,12 +144,25 @@ class HistoryWeightForecaster:
     @property
     def persistent_tensor_bytes(self) -> int:
         tensors = [entry.feature_flat for entry in self._history]
+        tensors.extend(
+            sample
+            for entry in self._evidence_history
+            for sample in entry.values()
+        )
         tensors.extend(t for t in (self._design, self._cholesky) if t is not None)
         return sum(t.numel() * t.element_size() for t in tensors)
 
     @property
     def history_tensor_bytes(self) -> int:
         return sum(entry.feature_flat.numel() * entry.feature_flat.element_size() for entry in self._history)
+
+    @property
+    def evidence_tensor_bytes(self) -> int:
+        return sum(
+            sample.numel() * sample.element_size()
+            for entry in self._evidence_history
+            for sample in entry.values()
+        )
 
     def ready(self, minimum: int | None = None) -> bool:
         required = max(2, self.degree + 1, int(minimum or 0))
@@ -157,7 +178,14 @@ class HistoryWeightForecaster:
             columns.append(2.0 * x * columns[-1] - columns[-2])
         return torch.cat(columns[: degree + 1], dim=1)
 
-    def update(self, coordinate: float, feature: torch.Tensor, *, take_ownership: bool = False) -> None:
+    def update(
+        self,
+        coordinate: float,
+        feature: torch.Tensor,
+        *,
+        take_ownership: bool = False,
+        evidence_segments: Sequence[tuple[str, int, int]] | None = None,
+    ) -> None:
         if not torch.is_tensor(feature) or not feature.dtype.is_floating_point:
             raise ValueError("Spectrum history features must be floating-point tensors")
         shape = tuple(int(v) for v in feature.shape)
@@ -172,6 +200,31 @@ class HistoryWeightForecaster:
             raise ValueError(f"feature dtype changed from {self._feature_dtype} to {feature.dtype}")
 
         detached = feature.detach()
+        sampled_evidence = None
+        normalized_segments = None
+        clear_evidence = evidence_segments is None and bool(self._evidence_history)
+        if evidence_segments is not None:
+            normalized_segments = tuple(
+                (str(name), int(start), int(end))
+                for name, start, end in evidence_segments
+            )
+            if (
+                self._evidence_segments is not None
+                and normalized_segments != self._evidence_segments
+            ):
+                raise ValueError("model-aware evidence segments changed during actual history")
+            if self._history and len(self._evidence_history) != len(self._history):
+                raise ValueError("model-aware evidence sampling cannot start after history")
+            if any(
+                sample.device != detached.device
+                for entry in self._evidence_history
+                for sample in entry.values()
+            ):
+                raise ValueError("model-aware evidence device changed during actual history")
+            sampled_evidence = {
+                name: self._sample_segment_device(detached, start, end)
+                for name, start, end in normalized_segments
+            }
         storage_device = torch.device("cpu") if self.history_storage == "system_ram" else detached.device
         if self._history_device is None:
             self._history_device = storage_device
@@ -187,8 +240,16 @@ class HistoryWeightForecaster:
                 .reshape(-1)
             )
         self._history.append(_HistoryEntry(float(coordinate), archived))
+        if sampled_evidence is not None:
+            self._evidence_segments = normalized_segments
+            self._evidence_history.append(sampled_evidence)
+        elif clear_evidence:
+            self._evidence_history.clear()
+            self._evidence_segments = None
         if len(self._history) > self.max_history:
             self._history.pop(0)
+            if self._evidence_history:
+                self._evidence_history.pop(0)
         self._generation += 1
         self._design = None
         self._cholesky = None
@@ -359,14 +420,13 @@ class HistoryWeightForecaster:
         return condition if math.isfinite(condition) else float("inf")
 
     @staticmethod
-    def _sample_segment_with_timing(
+    def _sample_segment_device(
         feature: torch.Tensor,
         start_row: int,
         end_row: int,
         *,
         limit: int = 4096,
-    ) -> tuple[torch.Tensor, float, float]:
-        selection_started = time.perf_counter()
+    ) -> torch.Tensor:
         selected = []
         per_branch = max(1, int(limit) // max(1, int(feature.shape[0])))
         for branch in range(int(feature.shape[0])):
@@ -374,55 +434,67 @@ class HistoryWeightForecaster:
             if flat.numel() == 0:
                 continue
             stride = max(1, flat.numel() // per_branch)
-            selected.append(flat[::stride][:per_branch])
-        selection_seconds = time.perf_counter() - selection_started
+            selected.append(flat[::stride][:per_branch].to(torch.float32))
         if not selected:
             raise ValueError("cannot sample an empty feature segment")
-        transfer_started = time.perf_counter()
-        samples = [
-            sample.to(device="cpu", dtype=torch.float32)
-            for sample in selected
-        ]
-        result = torch.cat(samples)
-        transfer_seconds = time.perf_counter() - transfer_started
-        return result, selection_seconds, transfer_seconds
+        return torch.cat(selected).contiguous()
 
-    @classmethod
-    def _sample_segment(
-        cls,
-        feature: torch.Tensor,
+    @staticmethod
+    def _sample_channel_sensitivity(
+        feature_shape: tuple[int, ...],
         start_row: int,
         end_row: int,
+        sensitivity: torch.Tensor,
         *,
         limit: int = 4096,
     ) -> torch.Tensor:
-        sampled, _, _ = cls._sample_segment_with_timing(
-            feature,
-            start_row,
-            end_row,
-            limit=limit,
-        )
-        return sampled
+        hidden = int(feature_shape[-1])
+        if sensitivity.ndim != 1 or int(sensitivity.shape[0]) != hidden:
+            raise ValueError("FinalLayer head sensitivity does not match the cached hidden width")
+        branch_count = int(feature_shape[0])
+        flat_elements = (int(end_row) - int(start_row)) * hidden
+        per_branch = max(1, int(limit) // max(1, branch_count))
+        stride = max(1, flat_elements // per_branch)
+        positions = torch.arange(
+            0,
+            flat_elements,
+            stride,
+            device=sensitivity.device,
+        )[:per_branch]
+        sampled = sensitivity.index_select(0, positions.remainder(hidden))
+        return sampled.repeat(branch_count).contiguous()
 
     def sampled_anchor_evidence(
         self,
         coordinate: float,
         actual_feature: torch.Tensor,
-        stream_parameters: Sequence[tuple[str, int, int, float, float, float]],
+        stream_parameters: Sequence[tuple[str, int, int, float, float, float, float]],
         *,
         degree: int,
         ridge_lambda: float,
+        stream_sensitivities: dict[str, torch.Tensor] | None = None,
+        sensitivity_transfer_seconds: float = 0.0,
     ) -> AnchorEvidence | None:
         if len(self._history) < 2 or self._feature_shape is None:
             return None
         if tuple(actual_feature.shape) != self._feature_shape:
             raise ValueError("actual feature shape changed during model-aware evidence sampling")
+        if len(self._evidence_history) != len(self._history):
+            raise RuntimeError("device-local model-aware evidence history is not aligned")
         stream_evidence: dict[str, StreamAnchorEvidence] = {}
         weight_fit_seconds = 0.0
         sample_index_seconds = 0.0
-        device_transfer_seconds = 0.0
+        scalar_transfer_seconds = 0.0
         reduction_seconds = 0.0
-        for name, start, end, blend, model_gain, generic_gain in stream_parameters:
+        for (
+            name,
+            start,
+            end,
+            blend,
+            model_gain,
+            generic_gain,
+            model_candidate_gain,
+        ) in stream_parameters:
             fit_started = time.perf_counter()
             raw_weights = self.model_aware_weights(
                 coordinate,
@@ -432,23 +504,29 @@ class HistoryWeightForecaster:
                 correction_gain=0.0,
             )
             weight_fit_seconds += time.perf_counter() - fit_started
-            history_samples = []
-            for entry in self._history:
-                sampled, selection_seconds, transfer_seconds = self._sample_segment_with_timing(
-                    entry.feature_flat.reshape(self._feature_shape),
-                    int(start),
-                    int(end),
-                )
-                history_samples.append(sampled)
-                sample_index_seconds += selection_seconds
-                device_transfer_seconds += transfer_seconds
-            actual, selection_seconds, transfer_seconds = self._sample_segment_with_timing(
+            history_samples = [entry[str(name)] for entry in self._evidence_history]
+            selection_started = time.perf_counter()
+            actual = self._sample_segment_device(
                 actual_feature,
                 int(start),
                 int(end),
             )
-            sample_index_seconds += selection_seconds
-            device_transfer_seconds += transfer_seconds
+            if any(sample.device != actual.device for sample in history_samples):
+                raise RuntimeError("model-aware evidence device changed during actual history")
+            sensitivity = None if stream_sensitivities is None else stream_sensitivities.get(str(name))
+            if sensitivity is not None and sensitivity.device != actual.device:
+                raise ValueError("FinalLayer head sensitivity is on the wrong evidence device")
+            sampled_sensitivity = (
+                None
+                if sensitivity is None
+                else self._sample_channel_sensitivity(
+                    self._feature_shape,
+                    int(start),
+                    int(end),
+                    sensitivity,
+                )
+            )
+            sample_index_seconds += time.perf_counter() - selection_started
             reduction_started = time.perf_counter()
             predicted = torch.zeros_like(actual)
             for weight, sample in zip(raw_weights.tolist(), history_samples, strict=True):
@@ -458,38 +536,105 @@ class HistoryWeightForecaster:
             previous = history_samples[-2]
             delta = latest - previous
             residual = actual - predicted
-            epsilon = max(float(torch.sqrt(torch.mean(actual.square())).item()) * 1e-6, torch.finfo(torch.float32).eps)
-            forecast_rms = float(torch.sqrt(torch.mean(residual.square())).item())
-            hold_rms = float(torch.sqrt(torch.mean((actual - latest).square())).item())
-            denominator = float(torch.dot(delta, delta).item())
-            dot_epsilon = epsilon * epsilon * max(1, int(delta.numel()))
-            projection = float(torch.dot(residual, delta).item()) / max(denominator, dot_epsilon)
-            forecast_ratio = forecast_rms / max(hold_rms, epsilon)
+            epsilon = torch.sqrt(torch.mean(actual.square())).mul(1e-6).clamp_min(
+                torch.finfo(torch.float32).eps
+            )
+            hold_error = actual - latest
+            hold_rms = torch.sqrt(torch.mean(hold_error.square())).clamp_min(epsilon)
+            forecast_rms = torch.sqrt(torch.mean(residual.square()))
+            dot_epsilon = epsilon.square() * max(1, int(delta.numel()))
+            projection = torch.dot(residual, delta) / torch.dot(delta, delta).clamp_min(
+                dot_epsilon
+            )
+            if sampled_sensitivity is None:
+                model_projection = projection
+            else:
+                weighted_delta = sampled_sensitivity * delta
+                model_projection = torch.dot(residual, weighted_delta) / torch.dot(
+                    delta,
+                    weighted_delta,
+                ).clamp_min(dot_epsilon)
+            forecast_ratio = forecast_rms / hold_rms
             model_predicted = predicted + float(model_gain) * delta
             generic_predicted = predicted + float(generic_gain) * delta
-            model_ratio = (
-                float(torch.sqrt(torch.mean((actual - model_predicted).square())).item())
-                / max(hold_rms, epsilon)
+            model_candidate_predicted = predicted + float(model_candidate_gain) * delta
+            model_error = actual - model_predicted
+            generic_error = actual - generic_predicted
+            model_candidate_error = actual - model_candidate_predicted
+            model_ratio = torch.sqrt(torch.mean(model_error.square())) / hold_rms
+            generic_ratio = torch.sqrt(torch.mean(generic_error.square())) / hold_rms
+            model_candidate_ratio = (
+                torch.sqrt(torch.mean(model_candidate_error.square())) / hold_rms
             )
-            generic_ratio = (
-                float(torch.sqrt(torch.mean((actual - generic_predicted).square())).item())
-                / max(hold_rms, epsilon)
-            )
+            if sampled_sensitivity is None:
+                model_head_ratio = model_ratio
+                generic_head_ratio = generic_ratio
+                model_candidate_head_ratio = model_candidate_ratio
+            else:
+                sensitivity_sum = sampled_sensitivity.sum().clamp_min(
+                    torch.finfo(torch.float32).eps
+                )
+                weighted_hold_rms = torch.sqrt(
+                    torch.sum(sampled_sensitivity * hold_error.square()) / sensitivity_sum
+                ).clamp_min(epsilon)
+                model_head_ratio = torch.sqrt(
+                    torch.sum(sampled_sensitivity * model_error.square()) / sensitivity_sum
+                ) / weighted_hold_rms
+                generic_head_ratio = torch.sqrt(
+                    torch.sum(sampled_sensitivity * generic_error.square()) / sensitivity_sum
+                ) / weighted_hold_rms
+                model_candidate_head_ratio = torch.sqrt(
+                    torch.sum(sampled_sensitivity * model_candidate_error.square())
+                    / sensitivity_sum
+                ) / weighted_hold_rms
             if len(history_samples) >= 3:
                 curvature = latest - 2.0 * previous + history_samples[-3]
-                curvature_rms = float(torch.sqrt(torch.mean(curvature.square())).item())
-                delta_rms = float(torch.sqrt(torch.mean(delta.square())).item())
-                curvature_ratio = curvature_rms / max(delta_rms, epsilon)
+                curvature_ratio = torch.sqrt(torch.mean(curvature.square())) / torch.sqrt(
+                    torch.mean(delta.square())
+                ).clamp_min(epsilon)
             else:
-                curvature_ratio = 0.0
-            stream_evidence[str(name)] = StreamAnchorEvidence(
-                forecast_ratio=forecast_ratio,
-                curvature_ratio=curvature_ratio,
-                residual_projection=projection,
-                model_corrected_ratio=model_ratio,
-                generic_corrected_ratio=generic_ratio,
+                curvature_ratio = torch.zeros((), dtype=torch.float32, device=actual.device)
+            scalar_values = torch.stack(
+                (
+                    forecast_ratio,
+                    curvature_ratio,
+                    projection,
+                    model_projection,
+                    model_ratio,
+                    generic_ratio,
+                    model_candidate_ratio,
+                    model_head_ratio,
+                    generic_head_ratio,
+                    model_candidate_head_ratio,
+                )
             )
             reduction_seconds += time.perf_counter() - reduction_started
+            transfer_started = time.perf_counter()
+            (
+                forecast_ratio_value,
+                curvature_ratio_value,
+                projection_value,
+                model_projection_value,
+                model_ratio_value,
+                generic_ratio_value,
+                model_candidate_ratio_value,
+                model_head_ratio_value,
+                generic_head_ratio_value,
+                model_candidate_head_ratio_value,
+            ) = scalar_values.detach().to(device="cpu").tolist()
+            scalar_transfer_seconds += time.perf_counter() - transfer_started
+            stream_evidence[str(name)] = StreamAnchorEvidence(
+                forecast_ratio=forecast_ratio_value,
+                curvature_ratio=curvature_ratio_value,
+                residual_projection=projection_value,
+                model_corrected_ratio=model_ratio_value,
+                generic_corrected_ratio=generic_ratio_value,
+                model_projection=model_projection_value,
+                model_candidate_ratio=model_candidate_ratio_value,
+                model_corrected_head_ratio=model_head_ratio_value,
+                generic_corrected_head_ratio=generic_head_ratio_value,
+                model_candidate_head_ratio=model_candidate_head_ratio_value,
+            )
         if "packed" in stream_evidence:
             audio = video = stream_evidence["packed"]
         else:
@@ -502,8 +647,13 @@ class HistoryWeightForecaster:
                 evidence.forecast_ratio,
                 evidence.curvature_ratio,
                 evidence.residual_projection,
+                evidence.model_projection,
                 evidence.model_corrected_ratio,
                 evidence.generic_corrected_ratio,
+                evidence.model_candidate_ratio,
+                evidence.model_corrected_head_ratio,
+                evidence.generic_corrected_head_ratio,
+                evidence.model_candidate_head_ratio,
             )
         ]
         if not values or not all(math.isfinite(value) for value in values):
@@ -530,7 +680,11 @@ class HistoryWeightForecaster:
             timing=AnchorEvidenceTiming(
                 weight_fit_seconds=weight_fit_seconds,
                 sample_index_seconds=sample_index_seconds,
-                device_transfer_seconds=device_transfer_seconds,
+                device_transfer_seconds=(
+                    float(sensitivity_transfer_seconds) + scalar_transfer_seconds
+                ),
+                sensitivity_transfer_seconds=float(sensitivity_transfer_seconds),
+                scalar_transfer_seconds=scalar_transfer_seconds,
                 reduction_seconds=reduction_seconds,
                 fit_condition_seconds=fit_condition_seconds,
             ),

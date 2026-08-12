@@ -33,6 +33,8 @@ class ModelForecastabilityProfile:
     final_block_perturbation: float
     audio_sensitivity: float
     video_sensitivity: float
+    audio_head_gram_diagonal: torch.Tensor | None
+    video_head_gram_diagonal: torch.Tensor | None
     forecast_risk_prior: float
     build_seconds: float
     estimated_bytes: int
@@ -49,19 +51,26 @@ class ProfileLookup:
 @dataclass(frozen=True, slots=True)
 class CorrectionGainTelemetry:
     residual_projection: float = 0.0
+    model_projection: float = 0.0
     raw_generic_gain: float = 0.0
     raw_model_gain: float = 0.0
     generic_gain: float = 0.0
+    model_candidate_gain: float = 0.0
     model_gain: float = 0.0
-    generic_saturated: bool = False
-    model_saturated: bool = False
+    model_trust: float = 0.0
+    generic_bound_active: bool = False
+    model_bound_active: bool = False
 
     @property
-    def pre_clamp_delta(self) -> float:
+    def pre_bound_delta(self) -> float:
         return self.raw_model_gain - self.raw_generic_gain
 
     @property
-    def post_clamp_delta(self) -> float:
+    def post_bound_delta(self) -> float:
+        return self.model_candidate_gain - self.generic_gain
+
+    @property
+    def applied_delta(self) -> float:
         return self.model_gain - self.generic_gain
 
 
@@ -95,6 +104,11 @@ class StreamAnchorEvidence:
     residual_projection: float = 0.0
     model_corrected_ratio: float = 0.0
     generic_corrected_ratio: float = 0.0
+    model_projection: float = 0.0
+    model_candidate_ratio: float = 0.0
+    model_corrected_head_ratio: float = 0.0
+    generic_corrected_head_ratio: float = 0.0
+    model_candidate_head_ratio: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +116,8 @@ class AnchorEvidenceTiming:
     weight_fit_seconds: float = 0.0
     sample_index_seconds: float = 0.0
     device_transfer_seconds: float = 0.0
+    sensitivity_transfer_seconds: float = 0.0
+    scalar_transfer_seconds: float = 0.0
     reduction_seconds: float = 0.0
     fit_condition_seconds: float = 0.0
 
@@ -141,6 +157,14 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     if not math.isfinite(value):
         return high
     return max(low, min(high, float(value)))
+
+
+def _soft_limit(value: float, limit: float) -> float:
+    resolved = float(value)
+    bound = float(limit)
+    if not math.isfinite(resolved) or not math.isfinite(bound) or bound <= 0.0:
+        raise ValueError("soft limit requires a finite value and positive finite bound")
+    return resolved / (1.0 + abs(resolved) / bound)
 
 
 def _locate_inner(model_patcher: Any) -> Any | None:
@@ -382,6 +406,25 @@ def _operator_gain(weight: Any) -> tuple[float | None, int]:
     return rms * math.sqrt(max(1, in_features)), samples
 
 
+def _head_gram_diagonal(weight: Any, hidden_size: int) -> torch.Tensor | None:
+    if (
+        not torch.is_tensor(weight)
+        or not weight.dtype.is_floating_point
+        or weight.device.type == "meta"
+        or weight.ndim != 2
+        or int(weight.shape[1]) != int(hidden_size)
+    ):
+        return None
+    try:
+        diagonal = weight.detach().to(torch.float32).square().sum(dim=0)
+        mean = diagonal.mean()
+        if not bool(torch.isfinite(diagonal).all().item()) or float(mean.item()) <= 0.0:
+            return None
+        return (diagonal / mean).to(device="cpu", dtype=torch.float32, copy=True).contiguous()
+    except (RuntimeError, TypeError):
+        return None
+
+
 def _get_base_weight(model_patcher: Any, key: str) -> Any | None:
     backup = (getattr(model_patcher, "backup", {}) or {}).get(key)
     if backup is not None:
@@ -516,6 +559,15 @@ def _build_profile(model_patcher: Any, inner: Any, cache_key: tuple[Any, ...]) -
     stream_mean = max((audio_gain + video_gain) * 0.5, 1e-12)
     audio_sensitivity = _clamp(audio_gain / stream_mean, 0.25, 2.0)
     video_sensitivity = _clamp(video_gain / stream_mean, 0.25, 2.0)
+    hidden_size = int(getattr(inner, "hidden_size", 0))
+    audio_head_gram = _head_gram_diagonal(
+        _get_base_weight(model_patcher, "diffusion_model.final_layer.audio_out.weight"),
+        hidden_size,
+    )
+    video_head_gram = _head_gram_diagonal(
+        _get_base_weight(model_patcher, "diffusion_model.final_layer.video_out.weight"),
+        hidden_size,
+    )
 
     patches = getattr(model_patcher, "patches", {}) or {}
     _, injection_adapters = _injection_metadata(model_patcher, inner)
@@ -675,12 +727,26 @@ def _build_profile(model_patcher: Any, inner: Any, cache_key: tuple[Any, ...]) -
         final_block_perturbation=final_perturbation,
         audio_sensitivity=audio_sensitivity,
         video_sensitivity=video_sensitivity,
+        audio_head_gram_diagonal=audio_head_gram,
+        video_head_gram_diagonal=video_head_gram,
         forecast_risk_prior=forecast_risk_prior,
         build_seconds=elapsed,
-        # Samples and low-rank Gram matrices are temporary; the LRU retains
-        # only this immutable scalar/string record.
-        estimated_bytes=max(512, min(4096, 512 + 16 * len(cache_key))),
-        transient_workspace_bytes=int(transient_workspace_bytes),
+        estimated_bytes=(
+            max(512, min(4096, 512 + 16 * len(cache_key)))
+            + sum(
+                value.numel() * value.element_size()
+                for value in (audio_head_gram, video_head_gram)
+                if value is not None
+            )
+        ),
+        transient_workspace_bytes=max(
+            int(transient_workspace_bytes),
+            sum(
+                value.numel() * value.element_size()
+                for value in (audio_head_gram, video_head_gram)
+                if value is not None
+            ),
+        ),
     )
 
 
@@ -713,6 +779,7 @@ class ModelAwareController:
         self.reset()
 
     def reset(self) -> None:
+        self._sensitivity_device_cache: dict[tuple[str, str], torch.Tensor] = {}
         self.anchor_count = 0
         self.forecast_ratio_ewma = 1.0
         self.curvature_ratio_ewma = 0.0
@@ -724,19 +791,53 @@ class ModelAwareController:
         self.ablation_count = 0
         self.stream_evidence_count = 0
         for stream in ("audio", "video"):
+            setattr(self, f"{stream}_model_projection_ewma", 0.0)
+            setattr(self, f"{stream}_model_trust", 0.5)
+            setattr(self, f"{stream}_model_comparison_count", 0)
+            setattr(self, f"{stream}_model_candidate_win_count", 0)
+            setattr(self, f"{stream}_model_candidate_loss_count", 0)
             setattr(self, f"{stream}_forecast_ratio_sum", 0.0)
             setattr(self, f"{stream}_forecast_ratio_max", 0.0)
             setattr(self, f"{stream}_model_corrected_ratio_sum", 0.0)
             setattr(self, f"{stream}_generic_corrected_ratio_sum", 0.0)
-            setattr(self, f"{stream}_model_gain_clamp_count", 0)
-            setattr(self, f"{stream}_generic_gain_clamp_count", 0)
+            setattr(self, f"{stream}_model_candidate_ratio_sum", 0.0)
+            setattr(self, f"{stream}_model_corrected_head_ratio_sum", 0.0)
+            setattr(self, f"{stream}_generic_corrected_head_ratio_sum", 0.0)
+            setattr(self, f"{stream}_model_candidate_head_ratio_sum", 0.0)
+            setattr(self, f"{stream}_model_bound_active_count", 0)
+            setattr(self, f"{stream}_generic_bound_active_count", 0)
             setattr(self, f"{stream}_gain_delta_pre_abs_sum", 0.0)
             setattr(self, f"{stream}_gain_delta_pre_abs_max", 0.0)
             setattr(self, f"{stream}_gain_delta_post_abs_sum", 0.0)
             setattr(self, f"{stream}_gain_delta_post_abs_max", 0.0)
+            setattr(self, f"{stream}_gain_delta_applied_abs_sum", 0.0)
+            setattr(self, f"{stream}_gain_delta_applied_abs_max", 0.0)
 
     def set_profile(self, profile: ModelForecastabilityProfile | None) -> None:
         self.profile = profile
+        self._sensitivity_device_cache.clear()
+
+    def channel_sensitivity(
+        self,
+        stream: str,
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, float]:
+        if stream not in {"audio", "video"}:
+            raise ValueError("stream must be 'audio' or 'video'")
+        if self.profile is None:
+            return None, 0.0
+        source = getattr(self.profile, f"{stream}_head_gram_diagonal")
+        if source is None:
+            return None, 0.0
+        key = (stream, str(device))
+        cached = self._sensitivity_device_cache.get(key)
+        if cached is not None:
+            return cached, 0.0
+        started = time.perf_counter()
+        materialized = source.to(device=device, dtype=torch.float32, copy=True).contiguous()
+        elapsed = time.perf_counter() - started
+        self._sensitivity_device_cache[key] = materialized
+        return materialized, elapsed
 
     def snapshot(self) -> dict[str, float | int]:
         state = {
@@ -752,17 +853,34 @@ class ModelAwareController:
             "stream_evidence_count": self.stream_evidence_count,
         }
         for stream in ("audio", "video"):
+            state[f"{stream}_model_projection_ewma"] = getattr(
+                self, f"{stream}_model_projection_ewma"
+            )
+            state[f"{stream}_model_trust"] = getattr(self, f"{stream}_model_trust")
             for suffix in (
                 "forecast_ratio_sum",
                 "forecast_ratio_max",
                 "model_corrected_ratio_sum",
                 "generic_corrected_ratio_sum",
-                "model_gain_clamp_count",
-                "generic_gain_clamp_count",
+                "model_candidate_ratio_sum",
+                "model_corrected_head_ratio_sum",
+                "generic_corrected_head_ratio_sum",
+                "model_candidate_head_ratio_sum",
+                "model_bound_active_count",
+                "generic_bound_active_count",
                 "gain_delta_pre_abs_sum",
                 "gain_delta_pre_abs_max",
                 "gain_delta_post_abs_sum",
                 "gain_delta_post_abs_max",
+                "gain_delta_applied_abs_sum",
+                "gain_delta_applied_abs_max",
+            ):
+                key = f"{stream}_{suffix}"
+                state[key] = getattr(self, key)
+            for suffix in (
+                "model_comparison_count",
+                "model_candidate_win_count",
+                "model_candidate_loss_count",
             ):
                 key = f"{stream}_{suffix}"
                 state[key] = getattr(self, key)
@@ -780,19 +898,42 @@ class ModelAwareController:
         self.ablation_count = int(state["ablation_count"])
         self.stream_evidence_count = int(state["stream_evidence_count"])
         for stream in ("audio", "video"):
+            setattr(
+                self,
+                f"{stream}_model_projection_ewma",
+                float(state[f"{stream}_model_projection_ewma"]),
+            )
+            setattr(
+                self,
+                f"{stream}_model_trust",
+                float(state[f"{stream}_model_trust"]),
+            )
             for suffix in (
                 "forecast_ratio_sum",
                 "forecast_ratio_max",
                 "model_corrected_ratio_sum",
                 "generic_corrected_ratio_sum",
+                "model_candidate_ratio_sum",
+                "model_corrected_head_ratio_sum",
+                "generic_corrected_head_ratio_sum",
+                "model_candidate_head_ratio_sum",
                 "gain_delta_pre_abs_sum",
                 "gain_delta_pre_abs_max",
                 "gain_delta_post_abs_sum",
                 "gain_delta_post_abs_max",
+                "gain_delta_applied_abs_sum",
+                "gain_delta_applied_abs_max",
             ):
                 key = f"{stream}_{suffix}"
                 setattr(self, key, float(state[key]))
-            for suffix in ("model_gain_clamp_count", "generic_gain_clamp_count"):
+            for suffix in ("model_bound_active_count", "generic_bound_active_count"):
+                key = f"{stream}_{suffix}"
+                setattr(self, key, int(state[key]))
+            for suffix in (
+                "model_comparison_count",
+                "model_candidate_win_count",
+                "model_candidate_loss_count",
+            ):
                 key = f"{stream}_{suffix}"
                 setattr(self, key, int(state[key]))
 
@@ -818,8 +959,13 @@ class ModelAwareController:
                 stream_evidence.forecast_ratio,
                 stream_evidence.curvature_ratio,
                 stream_evidence.residual_projection,
+                stream_evidence.model_projection,
                 stream_evidence.model_corrected_ratio,
                 stream_evidence.generic_corrected_ratio,
+                stream_evidence.model_candidate_ratio,
+                stream_evidence.model_corrected_head_ratio,
+                stream_evidence.generic_corrected_head_ratio,
+                stream_evidence.model_candidate_head_ratio,
             )
             if not all(math.isfinite(float(value)) for value in values):
                 raise ValueError("per-stream model-aware evidence is nonfinite")
@@ -827,10 +973,13 @@ class ModelAwareController:
                 math.isfinite(value)
                 for value in (
                     correction.residual_projection,
+                    correction.model_projection,
                     correction.raw_generic_gain,
                     correction.raw_model_gain,
                     correction.generic_gain,
+                    correction.model_candidate_gain,
                     correction.model_gain,
+                    correction.model_trust,
                 )
             ):
                 raise ValueError("model-aware correction telemetry is nonfinite")
@@ -844,11 +993,13 @@ class ModelAwareController:
         self.fit_condition_ewma = (1.0 - alpha) * self.fit_condition_ewma + alpha * max(
             1.0, min(float(evidence.fit_condition), 1e8)
         )
-        self.audio_projection_ewma = (1.0 - alpha) * self.audio_projection_ewma + alpha * _clamp(
-            evidence.audio_projection, -2.0, 2.0
+        self.audio_projection_ewma = (
+            (1.0 - alpha) * self.audio_projection_ewma
+            + alpha * _soft_limit(evidence.audio_projection, 2.0)
         )
-        self.video_projection_ewma = (1.0 - alpha) * self.video_projection_ewma + alpha * _clamp(
-            evidence.video_projection, -2.0, 2.0
+        self.video_projection_ewma = (
+            (1.0 - alpha) * self.video_projection_ewma
+            + alpha * _soft_limit(evidence.video_projection, 2.0)
         )
         if math.isfinite(evidence.model_corrected_ratio) and math.isfinite(evidence.generic_corrected_ratio):
             self.model_corrected_ratio_sum += evidence.model_corrected_ratio
@@ -858,6 +1009,13 @@ class ModelAwareController:
             forecast_ratio = float(stream_evidence.forecast_ratio)
             model_ratio = float(stream_evidence.model_corrected_ratio)
             generic_ratio = float(stream_evidence.generic_corrected_ratio)
+            model_projection_name = f"{stream}_model_projection_ewma"
+            setattr(
+                self,
+                model_projection_name,
+                (1.0 - alpha) * getattr(self, model_projection_name)
+                + alpha * _soft_limit(stream_evidence.model_projection, 2.0),
+            )
             setattr(
                 self,
                 f"{stream}_forecast_ratio_sum",
@@ -878,27 +1036,63 @@ class ModelAwareController:
                 f"{stream}_generic_corrected_ratio_sum",
                 getattr(self, f"{stream}_generic_corrected_ratio_sum") + generic_ratio,
             )
+            for suffix, value in (
+                ("model_candidate_ratio_sum", stream_evidence.model_candidate_ratio),
+                ("model_corrected_head_ratio_sum", stream_evidence.model_corrected_head_ratio),
+                ("generic_corrected_head_ratio_sum", stream_evidence.generic_corrected_head_ratio),
+                ("model_candidate_head_ratio_sum", stream_evidence.model_candidate_head_ratio),
+            ):
+                name = f"{stream}_{suffix}"
+                setattr(self, name, getattr(self, name) + float(value))
             if correction is not None:
-                if correction.model_saturated:
+                if correction.model_bound_active:
                     setattr(
                         self,
-                        f"{stream}_model_gain_clamp_count",
-                        getattr(self, f"{stream}_model_gain_clamp_count") + 1,
+                        f"{stream}_model_bound_active_count",
+                        getattr(self, f"{stream}_model_bound_active_count") + 1,
                     )
-                if correction.generic_saturated:
+                if correction.generic_bound_active:
                     setattr(
                         self,
-                        f"{stream}_generic_gain_clamp_count",
-                        getattr(self, f"{stream}_generic_gain_clamp_count") + 1,
+                        f"{stream}_generic_bound_active_count",
+                        getattr(self, f"{stream}_generic_bound_active_count") + 1,
                     )
                 for stage, delta in (
-                    ("pre", abs(correction.pre_clamp_delta)),
-                    ("post", abs(correction.post_clamp_delta)),
+                    ("pre", abs(correction.pre_bound_delta)),
+                    ("post", abs(correction.post_bound_delta)),
+                    ("applied", abs(correction.applied_delta)),
                 ):
                     sum_name = f"{stream}_gain_delta_{stage}_abs_sum"
                     max_name = f"{stream}_gain_delta_{stage}_abs_max"
                     setattr(self, sum_name, getattr(self, sum_name) + delta)
                     setattr(self, max_name, max(getattr(self, max_name), delta))
+                candidate_ratio = float(stream_evidence.model_candidate_head_ratio)
+                baseline_ratio = float(stream_evidence.generic_corrected_head_ratio)
+                if (
+                    abs(correction.model_candidate_gain - correction.generic_gain) > 1e-9
+                    and candidate_ratio > 0.0
+                    and baseline_ratio > 0.0
+                ):
+                    comparison_name = f"{stream}_model_comparison_count"
+                    setattr(self, comparison_name, getattr(self, comparison_name) + 1)
+                    relative_advantage = _clamp(
+                        (baseline_ratio - candidate_ratio) / max(baseline_ratio, 1e-12),
+                        -0.25,
+                        0.25,
+                    )
+                    target_trust = _clamp(0.5 + 2.0 * relative_advantage)
+                    trust_name = f"{stream}_model_trust"
+                    setattr(
+                        self,
+                        trust_name,
+                        0.65 * getattr(self, trust_name) + 0.35 * target_trust,
+                    )
+                    if candidate_ratio < baseline_ratio:
+                        win_name = f"{stream}_model_candidate_win_count"
+                        setattr(self, win_name, getattr(self, win_name) + 1)
+                    elif candidate_ratio > baseline_ratio:
+                        loss_name = f"{stream}_model_candidate_loss_count"
+                        setattr(self, loss_name, getattr(self, loss_name) + 1)
         self.stream_evidence_count += 1
         self.anchor_count += 1
 
@@ -937,29 +1131,28 @@ class ModelAwareController:
     @staticmethod
     def _correction_telemetry(
         projection: float,
-        sensitivity: float,
+        model_projection: float,
         scale: float,
+        model_trust: float,
     ) -> CorrectionGainTelemetry:
         raw_generic = float(projection) * float(scale)
-        raw_model = raw_generic * float(sensitivity)
-        generic = _clamp(
-            raw_generic,
-            -_CORRECTION_GAIN_LIMIT,
-            _CORRECTION_GAIN_LIMIT,
-        )
-        model = _clamp(
-            raw_model,
-            -_CORRECTION_GAIN_LIMIT,
-            _CORRECTION_GAIN_LIMIT,
-        )
+        raw_model = float(model_projection) * float(scale)
+
+        generic = _soft_limit(raw_generic, _CORRECTION_GAIN_LIMIT)
+        model_candidate = _soft_limit(raw_model, _CORRECTION_GAIN_LIMIT)
+        trust = _clamp(model_trust)
+        model = generic + trust * (model_candidate - generic)
         return CorrectionGainTelemetry(
             residual_projection=float(projection),
+            model_projection=float(model_projection),
             raw_generic_gain=raw_generic,
             raw_model_gain=raw_model,
             generic_gain=generic,
+            model_candidate_gain=model_candidate,
             model_gain=model,
-            generic_saturated=abs(raw_generic) >= _CORRECTION_GAIN_LIMIT,
-            model_saturated=abs(raw_model) >= _CORRECTION_GAIN_LIMIT,
+            model_trust=trust,
+            generic_bound_active=abs(raw_generic) >= _CORRECTION_GAIN_LIMIT,
+            model_bound_active=abs(raw_model) >= _CORRECTION_GAIN_LIMIT,
         )
 
     def decision(
@@ -996,13 +1189,15 @@ class ModelAwareController:
             scale = confidence * horizon_scale
             audio_correction = self._correction_telemetry(
                 self.audio_projection_ewma,
-                self.profile.audio_sensitivity,
+                self.audio_model_projection_ewma,
                 scale,
+                self.audio_model_trust,
             )
             video_correction = self._correction_telemetry(
                 self.video_projection_ewma,
-                self.profile.video_sensitivity,
+                self.video_model_projection_ewma,
                 scale,
+                self.video_model_trust,
             )
         return ModelAwareForecastDecision(
             trajectory_risk=trajectory,
@@ -1048,8 +1243,13 @@ class ModelAwareController:
             "forecast_ratio",
             "model_corrected_ratio",
             "generic_corrected_ratio",
+            "model_candidate_ratio",
+            "model_corrected_head_ratio",
+            "generic_corrected_head_ratio",
+            "model_candidate_head_ratio",
             "gain_delta_pre_abs",
             "gain_delta_post_abs",
+            "gain_delta_applied_abs",
         }:
             raise ValueError("unknown model-aware stream metric")
         if self.stream_evidence_count == 0:

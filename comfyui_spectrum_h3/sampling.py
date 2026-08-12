@@ -202,7 +202,9 @@ def outer_sample_wrapper(
                     "Spectrum H3 model-aware profile base=%s patches=%s patch_keys=%s "
                     "recognized_lora=%s unknown_patches=%s cache=%s build_s=%.6f "
                     "lookup_s=%.6f memory_bytes=%s sensitivity=%.6f perturbation=%.6f "
-                    "final_perturbation=%.6f confidence=%.6f",
+                    "final_perturbation=%.6f confidence=%.6f "
+                    "head_metric=final_layer_gram_diagonal head_metric_available=%s "
+                    "head_metric_channels=%s",
                     profile.base_model_identity,
                     profile.active_patch_count,
                     profile.active_patch_keys,
@@ -216,6 +218,15 @@ def outer_sample_wrapper(
                     profile.patch_perturbation,
                     profile.final_block_perturbation,
                     profile.profile_confidence,
+                    bool(
+                        profile.audio_head_gram_diagonal is not None
+                        and profile.video_head_gram_diagonal is not None
+                    ),
+                    (
+                        0
+                        if profile.audio_head_gram_diagonal is None
+                        else profile.audio_head_gram_diagonal.numel()
+                    ),
                 )
         except torch.cuda.OutOfMemoryError:
             raise
@@ -448,14 +459,20 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 "Spectrum H3 model-aware step=%s trajectory_risk=%.6f model_risk=%.6f "
                 "patch_risk=%.6f combined_risk=%.6f confidence=%.6f horizon=%.3f "
                 "degree=%s ridge=%.8f audio_blend=%.6f video_blend=%.6f "
-                "audio_projection_used=%.6f audio_raw_generic_gain=%.6f "
+                "audio_generic_projection_used=%.6f audio_head_projection_used=%.6f "
+                "audio_raw_generic_gain=%.6f "
                 "audio_raw_model_gain=%.6f audio_generic_gain=%.6f "
-                "audio_model_gain=%.6f audio_generic_clamped=%s audio_model_clamped=%s "
-                "audio_gain_delta_pre_clamp=%.6f audio_gain_delta_post_clamp=%.6f "
-                "video_projection_used=%.6f video_raw_generic_gain=%.6f "
+                "audio_model_candidate_gain=%.6f audio_applied_gain=%.6f "
+                "audio_model_trust=%.6f audio_generic_bound_active=%s "
+                "audio_model_bound_active=%s audio_gain_delta_pre_bound=%.6f "
+                "audio_gain_delta_post_bound=%.6f audio_gain_delta_applied=%.6f "
+                "video_generic_projection_used=%.6f video_head_projection_used=%.6f "
+                "video_raw_generic_gain=%.6f "
                 "video_raw_model_gain=%.6f video_generic_gain=%.6f "
-                "video_model_gain=%.6f video_generic_clamped=%s video_model_clamped=%s "
-                "video_gain_delta_pre_clamp=%.6f video_gain_delta_post_clamp=%.6f "
+                "video_model_candidate_gain=%.6f video_applied_gain=%.6f "
+                "video_model_trust=%.6f video_generic_bound_active=%s "
+                "video_model_bound_active=%s video_gain_delta_pre_bound=%.6f "
+                "video_gain_delta_post_bound=%.6f video_gain_delta_applied=%.6f "
                 "decision=%s",
                 decision["step_id"],
                 model_decision.trajectory_risk,
@@ -469,23 +486,31 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 model_decision.audio_blend_weight,
                 model_decision.video_blend_weight,
                 audio_gain.residual_projection,
+                audio_gain.model_projection,
                 audio_gain.raw_generic_gain,
                 audio_gain.raw_model_gain,
                 audio_gain.generic_gain,
+                audio_gain.model_candidate_gain,
                 audio_gain.model_gain,
-                audio_gain.generic_saturated,
-                audio_gain.model_saturated,
-                audio_gain.pre_clamp_delta,
-                audio_gain.post_clamp_delta,
+                audio_gain.model_trust,
+                audio_gain.generic_bound_active,
+                audio_gain.model_bound_active,
+                audio_gain.pre_bound_delta,
+                audio_gain.post_bound_delta,
+                audio_gain.applied_delta,
                 video_gain.residual_projection,
+                video_gain.model_projection,
                 video_gain.raw_generic_gain,
                 video_gain.raw_model_gain,
                 video_gain.generic_gain,
+                video_gain.model_candidate_gain,
                 video_gain.model_gain,
-                video_gain.generic_saturated,
-                video_gain.model_saturated,
-                video_gain.pre_clamp_delta,
-                video_gain.post_clamp_delta,
+                video_gain.model_trust,
+                video_gain.generic_bound_active,
+                video_gain.model_bound_active,
+                video_gain.pre_bound_delta,
+                video_gain.post_bound_delta,
+                video_gain.applied_delta,
                 "ACTUAL" if decision["actual"] else "FORECAST",
             )
 

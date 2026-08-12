@@ -94,6 +94,8 @@ def _profile(**overrides):
         "final_block_perturbation": 0.0,
         "audio_sensitivity": 0.8,
         "video_sensitivity": 1.2,
+        "audio_head_gram_diagonal": torch.ones(4),
+        "video_head_gram_diagonal": torch.ones(4),
         "forecast_risk_prior": 0.2,
         "build_seconds": 0.001,
         "estimated_bytes": 512,
@@ -116,7 +118,7 @@ def _lora_patch(strength, *, scale=1.0):
     return (strength, _LoRA(up, down), 1.0, None, None)
 
 
-def test_base_profile_is_scalar_only_and_reused_across_clone_lineage():
+def test_base_profile_retains_only_small_cpu_head_metrics_and_reuses_clone_lineage():
     inner = _Inner()
     original = _Patcher(inner)
     first = get_model_forecastability_profile(original)
@@ -128,16 +130,48 @@ def test_base_profile_is_scalar_only_and_reused_across_clone_lineage():
     assert first.profile is second.profile
     assert first.profile.active_patch_count == 0
     assert first.profile.sampled_base_tensors == 8
-    assert first.profile.estimated_bytes <= 4096
-    assert all(
-        not torch.is_tensor(getattr(first.profile, field.name))
+    assert first.profile.estimated_bytes <= 8192
+    tensor_fields = {
+        field.name: getattr(first.profile, field.name)
         for field in dataclasses.fields(first.profile)
-    )
+        if torch.is_tensor(getattr(first.profile, field.name))
+    }
+    assert set(tensor_fields) == {
+        "audio_head_gram_diagonal",
+        "video_head_gram_diagonal",
+    }
+    assert all(value.device.type == "cpu" for value in tensor_fields.values())
+    assert all(value.dtype == torch.float32 for value in tensor_fields.values())
+    assert all(tuple(value.shape) == (inner.hidden_size,) for value in tensor_fields.values())
+    assert all(float(value.mean()) == pytest.approx(1.0) for value in tensor_fields.values())
 
     reference = weakref.ref(original)
     del original
     gc.collect()
     assert reference() is None
+
+
+def test_profile_head_metric_is_exact_normalized_final_layer_gram_diagonal():
+    inner = _Inner(hidden=4)
+    with torch.no_grad():
+        inner.final_layer.audio_out.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 2.0, 0.0, 1.0],
+                    [2.0, 0.0, 3.0, 1.0],
+                    [0.0, 1.0, 4.0, 1.0],
+                    [1.0, 1.0, 0.0, 1.0],
+                    [0.0, 2.0, 0.0, 1.0],
+                    [1.0, 0.0, 0.0, 1.0],
+                ]
+            )
+        )
+    profile = get_model_forecastability_profile(_Patcher(inner)).profile
+    expected = inner.final_layer.audio_out.weight.detach().float().square().sum(dim=0)
+    expected /= expected.mean()
+
+    assert profile.audio_head_gram_diagonal is not None
+    assert torch.equal(profile.audio_head_gram_diagonal, expected)
 
 
 def test_lora_strength_and_composition_change_profile_without_materializing_ba():
@@ -305,7 +339,31 @@ def test_controller_combines_static_prior_with_observed_evidence_and_bounds_outp
     )
     for _ in range(4):
         controller.observe_anchor(
-            AnchorEvidence(0.2, 0.1, 2.0, 0.4, -0.3, 0.3, 0.4)
+            AnchorEvidence(
+                0.2,
+                0.1,
+                2.0,
+                0.4,
+                -0.3,
+                0.3,
+                0.4,
+                audio=StreamAnchorEvidence(
+                    forecast_ratio=0.2,
+                    curvature_ratio=0.1,
+                    residual_projection=0.4,
+                    model_projection=0.8,
+                    model_corrected_ratio=0.3,
+                    generic_corrected_ratio=0.4,
+                ),
+                video=StreamAnchorEvidence(
+                    forecast_ratio=0.2,
+                    curvature_ratio=0.1,
+                    residual_projection=-0.3,
+                    model_projection=-0.7,
+                    model_corrected_ratio=0.3,
+                    generic_corrected_ratio=0.4,
+                ),
+            )
         )
     calibrated = controller.decision(
         forecast_horizon=1.0,
@@ -326,21 +384,33 @@ def test_controller_combines_static_prior_with_observed_evidence_and_bounds_outp
     assert calibrated.audio_correction_gain != calibrated.video_correction_gain
 
 
-def test_correction_saturation_exposes_pre_clamp_model_difference_and_post_clamp_equality():
+def test_smooth_trust_region_preserves_model_candidate_difference_after_bounding():
     controller = ModelAwareController("full", risk_threshold=1.0)
-    controller.set_profile(
-        _profile(audio_sensitivity=2.0, video_sensitivity=1.5)
-    )
+    controller.set_profile(_profile())
     seed_evidence = AnchorEvidence(
         1.0,
         0.2,
         2.0,
-        -2.0,
-        -2.0,
+        -10.0,
+        -10.0,
         1.0,
         1.0,
-        audio=StreamAnchorEvidence(1.2, 0.1, -2.0, 0.9, 0.9),
-        video=StreamAnchorEvidence(0.8, 0.2, -2.0, 0.7, 0.7),
+        audio=StreamAnchorEvidence(
+            forecast_ratio=1.2,
+            curvature_ratio=0.1,
+                residual_projection=-10.0,
+                model_projection=-20.0,
+            model_corrected_ratio=0.9,
+            generic_corrected_ratio=0.9,
+        ),
+        video=StreamAnchorEvidence(
+            forecast_ratio=0.8,
+            curvature_ratio=0.2,
+                residual_projection=-10.0,
+                model_projection=-15.0,
+            model_corrected_ratio=0.7,
+            generic_corrected_ratio=0.7,
+        ),
     )
     controller.observe_anchor(seed_evidence)
 
@@ -358,12 +428,17 @@ def test_correction_saturation_exposes_pre_clamp_model_difference_and_post_clamp
         decision.video_correction_telemetry,
     ):
         assert telemetry.raw_model_gain != telemetry.raw_generic_gain
-        assert telemetry.model_saturated
-        assert telemetry.generic_saturated
-        assert telemetry.model_gain == -0.25
-        assert telemetry.generic_gain == -0.25
-        assert telemetry.pre_clamp_delta != 0.0
-        assert telemetry.post_clamp_delta == 0.0
+        assert telemetry.model_bound_active
+        assert telemetry.generic_bound_active
+        assert -0.25 < telemetry.model_candidate_gain < 0.0
+        assert -0.25 < telemetry.generic_gain < 0.0
+        assert telemetry.model_candidate_gain != telemetry.generic_gain
+        assert telemetry.model_gain == pytest.approx(
+            0.5 * (telemetry.generic_gain + telemetry.model_candidate_gain)
+        )
+        assert telemetry.pre_bound_delta != 0.0
+        assert telemetry.post_bound_delta != 0.0
+        assert telemetry.applied_delta != 0.0
 
     measured = AnchorEvidence(
         2.0,
@@ -373,19 +448,45 @@ def test_correction_saturation_exposes_pre_clamp_model_difference_and_post_clamp
         -0.7,
         1.8,
         1.8,
-        audio=StreamAnchorEvidence(2.0, 0.4, -1.5, 1.8, 1.8),
-        video=StreamAnchorEvidence(0.6, 0.1, -0.7, 0.5, 0.5),
+        audio=StreamAnchorEvidence(
+            forecast_ratio=2.0,
+            curvature_ratio=0.4,
+            residual_projection=-1.5,
+            model_projection=-2.0,
+            model_corrected_ratio=1.7,
+            generic_corrected_ratio=1.8,
+            model_candidate_ratio=1.6,
+            model_corrected_head_ratio=1.6,
+            generic_corrected_head_ratio=1.8,
+            model_candidate_head_ratio=1.5,
+        ),
+        video=StreamAnchorEvidence(
+            forecast_ratio=0.6,
+            curvature_ratio=0.1,
+            residual_projection=-0.7,
+            model_projection=-0.9,
+            model_corrected_ratio=0.45,
+            generic_corrected_ratio=0.5,
+            model_candidate_ratio=0.4,
+            model_corrected_head_ratio=0.45,
+            generic_corrected_head_ratio=0.5,
+            model_candidate_head_ratio=0.4,
+        ),
     )
     controller.observe_anchor(measured, decision)
 
-    assert controller.audio_model_gain_clamp_count == 1
-    assert controller.audio_generic_gain_clamp_count == 1
-    assert controller.video_model_gain_clamp_count == 1
-    assert controller.video_generic_gain_clamp_count == 1
+    assert controller.audio_model_bound_active_count == 1
+    assert controller.audio_generic_bound_active_count == 1
+    assert controller.video_model_bound_active_count == 1
+    assert controller.video_generic_bound_active_count == 1
     assert controller.audio_gain_delta_pre_abs_max > 0.0
     assert controller.video_gain_delta_pre_abs_max > 0.0
-    assert controller.audio_gain_delta_post_abs_max == 0.0
-    assert controller.video_gain_delta_post_abs_max == 0.0
+    assert controller.audio_gain_delta_post_abs_max > 0.0
+    assert controller.video_gain_delta_post_abs_max > 0.0
+    assert controller.audio_model_candidate_win_count == 1
+    assert controller.video_model_candidate_win_count == 1
+    assert controller.audio_model_trust > 0.5
+    assert controller.video_model_trust > 0.5
     assert controller.stream_mean("audio", "forecast_ratio") == pytest.approx(1.6)
     assert controller.stream_mean("video", "forecast_ratio") == pytest.approx(0.7)
     assert controller.forecast_ratio_ewma > controller.video_forecast_ratio_max
@@ -393,8 +494,9 @@ def test_correction_saturation_exposes_pre_clamp_model_difference_and_post_clamp
     runtime.model_aware = controller
     summary = runtime.debug_summary()
     assert "model_aware_scheduler_forecast_aggregate=max(audio,video)" in summary
-    assert "model_aware_audio_model_gain_clamps=1" in summary
-    assert "model_aware_audio_gain_delta_post_abs_max=0.000000" in summary
+    assert "model_aware_audio_model_bound_active=1" in summary
+    assert "model_aware_correction_bound=rational_softsign_0.25" in summary
+    assert "model_aware_audio_model_candidate_wins=1" in summary
 
 
 def test_new_stream_and_saturation_statistics_round_trip_through_snapshot_restore():
@@ -523,10 +625,68 @@ def test_schedule_preserves_fitting_and_blends_while_schedule_confidence_adapts_
     assert confidence_decision.video_correction_gain == 0.0
 
 
+def test_full_correction_does_not_change_schedule_confidence_nfe_decision():
+    confidence = ModelAwareController("schedule_confidence", risk_threshold=0.65)
+    full = ModelAwareController("full", risk_threshold=0.65)
+    evidence = AnchorEvidence(
+        0.9,
+        0.3,
+        4.0,
+        -0.4,
+        -0.4,
+        0.8,
+        0.85,
+        audio=StreamAnchorEvidence(
+            forecast_ratio=0.9,
+            curvature_ratio=0.3,
+            residual_projection=-0.4,
+            model_projection=-0.7,
+        ),
+        video=StreamAnchorEvidence(
+            forecast_ratio=0.8,
+            curvature_ratio=0.2,
+            residual_projection=-0.4,
+            model_projection=-0.2,
+        ),
+    )
+    for controller in (confidence, full):
+        controller.set_profile(_profile(forecast_risk_prior=0.5))
+        controller.observe_anchor(evidence)
+    inputs = {
+        "forecast_horizon": 1.0,
+        "history_length": 5,
+        "configured_degree": 4,
+        "configured_ridge_lambda": 0.1,
+        "configured_audio_blend": 0.0,
+        "configured_video_blend": 0.5,
+    }
+
+    confidence_decision = confidence.decision(**inputs)
+    full_decision = full.decision(**inputs)
+
+    assert full_decision.combined_risk == confidence_decision.combined_risk
+    assert full_decision.force_actual == confidence_decision.force_actual
+    assert full_decision.degree == confidence_decision.degree
+    assert full_decision.ridge_lambda == confidence_decision.ridge_lambda
+    assert full_decision.audio_blend_weight == confidence_decision.audio_blend_weight
+    assert full_decision.video_blend_weight == confidence_decision.video_blend_weight
+    assert full_decision.audio_correction_gain != 0.0
+    assert confidence_decision.audio_correction_gain == 0.0
+
+
 def test_sampled_evidence_is_bounded_and_model_aware_weight_correction_preserves_affine_sum():
     forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.1, max_history=4)
-    forecaster.update(0.0, torch.zeros((1, 4, 3)))
-    forecaster.update(0.5, torch.ones((1, 4, 3)))
+    segments = (("audio", 0, 2), ("video", 2, 4))
+    forecaster.update(
+        0.0,
+        torch.zeros((1, 4, 3)),
+        evidence_segments=segments,
+    )
+    forecaster.update(
+        0.5,
+        torch.ones((1, 4, 3)),
+        evidence_segments=segments,
+    )
     weights = forecaster.model_aware_weights(
         1.0,
         0.5,
@@ -547,9 +707,16 @@ def test_sampled_evidence_is_bounded_and_model_aware_weight_correction_preserves
     evidence = forecaster.sampled_anchor_evidence(
         1.0,
         actual,
-        (("audio", 0, 2, 0.5, 0.2, 0.1), ("video", 2, 4, 0.5, -0.1, 0.1)),
+        (
+            ("audio", 0, 2, 0.5, 0.2, 0.1, 0.15),
+            ("video", 2, 4, 0.5, -0.1, 0.1, -0.05),
+        ),
         degree=1,
         ridge_lambda=0.2,
+        stream_sensitivities={
+            "audio": torch.tensor([3.0, 1.0, 0.5]),
+            "video": torch.tensor([0.5, 1.0, 3.0]),
+        },
     )
 
     assert float(weights.sum()) == pytest.approx(float(uncorrected.sum()), abs=1e-6)
@@ -596,12 +763,24 @@ def test_sampled_evidence_is_bounded_and_model_aware_weight_correction_preserves
 
 def test_anchor_telemetry_retains_raw_projection_while_controller_calibration_stays_bounded():
     forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.1, max_history=4)
-    forecaster.update(0.0, torch.zeros((1, 4, 3)))
-    forecaster.update(0.5, torch.ones((1, 4, 3)))
+    segments = (("audio", 0, 2), ("video", 2, 4))
+    forecaster.update(
+        0.0,
+        torch.zeros((1, 4, 3)),
+        evidence_segments=segments,
+    )
+    forecaster.update(
+        0.5,
+        torch.ones((1, 4, 3)),
+        evidence_segments=segments,
+    )
     evidence = forecaster.sampled_anchor_evidence(
         1.0,
         torch.full((1, 4, 3), 10.0),
-        (("audio", 0, 2, 0.0, 0.0, 0.0), ("video", 2, 4, 0.0, 0.0, 0.0)),
+        (
+            ("audio", 0, 2, 0.0, 0.0, 0.0, 0.0),
+            ("video", 2, 4, 0.0, 0.0, 0.0, 0.0),
+        ),
         degree=1,
         ridge_lambda=0.1,
     )
@@ -611,8 +790,115 @@ def test_anchor_telemetry_retains_raw_projection_while_controller_calibration_st
     assert evidence.video.residual_projection > 2.0
     controller = ModelAwareController("full", risk_threshold=1.0)
     controller.observe_anchor(evidence)
-    assert controller.audio_projection_ewma == 1.0
-    assert controller.video_projection_ewma == 1.0
+    expected_audio = 0.5 * evidence.audio.residual_projection / (
+        1.0 + abs(evidence.audio.residual_projection) / 2.0
+    )
+    expected_video = 0.5 * evidence.video.residual_projection / (
+        1.0 + abs(evidence.video.residual_projection) / 2.0
+    )
+    assert controller.audio_projection_ewma == pytest.approx(expected_audio)
+    assert controller.video_projection_ewma == pytest.approx(expected_video)
+
+
+def test_final_layer_weighted_projection_differs_from_euclidean_control_on_device():
+    forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.0, max_history=4)
+    segments = (("audio", 0, 1), ("video", 1, 2))
+    previous = torch.zeros((1, 2, 2))
+    latest = torch.ones((1, 2, 2))
+    forecaster.update(0.0, previous, evidence_segments=segments)
+    forecaster.update(1.0, latest, evidence_segments=segments)
+    actual = torch.tensor([[[3.0, 1.5], [2.0, 2.0]]])
+
+    evidence = forecaster.sampled_anchor_evidence(
+        2.0,
+        actual,
+        (
+            ("audio", 0, 1, 0.0, 0.0, 0.0, 0.0),
+            ("video", 1, 2, 0.0, 0.0, 0.0, 0.0),
+        ),
+        degree=1,
+        ridge_lambda=0.0,
+        stream_sensitivities={
+            "audio": torch.tensor([10.0, 1.0]),
+            "video": torch.ones(2),
+        },
+    )
+
+    assert evidence is not None
+    assert evidence.audio.residual_projection == pytest.approx(0.25)
+    assert evidence.audio.model_projection == pytest.approx(9.5 / 11.0)
+    assert evidence.audio.model_projection != evidence.audio.residual_projection
+    assert evidence.video.model_projection == pytest.approx(
+        evidence.video.residual_projection
+    )
+    assert forecaster.evidence_tensor_bytes == 32
+    assert all(
+        sample.device == actual.device
+        for entry in forecaster._evidence_history
+        for sample in entry.values()
+    )
+
+
+def test_online_model_trust_falls_when_head_weighted_candidate_loses():
+    controller = ModelAwareController("full", risk_threshold=1.0)
+    controller.set_profile(_profile())
+    controller.observe_anchor(
+        AnchorEvidence(
+            1.0,
+            0.1,
+            2.0,
+            -1.0,
+            -1.0,
+            1.0,
+            1.0,
+            audio=StreamAnchorEvidence(
+                residual_projection=-1.0,
+                model_projection=-2.0,
+            ),
+            video=StreamAnchorEvidence(
+                residual_projection=-1.0,
+                model_projection=-2.0,
+            ),
+        )
+    )
+    decision = controller.decision(
+        forecast_horizon=1.0,
+        history_length=4,
+        configured_degree=2,
+        configured_ridge_lambda=0.1,
+        configured_audio_blend=0.0,
+        configured_video_blend=0.5,
+    )
+    losing = StreamAnchorEvidence(
+        forecast_ratio=1.0,
+        residual_projection=-1.0,
+        model_projection=-2.0,
+        model_corrected_ratio=1.1,
+        generic_corrected_ratio=1.0,
+        model_candidate_ratio=1.2,
+        model_corrected_head_ratio=1.1,
+        generic_corrected_head_ratio=1.0,
+        model_candidate_head_ratio=1.25,
+    )
+    controller.observe_anchor(
+        AnchorEvidence(
+            1.0,
+            0.1,
+            2.0,
+            -1.0,
+            -1.0,
+            1.1,
+            1.0,
+            audio=losing,
+            video=losing,
+        ),
+        decision,
+    )
+
+    assert controller.audio_model_candidate_loss_count == 1
+    assert controller.video_model_candidate_loss_count == 1
+    assert controller.audio_model_trust < 0.5
+    assert controller.video_model_trust < 0.5
 
 
 def test_model_aware_schedule_can_only_convert_a_legacy_forecast_to_actual():
