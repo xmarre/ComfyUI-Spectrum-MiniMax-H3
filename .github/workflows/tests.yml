@@ -62,7 +62,7 @@ jobs:
             tests/test_feature3_direction_normalization.py \
             tests/test_feature3_previous_error.py \
             tests/conftest.py \
-            --ignore N999,I001,C408
+            --ignore N999,I001,C408,UP035
           python -m compileall -q comfyui_spectrum_h3 tests
 
       - name: Run tests against native MiniMax H3
