@@ -1,31 +1,17 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
 
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
-from comfyui_spectrum_h3.sampling import min_tail_actual_steps
 
 
-def _sampler(function_name: str) -> SimpleNamespace:
-    def sampler_function():
-        pass
-
-    sampler_function.__name__ = function_name
-    return SimpleNamespace(sampler_function=sampler_function)
-
-
-def test_er_sde_requires_two_actual_tail_steps_without_changing_other_sampler_policies():
-    assert min_tail_actual_steps(_sampler("sample_er_sde")) == 2
-    assert min_tail_actual_steps(_sampler("sample_res_multistep")) == 3
-    assert min_tail_actual_steps(_sampler("sample_res_multistep_cfg_pp")) == 3
-    assert min_tail_actual_steps(_sampler("sample_euler")) == 0
-    assert min_tail_actual_steps(_sampler("_turbo_sampler")) == 0
-
-
-def _penultimate_decision(total_steps: int, *, minimum_tail: int) -> dict[str, object]:
+def _penultimate_decision(
+    total_steps: int,
+    *,
+    sampler_name: str,
+    minimum_tail: int,
+) -> dict[str, object]:
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(
             model_aware_mode="off",
@@ -37,7 +23,7 @@ def _penultimate_decision(total_steps: int, *, minimum_tail: int) -> dict[str, o
     sigmas = torch.linspace(1.0, 0.0, total_steps + 1, dtype=torch.float32)
     run_id = runtime.start_run(
         sigmas,
-        "sample_er_sde",
+        sampler_name,
         supported_sampler=True,
         max_consecutive_forecasts=1,
         min_actual_steps_after_forecast=1,
@@ -55,18 +41,30 @@ def _penultimate_decision(total_steps: int, *, minimum_tail: int) -> dict[str, o
     return decision
 
 
-def test_er_sde_two_step_tail_removes_odd_step_penultimate_forecast():
-    old_policy = _penultimate_decision(25, minimum_tail=0)
-    protected = _penultimate_decision(25, minimum_tail=2)
+def test_er_sde_runtime_tail_policy_removes_odd_step_penultimate_forecast():
+    unprotected_control = _penultimate_decision(
+        25,
+        sampler_name="sample_euler",
+        minimum_tail=0,
+    )
+    protected_er_sde = _penultimate_decision(
+        25,
+        sampler_name="sample_er_sde",
+        minimum_tail=0,
+    )
 
-    assert old_policy["actual"] is False
-    assert old_policy["reason"] == "adaptive forecast"
-    assert protected["actual"] is True
-    assert protected["reason"] == "final actual tail"
+    assert unprotected_control["actual"] is False
+    assert unprotected_control["reason"] == "adaptive forecast"
+    assert protected_er_sde["actual"] is True
+    assert protected_er_sde["reason"] == "final actual tail"
 
 
 def test_er_sde_tail_invariant_is_independent_of_total_step_count():
     for total_steps in (20, 25, 32):
-        decision = _penultimate_decision(total_steps, minimum_tail=2)
+        decision = _penultimate_decision(
+            total_steps,
+            sampler_name="sample_er_sde",
+            minimum_tail=0,
+        )
         assert decision["actual"] is True
         assert decision["reason"] == "final actual tail"
