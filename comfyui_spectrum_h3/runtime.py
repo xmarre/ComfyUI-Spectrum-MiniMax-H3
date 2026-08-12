@@ -17,6 +17,12 @@ from .experiments import (
     tensor_all_finite,
 )
 from .forecast import ForecasterSnapshot, HistoryWeightForecaster
+from .model_aware import (
+    ModelAwareController,
+    ModelAwareForecastDecision,
+    ModelForecastabilityProfile,
+    ProfileLookup,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -113,6 +119,29 @@ class RuntimeStats:
     offline_attenuated_video_predictions: int = 0
     offline_local_only_audio_predictions: int = 0
     offline_local_only_video_predictions: int = 0
+    adaptive_extra_nfes: int = 0
+    model_profile_cache_hit: bool = False
+    model_profile_build_seconds: float = 0.0
+    model_profile_lookup_seconds: float = 0.0
+    model_profile_bytes: int = 0
+    model_profile_workspace_bytes: int = 0
+    model_profile_patch_count: int = 0
+    model_profile_unknown_patch_count: int = 0
+    model_profile_sensitivity: float = 0.0
+    model_profile_patch_perturbation: float = 0.0
+    model_aware_forecasts: int = 0
+    model_aware_anchor_updates: int = 0
+    model_aware_failures: int = 0
+    model_aware_risk_max: float = 0.0
+    model_aware_confidence_min: float = 1.0
+    model_aware_correction_max: float = 0.0
+    model_aware_overhead_seconds: float = 0.0
+    model_aware_decision_seconds: float = 0.0
+    model_aware_evidence_seconds: float = 0.0
+    model_aware_fit_seconds: float = 0.0
+    model_aware_correction_seconds: float = 0.0
+    model_aware_model_corrected_ratio_mean: float = 0.0
+    model_aware_generic_corrected_ratio_mean: float = 0.0
 
 
 @dataclass(slots=True)
@@ -167,6 +196,8 @@ class _StepState:
     rollback_replay: bool = False
     consumes_feedback_refresh: bool = False
     residual_skip_reason: str | None = None
+    model_aware_decision: ModelAwareForecastDecision | None = None
+    model_aware_forced_actual: bool = False
 
 
 @dataclass(slots=True)
@@ -199,6 +230,7 @@ class RuntimeRollbackSnapshot:
     experiment_disable_reason: str | None
     last_completed_mode: str | None
     last_completed_step_id: int | None
+    model_aware_state: dict[str, float | int]
     stats: RuntimeStats
 
 
@@ -210,6 +242,10 @@ class SpectrumH3Runtime:
             ridge_lambda=self.config.ridge_lambda,
             max_history=self.config.max_history,
             history_storage=self.config.history_storage,
+        )
+        self.model_aware = ModelAwareController(
+            self.config.model_aware_mode,
+            self.config.model_aware_risk_threshold,
         )
 
         self.stats = RuntimeStats(current_window=self.config.window_size)
@@ -237,6 +273,10 @@ class SpectrumH3Runtime:
         self._offline_smoother: OfflineSmoother | None = None
         self._offline_archive_seconds_total = 0.0
         self._offline_smoother_build_seconds_total = 0.0
+        self._model_profile: ModelForecastabilityProfile | None = None
+        self._model_profile_cache_hit = False
+        self._model_profile_lookup_seconds = 0.0
+        self._model_aware_disabled_reason: str | None = None
 
     @property
     def active_run_id(self) -> int | None:
@@ -245,6 +285,10 @@ class SpectrumH3Runtime:
     @property
     def active_step_id(self) -> int | None:
         return None if self._step is None else self._step.step_id
+
+    @property
+    def active_model_aware_decision(self) -> ModelAwareForecastDecision | None:
+        return None if self._step is None else self._step.model_aware_decision
 
     @property
     def supported_sampler(self) -> bool:
@@ -305,6 +349,30 @@ class SpectrumH3Runtime:
     def record_residual_output_head_seconds(self, elapsed: float) -> None:
         self.stats.residual_output_head_seconds += max(0.0, float(elapsed))
 
+    def set_model_profile(self, lookup: ProfileLookup) -> None:
+        if self._run is not None:
+            raise RuntimeError("cannot replace the model forecastability profile during a run")
+        self._model_profile = lookup.profile
+        self._model_profile_cache_hit = bool(lookup.cache_hit)
+        self._model_profile_lookup_seconds = max(0.0, float(lookup.lookup_seconds))
+        self._model_aware_disabled_reason = None
+        self.model_aware.set_profile(lookup.profile)
+
+    def disable_model_aware(self, reason: str) -> None:
+        self._model_aware_disabled_reason = str(reason)
+        self.model_aware.set_profile(None)
+
+    @property
+    def model_profile(self) -> ModelForecastabilityProfile | None:
+        return self._model_profile
+
+    def _model_aware_enabled(self) -> bool:
+        return bool(
+            self.config.model_aware_mode != "off"
+            and self._model_aware_disabled_reason is None
+            and self._model_profile is not None
+        )
+
     def _record_offline_smoother_stats(self) -> None:
         smoother = self._offline_smoother
         if smoother is None:
@@ -337,9 +405,10 @@ class SpectrumH3Runtime:
         self.stats.offline_attenuated_video_predictions = smoother.attenuated_prediction_counts.get("video", 0)
         self.stats.offline_local_only_audio_predictions = smoother.local_only_prediction_counts.get("audio", 0)
         self.stats.offline_local_only_video_predictions = smoother.local_only_prediction_counts.get("video", 0)
+        self.stats.model_aware_fit_seconds = smoother.model_aware_fit_seconds
+        self.stats.model_aware_correction_seconds = smoother.model_aware_correction_seconds
 
-    def _prediction_segments(self, call: _CallState) -> tuple[tuple[int, int, float], ...]:
-        audio_blend_weight, video_blend_weight = self._causal_prediction_blends()
+    def _stream_ranges(self, call: _CallState) -> tuple[tuple[str, int, int], ...]:
         topology = {
             str(entry[0]): entry[1]
             for entry in call.topology
@@ -356,8 +425,18 @@ class SpectrumH3Runtime:
             and audio_rows + video_rows == target_rows
         ):
             return (
-                (0, audio_rows, audio_blend_weight),
-                (audio_rows, target_rows, video_blend_weight),
+                ("audio", 0, audio_rows),
+                ("video", audio_rows, target_rows),
+            )
+        return (("packed", 0, target_rows),)
+
+    def _prediction_segments(self, call: _CallState) -> tuple[tuple[int, int, float], ...]:
+        audio_blend_weight, video_blend_weight = self._causal_prediction_blends()
+        ranges = self._stream_ranges(call)
+        if len(ranges) == 2:
+            return (
+                (ranges[0][1], ranges[0][2], audio_blend_weight),
+                (ranges[1][1], ranges[1][2], video_blend_weight),
             )
         if math.isclose(
             audio_blend_weight,
@@ -365,8 +444,65 @@ class SpectrumH3Runtime:
             rel_tol=0.0,
             abs_tol=1e-12,
         ):
-            return ((0, target_rows, video_blend_weight),)
+            return ((ranges[0][1], ranges[0][2], video_blend_weight),)
         raise ValueError("packed H3 topology does not expose the target audio/video boundary")
+
+    def _model_aware_weight_segments(
+        self,
+        call: _CallState,
+        decision: ModelAwareForecastDecision,
+    ) -> tuple[tuple[int, int, torch.Tensor], ...]:
+        fit_before = self.forecaster.model_aware_fit_seconds
+        correction_before = self.forecaster.model_aware_correction_seconds
+        weighted = []
+        for name, start, end in self._stream_ranges(call):
+            if name == "audio":
+                blend = decision.audio_blend_weight
+                correction = decision.audio_correction_gain
+            elif name == "video":
+                blend = decision.video_blend_weight
+                correction = decision.video_correction_gain
+            else:
+                if not math.isclose(
+                    decision.audio_blend_weight,
+                    decision.video_blend_weight,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    raise ValueError(
+                        "model-aware packed prediction requires target audio/video row metadata"
+                    )
+                blend = decision.video_blend_weight
+                correction = max(
+                    -0.25,
+                    min(
+                        0.25,
+                        0.5
+                        * (
+                            decision.audio_correction_gain
+                            + decision.video_correction_gain
+                        ),
+                    ),
+                )
+            weights = self.forecaster.model_aware_weights(
+                self._step.coordinate if self._step is not None else 0.0,
+                blend,
+                degree=decision.degree,
+                ridge_lambda=decision.ridge_lambda,
+                correction_gain=correction,
+            )
+            weighted.append((start, end, weights))
+        fit_elapsed = self.forecaster.model_aware_fit_seconds - fit_before
+        correction_elapsed = (
+            self.forecaster.model_aware_correction_seconds - correction_before
+        )
+        self.stats.model_aware_fit_seconds += max(0.0, fit_elapsed)
+        self.stats.model_aware_correction_seconds += max(0.0, correction_elapsed)
+        self.stats.model_aware_overhead_seconds += max(
+            0.0,
+            fit_elapsed + correction_elapsed,
+        )
+        return tuple(weighted)
 
     def _causal_prediction_blends(self) -> tuple[float, float]:
         if self._offline_phase in {"first_pass", "replay"}:
@@ -457,6 +593,8 @@ class SpectrumH3Runtime:
         self._forced_actual_reason = None
         self._forced_actual_is_replay = False
         self._rollback_replay_active = False
+        self.model_aware.reset()
+        self.model_aware.set_profile(self._model_profile)
         if not self.config.enabled:
             self._disable_reason = "forecasting disabled by configuration"
         elif not supported_sampler:
@@ -478,6 +616,20 @@ class SpectrumH3Runtime:
             causal_video_blend_weight=causal_video_blend,
             causal_audio_blend_weight=causal_audio_blend,
         )
+        if self._model_profile is not None:
+            self.stats.model_profile_cache_hit = self._model_profile_cache_hit
+            self.stats.model_profile_build_seconds = (
+                0.0 if self._model_profile_cache_hit else self._model_profile.build_seconds
+            )
+            self.stats.model_profile_lookup_seconds = self._model_profile_lookup_seconds
+            self.stats.model_profile_bytes = self._model_profile.estimated_bytes
+            self.stats.model_profile_workspace_bytes = (
+                self._model_profile.transient_workspace_bytes
+            )
+            self.stats.model_profile_patch_count = self._model_profile.active_patch_count
+            self.stats.model_profile_unknown_patch_count = self._model_profile.unknown_patch_count
+            self.stats.model_profile_sensitivity = self._model_profile.aggregate_sensitivity
+            self.stats.model_profile_patch_perturbation = self._model_profile.patch_perturbation
         if self._offline_phase == "replay" and self._offline_archive is not None:
             self.stats.offline_archive_bytes = self._offline_archive.tensor_bytes
             self.stats.offline_estimated_archive_bytes = self._offline_archive.estimated_tensor_bytes
@@ -661,6 +813,50 @@ class SpectrumH3Runtime:
             advances_window = False
             bootstrap_forecast = False
 
+        model_aware_decision = None
+        model_aware_forced_actual = False
+        if not actual and self._model_aware_enabled():
+            model_aware_started = time.perf_counter()
+            try:
+                model_aware_decision = self.model_aware.decision(
+                    forecast_horizon=float(self._consecutive_forecasts + 1),
+                    history_length=self.forecaster.history_length,
+                    configured_degree=self.config.degree,
+                    configured_ridge_lambda=self.config.ridge_lambda,
+                    configured_audio_blend=self.config.audio_blend_weight,
+                    configured_video_blend=self.config.blend_weight,
+                )
+                self.stats.model_aware_risk_max = max(
+                    self.stats.model_aware_risk_max,
+                    model_aware_decision.combined_risk,
+                )
+                self.stats.model_aware_confidence_min = min(
+                    self.stats.model_aware_confidence_min,
+                    model_aware_decision.confidence,
+                )
+                self.stats.model_aware_correction_max = max(
+                    self.stats.model_aware_correction_max,
+                    abs(model_aware_decision.audio_correction_gain),
+                    abs(model_aware_decision.video_correction_gain),
+                )
+                if model_aware_decision.force_actual:
+                    actual = True
+                    reason = "model-aware forecast risk"
+                    advances_window = False
+                    bootstrap_forecast = False
+                    model_aware_forced_actual = True
+            except (RuntimeError, TypeError, ValueError) as exc:
+                self._model_aware_disabled_reason = f"model-aware decision failed: {exc}"
+                self.stats.model_aware_failures += 1
+                LOG.warning(
+                    "Spectrum H3 model-aware forecasting disabled for this run: %s",
+                    self._model_aware_disabled_reason,
+                )
+            finally:
+                elapsed = time.perf_counter() - model_aware_started
+                self.stats.model_aware_decision_seconds += elapsed
+                self.stats.model_aware_overhead_seconds += elapsed
+
         self._step = _StepState(
             step_id=step_id,
             coordinate=coordinate,
@@ -670,6 +866,8 @@ class SpectrumH3Runtime:
             bootstrap_forecast=bootstrap_forecast,
             rollback_replay=rollback_replay,
             consumes_feedback_refresh=consumes_feedback_refresh,
+            model_aware_decision=model_aware_decision,
+            model_aware_forced_actual=model_aware_forced_actual,
         )
         self._run.next_step_id += 1
         return {
@@ -1007,9 +1205,20 @@ class SpectrumH3Runtime:
             )
             return None
         segments = None
+        model_aware_weighted_segments = None
         if step.mode != "replay" and not step.bootstrap_forecast:
             try:
-                segments = self._prediction_segments(call)
+                if (
+                    step.model_aware_decision is not None
+                    and self._model_aware_enabled()
+                    and self._offline_phase is None
+                ):
+                    model_aware_weighted_segments = self._model_aware_weight_segments(
+                        call,
+                        step.model_aware_decision,
+                    )
+                else:
+                    segments = self._prediction_segments(call)
             except ValueError as exc:
                 self._fallback_or_retry(step, str(exc))
                 return None
@@ -1026,6 +1235,13 @@ class SpectrumH3Runtime:
                 )
             elif step.bootstrap_forecast:
                 predicted = self.forecaster.predict_one_point_hold(
+                    rows=positions,
+                    device=device,
+                    dtype=dtype,
+                )
+            elif model_aware_weighted_segments is not None:
+                predicted = self.forecaster.predict_with_segment_weights(
+                    model_aware_weighted_segments,
                     rows=positions,
                     device=device,
                     dtype=dtype,
@@ -1157,6 +1373,97 @@ class SpectrumH3Runtime:
             audio_score=audio_score,
         )
 
+    def _observe_model_aware_anchor(
+        self,
+        step: _StepState,
+        combined: torch.Tensor,
+    ) -> None:
+        if not self._model_aware_enabled() or self.forecaster.history_length < 2:
+            return
+        started = time.perf_counter()
+        try:
+            decision = self.model_aware.decision(
+                forecast_horizon=1.0,
+                history_length=self.forecaster.history_length,
+                configured_degree=self.config.degree,
+                configured_ridge_lambda=self.config.ridge_lambda,
+                configured_audio_blend=self.config.audio_blend_weight,
+                configured_video_blend=self.config.blend_weight,
+            )
+            generic_audio, generic_video = self.model_aware.generic_correction_gains(decision)
+            parameters = []
+            for name, start, end in self._stream_ranges(step.calls[0]):
+                if name == "audio":
+                    blend = decision.audio_blend_weight
+                    model_gain = decision.audio_correction_gain
+                    generic_gain = generic_audio
+                elif name == "video":
+                    blend = decision.video_blend_weight
+                    model_gain = decision.video_correction_gain
+                    generic_gain = generic_video
+                else:
+                    if not math.isclose(
+                        decision.audio_blend_weight,
+                        decision.video_blend_weight,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    ):
+                        raise ValueError(
+                            "packed model-aware evidence requires audio/video row metadata"
+                        )
+                    blend = decision.video_blend_weight
+                    model_gain = 0.5 * (
+                        decision.audio_correction_gain + decision.video_correction_gain
+                    )
+                    generic_gain = 0.5 * (generic_audio + generic_video)
+                parameters.append(
+                    (name, start, end, blend, model_gain, generic_gain)
+                )
+            evidence = self.forecaster.sampled_anchor_evidence(
+                step.coordinate,
+                combined,
+                parameters,
+                degree=decision.degree,
+                ridge_lambda=decision.ridge_lambda,
+            )
+            if evidence is not None:
+                self.model_aware.observe_anchor(evidence)
+                self.stats.model_aware_anchor_updates += 1
+                self.stats.model_aware_model_corrected_ratio_mean = (
+                    self.model_aware.model_corrected_ratio_mean
+                )
+                self.stats.model_aware_generic_corrected_ratio_mean = (
+                    self.model_aware.generic_corrected_ratio_mean
+                )
+                if self.config.debug:
+                    LOG.warning(
+                        "Spectrum H3 model-aware anchor step=%s forecast_ratio=%.6f "
+                        "curvature=%.6f fit_condition=%.6f audio_projection=%.6f "
+                        "video_projection=%.6f model_correction_ratio=%.6f "
+                        "generic_correction_ratio=%.6f",
+                        step.step_id,
+                        evidence.forecast_ratio,
+                        evidence.curvature_ratio,
+                        evidence.fit_condition,
+                        evidence.audio_projection,
+                        evidence.video_projection,
+                        evidence.model_corrected_ratio,
+                        evidence.generic_corrected_ratio,
+                    )
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self._model_aware_disabled_reason = f"anchor evidence failed: {exc}"
+            self.stats.model_aware_failures += 1
+            LOG.warning(
+                "Spectrum H3 model-aware forecasting disabled for this run: %s",
+                self._model_aware_disabled_reason,
+            )
+        finally:
+            elapsed = time.perf_counter() - started
+            self.stats.model_aware_evidence_seconds += elapsed
+            self.stats.model_aware_overhead_seconds += elapsed
+
     def _apply_residual_policy(self, step: _StepState, result: _AggregatedResidual) -> None:
         if self._experiment_disabled:
             return
@@ -1262,12 +1569,15 @@ class SpectrumH3Runtime:
             self._required_actual_refreshes = self._run.min_actual_steps_after_forecast
             self.stats.forecast_steps += 1
             self.stats.forecast_model_calls += len(step.calls)
+            if step.model_aware_decision is not None:
+                self.stats.model_aware_forecasts += 1
         else:
             if any(call.used_forecast for call in step.calls):
                 raise RuntimeError("actual solver step retained a forecasted subcall")
             combined = self._aggregate_actual(step)
             residual_result = self._aggregate_residual(step)
             if combined is not None and not self._disabled:
+                self._observe_model_aware_anchor(step, combined)
                 if self._offline_phase == "first_pass" and self._offline_archive is not None:
                     assert self._history_labels is not None
                     archive_started = time.perf_counter()
@@ -1296,6 +1606,8 @@ class SpectrumH3Runtime:
             if step.consumes_feedback_refresh:
                 self._required_feedback_actuals = max(0, self._required_feedback_actuals - 1)
             self.stats.actual_steps += 1
+            if step.model_aware_forced_actual:
+                self.stats.adaptive_extra_nfes += 1
             self.stats.actual_transformer_calls += len(step.actual_records)
             if step.consumes_feedback_refresh:
                 self.stats.feedback_refreshes += 1
@@ -1321,6 +1633,7 @@ class SpectrumH3Runtime:
                 step.step_id,
                 step.coordinate,
                 step.mode == "actual",
+                model_aware_decision=step.model_aware_decision,
             )
 
         self.stats.current_window = self._current_window
@@ -1353,6 +1666,7 @@ class SpectrumH3Runtime:
             experiment_disable_reason=self._experiment_disable_reason,
             last_completed_mode=self._last_completed_mode,
             last_completed_step_id=self._last_completed_step_id,
+            model_aware_state=self.model_aware.snapshot(),
             stats=replace(self.stats),
         )
 
@@ -1382,6 +1696,11 @@ class SpectrumH3Runtime:
             "residual_output_head_seconds",
             "offline_archive_seconds",
             "offline_smoother_build_seconds",
+            "model_aware_overhead_seconds",
+            "model_aware_decision_seconds",
+            "model_aware_evidence_seconds",
+            "model_aware_fit_seconds",
+            "model_aware_correction_seconds",
         ):
             setattr(
                 restored,
@@ -1399,6 +1718,8 @@ class SpectrumH3Runtime:
             "offline_replay_model_calls",
             "offline_replay_anchor_steps",
             "offline_replay_smoothed_steps",
+            "model_aware_anchor_updates",
+            "model_aware_failures",
         ):
             setattr(
                 restored,
@@ -1415,6 +1736,15 @@ class SpectrumH3Runtime:
         restored.residual_policy_max_score = max(
             restored.residual_policy_max_score, current.residual_policy_max_score
         )
+        restored.model_aware_risk_max = max(
+            restored.model_aware_risk_max, current.model_aware_risk_max
+        )
+        restored.model_aware_confidence_min = min(
+            restored.model_aware_confidence_min, current.model_aware_confidence_min
+        )
+        restored.model_aware_correction_max = max(
+            restored.model_aware_correction_max, current.model_aware_correction_max
+        )
 
         self._run.next_step_id = snapshot.next_step_id
         self.forecaster.restore(snapshot.forecaster)
@@ -1430,6 +1760,13 @@ class SpectrumH3Runtime:
         self._experiment_disable_reason = snapshot.experiment_disable_reason
         self._last_completed_mode = snapshot.last_completed_mode
         self._last_completed_step_id = snapshot.last_completed_step_id
+        self.model_aware.restore(snapshot.model_aware_state)
+        restored.model_aware_model_corrected_ratio_mean = (
+            self.model_aware.model_corrected_ratio_mean
+        )
+        restored.model_aware_generic_corrected_ratio_mean = (
+            self.model_aware.generic_corrected_ratio_mean
+        )
         self._rollback_requested = False
         self._forced_actual_reason = None
         self._forced_actual_is_replay = False
@@ -1526,11 +1863,36 @@ class SpectrumH3Runtime:
             f"offline_archive_mib={self.stats.offline_archive_bytes / (1024 * 1024):.1f} "
             f"offline_full_schedule_estimated_mib={self.stats.offline_estimated_archive_bytes / (1024 * 1024):.1f} "
             f"direct_history_updates={self.stats.direct_history_updates} "
+            f"model_aware_mode={self.config.model_aware_mode!r} "
+            f"model_aware_profile_cache_hit={self.stats.model_profile_cache_hit} "
+            f"model_aware_profile_build_s={self.stats.model_profile_build_seconds:.6f} "
+            f"model_aware_profile_lookup_s={self.stats.model_profile_lookup_seconds:.6f} "
+            f"model_aware_profile_bytes={self.stats.model_profile_bytes} "
+            f"model_aware_profile_workspace_bytes={self.stats.model_profile_workspace_bytes} "
+            f"model_aware_patch_count={self.stats.model_profile_patch_count} "
+            f"model_aware_unknown_patches={self.stats.model_profile_unknown_patch_count} "
+            f"model_aware_sensitivity={self.stats.model_profile_sensitivity:.6f} "
+            f"model_aware_patch_perturbation={self.stats.model_profile_patch_perturbation:.6f} "
+            f"model_aware_forecasts={self.stats.model_aware_forecasts} "
+            f"model_aware_anchor_updates={self.stats.model_aware_anchor_updates} "
+            f"model_aware_failures={self.stats.model_aware_failures} "
+            f"model_aware_risk_max={self.stats.model_aware_risk_max:.6f} "
+            f"model_aware_confidence_min={self.stats.model_aware_confidence_min:.6f} "
+            f"model_aware_correction_max={self.stats.model_aware_correction_max:.6f} "
+            f"model_aware_extra_nfes={self.stats.adaptive_extra_nfes} "
+            f"model_aware_overhead_s={self.stats.model_aware_overhead_seconds:.6f} "
+            f"model_aware_decision_s={self.stats.model_aware_decision_seconds:.6f} "
+            f"model_aware_evidence_s={self.stats.model_aware_evidence_seconds:.6f} "
+            f"model_aware_fit_s={self.stats.model_aware_fit_seconds:.6f} "
+            f"model_aware_correction_s={self.stats.model_aware_correction_seconds:.6f} "
+            f"model_corrected_ratio_mean={self.stats.model_aware_model_corrected_ratio_mean:.6f} "
+            f"generic_corrected_ratio_mean={self.stats.model_aware_generic_corrected_ratio_mean:.6f} "
             f"history_storage={self.config.history_storage} "
             f"offline_archive_storage={self.config.offline_archive_storage} "
             f"offline_archive_device={str(offline_archive_device)!r} "
             f"history_device={str(self.prediction_history_device)!r} "
             f"history_mib={self.prediction_history_tensor_bytes / (1024 * 1024):.1f} "
             f"reason={self.stats.disable_reason!r} "
-            f"experimental_reason={self._experiment_disable_reason!r}"
+            f"experimental_reason={self._experiment_disable_reason!r} "
+            f"model_aware_reason={self._model_aware_disabled_reason!r}"
         )

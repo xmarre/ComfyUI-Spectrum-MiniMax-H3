@@ -24,6 +24,8 @@ class SpectrumH3Config:
     offline_smoothing_replay: bool = True
     audio_blend_weight: float = 0.0
     offline_archive_storage: str = "system_ram"
+    model_aware_mode: str = "off"
+    model_aware_risk_threshold: float = 0.65
 
     def __post_init__(self) -> None:
         trajectory_modes = {
@@ -121,6 +123,20 @@ class SpectrumH3Config:
             "vram",
         }:
             raise ValueError("offline_archive_storage must be 'system_ram' or 'vram'")
+        if not isinstance(self.model_aware_mode, str) or self.model_aware_mode not in {
+            "off",
+            "schedule",
+            "schedule_confidence",
+            "full",
+        }:
+            raise ValueError(
+                "model_aware_mode must be 'off', 'schedule', 'schedule_confidence', or 'full'"
+            )
+        if (
+            not math.isfinite(self.model_aware_risk_threshold)
+            or not 0.0 <= self.model_aware_risk_threshold <= 1.0
+        ):
+            raise ValueError("model_aware_risk_threshold must be finite and in [0, 1]")
         return self
 
 

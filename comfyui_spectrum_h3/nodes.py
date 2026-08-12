@@ -152,6 +152,32 @@ class SpectrumApplyMiniMaxH3:
                         ),
                     },
                 ),
+                "model_aware_mode": (
+                    ["off", "schedule", "schedule_confidence", "full"],
+                    {
+                        "default": "off",
+                        "tooltip": (
+                            "Experimental model/LoRA-aware forecasting. 'schedule' may replace risky forecasts "
+                            "with actual evaluations. 'schedule_confidence' also adapts ridge regularization, "
+                            "usable degree, and spectral share. 'full' additionally enables a bounded reduced-order "
+                            "model-informed correction. A lightweight scalar profile is built lazily and cached; "
+                            "no extra denoiser forward is performed. Existing workflows remain unchanged when off."
+                        ),
+                    },
+                ),
+                "model_aware_risk_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.65,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Advanced threshold for converting a prospective forecast into an actual model "
+                            "evaluation. Lower values are more conservative and may spend more NFEs."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -180,6 +206,8 @@ class SpectrumApplyMiniMaxH3:
         offline_smoothing_replay=True,
         audio_blend_weight=0.0,
         offline_archive_storage="system_ram",
+        model_aware_mode="off",
+        model_aware_risk_threshold=0.65,
     ):
         if not enabled:
             return (model,)
@@ -217,6 +245,8 @@ class SpectrumApplyMiniMaxH3:
             offline_smoothing_replay=offline_smoothing_replay,
             audio_blend_weight=float(audio_blend_weight),
             offline_archive_storage=str(offline_archive_storage),
+            model_aware_mode=str(model_aware_mode),
+            model_aware_risk_threshold=float(model_aware_risk_threshold),
             debug=bool(debug),
         ).validate()
         patched = model.clone()

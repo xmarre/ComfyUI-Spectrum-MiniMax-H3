@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import math
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
+
+from .model_aware import AnchorEvidence
 
 
 @dataclass(slots=True)
@@ -72,6 +76,8 @@ class HistoryWeightForecaster:
         self._jitter_attempts = 0
         self.last_prediction_chunk_count = 0
         self.last_prediction_max_fp32_elements = 0
+        self.model_aware_fit_seconds = 0.0
+        self.model_aware_correction_seconds = 0.0
 
     def snapshot(self) -> ForecasterSnapshot:
         return ForecasterSnapshot(
@@ -231,6 +237,46 @@ class HistoryWeightForecaster:
     def spectral_weights(self, coordinate: float) -> torch.Tensor:
         return self._spectral_weights(coordinate)
 
+    def _spectral_weights_configured(
+        self,
+        coordinate: float,
+        *,
+        degree: int,
+        ridge_lambda: float,
+    ) -> torch.Tensor:
+        resolved_degree = int(degree)
+        resolved_ridge = float(ridge_lambda)
+        if resolved_degree == self.degree and math.isclose(
+            resolved_ridge,
+            self.ridge_lambda,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return self._spectral_weights(coordinate)
+        if resolved_degree < 1 or resolved_degree + 1 > len(self._history):
+            raise ValueError("adaptive degree is invalid for the available actual history")
+        if not math.isfinite(resolved_ridge) or resolved_ridge < 0.0:
+            raise ValueError("adaptive ridge_lambda must be finite and nonnegative")
+        coords = torch.tensor([entry.coordinate for entry in self._history], dtype=torch.float32)
+        design = self.chebyshev_design(coords, resolved_degree)
+        gram = design.transpose(0, 1) @ design
+        eye = torch.eye(gram.shape[0], dtype=torch.float32)
+        base = gram + resolved_ridge * eye
+        diagonal_scale = max(float(gram.diag().abs().mean().item()), 1.0)
+        cholesky = None
+        last_error: RuntimeError | None = None
+        for multiplier in (0.0, 1e-8, 1e-7, 1e-6, 1e-5):
+            try:
+                cholesky = torch.linalg.cholesky(base + (diagonal_scale * multiplier) * eye)
+                break
+            except RuntimeError as exc:
+                last_error = exc
+        if cholesky is None:
+            raise RuntimeError("adaptive Spectrum ridge factorization failed") from last_error
+        phi = self.chebyshev_design(torch.tensor([float(coordinate)]), resolved_degree)
+        solved = torch.cholesky_solve(design.transpose(0, 1), cholesky)
+        return (phi @ solved).reshape(-1)
+
     def _linear_weights(self, coordinate: float) -> torch.Tensor:
         weights = torch.zeros(len(self._history), dtype=torch.float32)
         if len(self._history) == 1:
@@ -257,6 +303,155 @@ class HistoryWeightForecaster:
         if blend >= 1.0 - 1e-12:
             return spectral
         return blend * spectral + (1.0 - blend) * self._linear_weights(coordinate)
+
+    def model_aware_weights(
+        self,
+        coordinate: float,
+        blend_weight: float,
+        *,
+        degree: int,
+        ridge_lambda: float,
+        correction_gain: float = 0.0,
+    ) -> torch.Tensor:
+        fit_started = time.perf_counter()
+        blend = float(blend_weight)
+        if not 0.0 <= blend <= 1.0:
+            raise ValueError("blend_weight must be in [0, 1]")
+        if blend <= 1e-12:
+            weights = self._linear_weights(coordinate)
+        else:
+            spectral = self._spectral_weights_configured(
+                coordinate,
+                degree=int(degree),
+                ridge_lambda=float(ridge_lambda),
+            )
+            weights = spectral if blend >= 1.0 - 1e-12 else blend * spectral + (1.0 - blend) * self._linear_weights(coordinate)
+        self.model_aware_fit_seconds += time.perf_counter() - fit_started
+        gain = float(correction_gain)
+        if not math.isfinite(gain) or not -0.25 <= gain <= 0.25:
+            raise ValueError("model-aware correction gain must be finite and in [-0.25, 0.25]")
+        if gain != 0.0:
+            correction_started = time.perf_counter()
+            if len(self._history) < 2:
+                raise RuntimeError("model-aware correction requires two actual history entries")
+            weights = weights.clone()
+            weights[-2] -= gain
+            weights[-1] += gain
+            self.model_aware_correction_seconds += time.perf_counter() - correction_started
+        return weights
+
+    def fit_condition(self, *, degree: int | None = None) -> float:
+        resolved_degree = self.degree if degree is None else int(degree)
+        if resolved_degree < 1 or resolved_degree + 1 > len(self._history):
+            return float("inf")
+        coords = torch.tensor([entry.coordinate for entry in self._history], dtype=torch.float32)
+        design = self.chebyshev_design(coords, resolved_degree)
+        try:
+            condition = float(torch.linalg.cond(design).item())
+        except RuntimeError:
+            return float("inf")
+        return condition if math.isfinite(condition) else float("inf")
+
+    @staticmethod
+    def _sample_segment(
+        feature: torch.Tensor,
+        start_row: int,
+        end_row: int,
+        *,
+        limit: int = 4096,
+    ) -> torch.Tensor:
+        samples = []
+        per_branch = max(1, int(limit) // max(1, int(feature.shape[0])))
+        for branch in range(int(feature.shape[0])):
+            flat = feature[branch, start_row:end_row].detach().reshape(-1)
+            if flat.numel() == 0:
+                continue
+            stride = max(1, flat.numel() // per_branch)
+            samples.append(flat[::stride][:per_branch].to(device="cpu", dtype=torch.float32))
+        if not samples:
+            raise ValueError("cannot sample an empty feature segment")
+        return torch.cat(samples)
+
+    def sampled_anchor_evidence(
+        self,
+        coordinate: float,
+        actual_feature: torch.Tensor,
+        stream_parameters: Sequence[tuple[str, int, int, float, float, float]],
+        *,
+        degree: int,
+        ridge_lambda: float,
+    ) -> AnchorEvidence | None:
+        if len(self._history) < 2 or self._feature_shape is None:
+            return None
+        if tuple(actual_feature.shape) != self._feature_shape:
+            raise ValueError("actual feature shape changed during model-aware evidence sampling")
+        forecast_ratios = []
+        curvature_ratios = []
+        model_ratios = []
+        generic_ratios = []
+        projections: dict[str, float] = {}
+        for name, start, end, blend, model_gain, generic_gain in stream_parameters:
+            raw_weights = self.model_aware_weights(
+                coordinate,
+                blend,
+                degree=degree,
+                ridge_lambda=ridge_lambda,
+                correction_gain=0.0,
+            )
+            history_samples = [
+                self._sample_segment(
+                    entry.feature_flat.reshape(self._feature_shape),
+                    int(start),
+                    int(end),
+                )
+                for entry in self._history
+            ]
+            actual = self._sample_segment(actual_feature, int(start), int(end))
+            predicted = torch.zeros_like(actual)
+            for weight, sample in zip(raw_weights.tolist(), history_samples, strict=True):
+                if weight != 0.0:
+                    predicted.add_(sample, alpha=float(weight))
+            latest = history_samples[-1]
+            previous = history_samples[-2]
+            delta = latest - previous
+            residual = actual - predicted
+            epsilon = max(float(torch.sqrt(torch.mean(actual.square())).item()) * 1e-6, torch.finfo(torch.float32).eps)
+            forecast_rms = float(torch.sqrt(torch.mean(residual.square())).item())
+            hold_rms = float(torch.sqrt(torch.mean((actual - latest).square())).item())
+            denominator = float(torch.dot(delta, delta).item())
+            dot_epsilon = epsilon * epsilon * max(1, int(delta.numel()))
+            projection = float(torch.dot(residual, delta).item()) / max(denominator, dot_epsilon)
+            projections[str(name)] = max(-2.0, min(2.0, projection))
+            forecast_ratios.append(forecast_rms / max(hold_rms, epsilon))
+            model_predicted = predicted + float(model_gain) * delta
+            generic_predicted = predicted + float(generic_gain) * delta
+            model_ratios.append(
+                float(torch.sqrt(torch.mean((actual - model_predicted).square())).item())
+                / max(hold_rms, epsilon)
+            )
+            generic_ratios.append(
+                float(torch.sqrt(torch.mean((actual - generic_predicted).square())).item())
+                / max(hold_rms, epsilon)
+            )
+            if len(history_samples) >= 3:
+                curvature = latest - 2.0 * previous + history_samples[-3]
+                curvature_rms = float(torch.sqrt(torch.mean(curvature.square())).item())
+                delta_rms = float(torch.sqrt(torch.mean(delta.square())).item())
+                curvature_ratios.append(curvature_rms / max(delta_rms, epsilon))
+            else:
+                curvature_ratios.append(0.0)
+        values = forecast_ratios + curvature_ratios + model_ratios + generic_ratios + list(projections.values())
+        if not values or not all(math.isfinite(value) for value in values):
+            raise ValueError("model-aware anchor evidence is nonfinite")
+        return AnchorEvidence(
+            forecast_ratio=max(forecast_ratios),
+            curvature_ratio=max(curvature_ratios),
+            fit_condition=self.fit_condition(degree=degree),
+            audio_projection=projections.get("audio", projections.get("packed", 0.0)),
+            video_projection=projections.get("video", projections.get("packed", 0.0)),
+            model_corrected_ratio=max(model_ratios),
+            generic_corrected_ratio=max(generic_ratios),
+        )
 
     def _chunk_elements(self, device: torch.device) -> int:
         target_bytes = self.chunk_bytes

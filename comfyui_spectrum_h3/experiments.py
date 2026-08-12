@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from .forecast import HistoryWeightForecaster
-
+from .model_aware import ModelAwareForecastDecision
 
 DEFAULT_CHUNK_BYTES = 32 * 1024 * 1024
 OFFLINE_VALIDATION_SAMPLES = 16 * 1024
@@ -103,6 +103,7 @@ class OfflineStepRecord:
     step_id: int
     coordinate: float
     actual: bool
+    model_aware_decision: ModelAwareForecastDecision | None = None
 
 
 @dataclass(slots=True)
@@ -151,14 +152,28 @@ class OfflineFeatureArchive:
             self.valid = False
             self.failure_reason = str(reason)
 
-    def record_step(self, step_id: int, coordinate: float, actual: bool) -> None:
+    def record_step(
+        self,
+        step_id: int,
+        coordinate: float,
+        actual: bool,
+        *,
+        model_aware_decision: ModelAwareForecastDecision | None = None,
+    ) -> None:
         if not self.valid:
             return
         expected = len(self.steps)
         if int(step_id) != expected:
             self.invalidate(f"offline step sequence changed: expected {expected}, got {step_id}")
             return
-        self.steps.append(OfflineStepRecord(int(step_id), float(coordinate), bool(actual)))
+        self.steps.append(
+            OfflineStepRecord(
+                int(step_id),
+                float(coordinate),
+                bool(actual),
+                model_aware_decision,
+            )
+        )
 
     def record_actual(
         self,
@@ -331,6 +346,14 @@ class OfflineSmoother:
     def last_prediction_chunk_count(self) -> int:
         return self._last_prediction_chunk_count
 
+    @property
+    def model_aware_fit_seconds(self) -> float:
+        return self._forecaster.model_aware_fit_seconds
+
+    @property
+    def model_aware_correction_seconds(self) -> float:
+        return self._forecaster.model_aware_correction_seconds
+
     @staticmethod
     def _affine_spectral_weights(weights: torch.Tensor) -> torch.Tensor:
         normalized = weights.detach().to(device="cpu", dtype=torch.float32).clone()
@@ -463,8 +486,17 @@ class OfflineSmoother:
         for record in self.archive.steps:
             if record.actual:
                 continue
+            decision = record.model_aware_decision
+            spectral_degree = self.degree if decision is None else decision.degree
+            spectral_ridge = self.ridge_lambda if decision is None else decision.ridge_lambda
             spectral = self._affine_spectral_weights(
-                self._forecaster.spectral_weights(record.coordinate)
+                self._forecaster.model_aware_weights(
+                    record.coordinate,
+                    1.0,
+                    degree=spectral_degree,
+                    ridge_lambda=spectral_ridge,
+                    correction_gain=0.0,
+                )
             )
             position = bisect.bisect_left(self._anchor_ids, record.step_id)
             if position == 0 or position == len(self._anchor_ids):
@@ -480,6 +512,20 @@ class OfflineSmoother:
             local[position] = ratio
             for stream_index, (stream_name, _, _) in enumerate(self._stream_ranges):
                 configured_blend = self.configured_stream_blends[stream_name]
+                correction_gain = 0.0
+                if decision is not None:
+                    if stream_name == "audio":
+                        configured_blend = decision.audio_blend_weight
+                        correction_gain = decision.audio_correction_gain
+                    elif stream_name == "video":
+                        configured_blend = decision.video_blend_weight
+                        correction_gain = decision.video_correction_gain
+                    else:
+                        configured_blend = decision.video_blend_weight
+                        correction_gain = 0.5 * (
+                            decision.audio_correction_gain
+                            + decision.video_correction_gain
+                        )
                 for branch in range(self._branch_count):
                     validation_score = self._validation_score_for_interval(
                         position,
@@ -487,9 +533,14 @@ class OfflineSmoother:
                         stream_index,
                     )
                     effective_blend = configured_blend / max(1.0, validation_score)
-                    weights_by_step[(record.step_id, branch, stream_index)] = (
+                    weights = (
                         effective_blend * spectral + (1.0 - effective_blend) * local
                     )
+                    if correction_gain != 0.0 and position >= 2:
+                        weights = weights.clone()
+                        weights[position - 2] -= correction_gain
+                        weights[position - 1] += correction_gain
+                    weights_by_step[(record.step_id, branch, stream_index)] = weights
                     effective_blends.append(effective_blend)
                     stream_effective_blends[stream_name].append(effective_blend)
                     if effective_blend < configured_blend - 1e-7:

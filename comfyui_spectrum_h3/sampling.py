@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 
+from .model_aware import get_model_forecastability_profile
 from .rollback import run_selective_rollback_euler
 from .runtime import ForecastRetryActual, OfflineReplayAbort, SpectrumH3Runtime
 
@@ -187,6 +188,39 @@ def outer_sample_wrapper(
 
     runtime = binding.runtime
     name = sampler_name(sampler)
+    if runtime.config.model_aware_mode != "off":
+        try:
+            lookup = get_model_forecastability_profile(guider.model_patcher)
+            runtime.set_model_profile(lookup)
+            if runtime.config.debug:
+                profile = lookup.profile
+                LOG.warning(
+                    "Spectrum H3 model-aware profile base=%s patches=%s patch_keys=%s "
+                    "recognized_lora=%s unknown_patches=%s cache=%s build_s=%.6f "
+                    "lookup_s=%.6f memory_bytes=%s sensitivity=%.6f perturbation=%.6f "
+                    "final_perturbation=%.6f confidence=%.6f",
+                    profile.base_model_identity,
+                    profile.active_patch_count,
+                    profile.active_patch_keys,
+                    profile.recognized_lora_count,
+                    profile.unknown_patch_count,
+                    "hit" if lookup.cache_hit else "miss",
+                    profile.build_seconds,
+                    lookup.lookup_seconds,
+                    profile.estimated_bytes,
+                    profile.aggregate_sensitivity,
+                    profile.patch_perturbation,
+                    profile.final_block_perturbation,
+                    profile.profile_confidence,
+                )
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            runtime.disable_model_aware(f"profile construction failed: {exc}")
+            LOG.warning(
+                "Spectrum H3 model-aware forecasting unavailable for this run: %s",
+                exc,
+            )
 
     def execute_run(
         run_noise,
@@ -402,6 +436,28 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
             runtime.prediction_history_length,
             runtime.stats.current_window,
         )
+        model_decision = runtime.active_model_aware_decision
+        if model_decision is not None:
+            LOG.warning(
+                "Spectrum H3 model-aware step=%s trajectory_risk=%.6f model_risk=%.6f "
+                "patch_risk=%.6f combined_risk=%.6f confidence=%.6f horizon=%.3f "
+                "degree=%s ridge=%.8f audio_blend=%.6f video_blend=%.6f "
+                "audio_correction=%.6f video_correction=%.6f decision=%s",
+                decision["step_id"],
+                model_decision.trajectory_risk,
+                model_decision.model_risk,
+                model_decision.patch_risk,
+                model_decision.combined_risk,
+                model_decision.confidence,
+                model_decision.forecast_horizon,
+                model_decision.degree,
+                model_decision.ridge_lambda,
+                model_decision.audio_blend_weight,
+                model_decision.video_blend_weight,
+                model_decision.audio_correction_gain,
+                model_decision.video_correction_gain,
+                "ACTUAL" if decision["actual"] else "FORECAST",
+            )
 
     def execute_attempt(attempt_decision: dict[str, Any]):
         patched = copy_model_options_with_step(model_options, runtime, attempt_decision)
