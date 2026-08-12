@@ -4,7 +4,9 @@ This matrix is intentionally separate from implementation-unit results. Do not p
 
 ## Fixed inputs
 
-Record the exact ComfyUI commit, node commit, MiniMax-H3 checkpoint and precision, LoRA files and strengths, prompt, reference media hashes, seed, sampler, scheduler, steps, resolution, frame count, CFG, Spectrum base controls, device, PyTorch build, and warm-up procedure. Run at least one base-model configuration and one materially strong LoRA configuration. Add a stacked-LoRA configuration when resources permit.
+Record the exact ComfyUI commit, node commit, MiniMax-H3 checkpoint and precision, LoRA files and strengths, prompt, reference media hashes, prespecified seeds, sampler, scheduler, steps, resolution, frame count, CFG, Spectrum base controls, device, PyTorch build, and warm-up procedure. Run at least one base-model configuration and one materially strong LoRA configuration. Add a stacked-LoRA configuration when resources permit.
+
+Use at least five independent seeds for each complete comparison matrix, paired across every compared variant. Report every paired result plus the median paired delta and a bootstrap 95% confidence interval. Establish timing repeatability with at least three control repetitions after warm-up; a timing delta is inconclusive when it is smaller than the larger of 3% or twice the control's median absolute deviation. Treat forecast-error deltas smaller than 2% as inconclusive. Perceptual video, audio, and synchronization results require blinded per-seed judgments and remain descriptive.
 
 Use the same inputs for:
 
@@ -16,7 +18,7 @@ Use the same inputs for:
 | D | `full` | Model-scaled correction contribution |
 | E | Spectrum disabled | Native reference |
 
-For equal-NFE comparison, rerun A (or adjust its fixed schedule conservatively) so its actual transformer-call count matches B-D. For equal-wall-clock comparison, choose the closest completed run without changing prompt, seed, model, or sampler, and report the residual timing mismatch.
+For equal-NFE comparison, create three separate legacy controls: A-B matches B's actual transformer-call count, A-C matches C's count, and A-D matches D's count for the same seed. Record the actual step IDs as well as the total count for every pair. If the legacy controls cannot express an exact target count, mark that pair's equal-NFE cell unavailable. Do not reuse one A run for variants with different NFE totals. For equal-wall-clock comparison, choose the closest completed run for each pair without changing prompt, seed, model, or sampler, and report the residual timing mismatch.
 
 ## Measurements
 
@@ -30,7 +32,7 @@ Capture the debug summary plus:
 - correction magnitude and model-informed versus generic-correction error ratios;
 - decoded same-seed video, audio, and synchronization assessments using a blinded ordering where practical.
 
-Repeat each timing after one warm-up and include a second generation with the identical effective patch set to measure cache benefit. Do not average away failures; report every seed and cancellation.
+Repeat each timing after one warm-up and include a second generation with the identical effective patch set to measure cache benefit. Run both cache measurements in the same process with the same clone lineage, patch-set identity and strengths, H3 architecture, and bypass-adapter metadata. Do not clear or evict the process-local profile cache between them. Report every seed, repetition, failure, and cancellation.
 
 ## Required ablations
 
@@ -44,7 +46,9 @@ Run, or explicitly mark unavailable:
 6. base model, strong single LoRA, and stacked LoRAs;
 7. Euler, deterministic RES/CFG++ where applicable, Turbo, and native seeded `er_sde`.
 
-The principal hypotheses are rejected if the correct weight prior does not outperform a neutral/mismatched prior at matched NFE, or if model-scaled correction does not improve sampled anchor error over generic correction after accounting for wall time. A higher NFE count alone is not evidence of a better scheduler.
+The current public node has no neutral-profile, mismatched-profile, profile-injection, or calibration-freeze control. Consequently, ablations 1-4 are unavailable for end-to-end real-checkpoint runs in this branch. Unit tests can inject profiles directly into `ModelAwareController`, but that does not constitute the required sampling harness. Keep these cells unavailable until a benchmark-only harness can inject a selected immutable profile before `start_run`, optionally replace it with a neutral or deliberately mismatched profile, and freeze `observe_anchor` calibration for the full run without changing ordinary node behavior.
+
+Evaluate each hypothesis from its paired per-seed deltas. Reject the weight-prior hypothesis when the upper bound of the paired 95% confidence interval fails to exceed the 2% forecast-error tolerance against both neutral and mismatched profiles at matched NFE. Reject the model-scaled-correction hypothesis by the same rule against generic correction after applying the timing tolerance above. If the required ablation cells are unavailable or the interval crosses the tolerance boundary, report the hypothesis as untested or inconclusive. A higher NFE count alone is not evidence of a better scheduler.
 
 ## Result status
 

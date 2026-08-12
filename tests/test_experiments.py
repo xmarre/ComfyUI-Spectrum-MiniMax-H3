@@ -282,6 +282,22 @@ def test_offline_replay_preserves_per_forecast_model_aware_decisions_without_ind
     assert archive.steps[3].model_aware_decision is second_decision
     assert smoother.effective_blend_stream_stats["audio"] == (0.0, 0.0, 0.0)
     assert smoother.effective_blend_stream_stats["video"] == pytest.approx((0.2, 0.5, 0.8))
+    spectral = smoother._affine_spectral_weights(
+        smoother._forecaster.model_aware_weights(
+            coordinates[3],
+            1.0,
+            degree=second_decision.degree,
+            ridge_lambda=second_decision.ridge_lambda,
+        )
+    )
+    local = torch.tensor([0.0, 0.5, 0.5])
+    expected_step_3_video = 0.8 * spectral + 0.2 * local
+    expected_step_3_video[1] += 0.1
+    expected_step_3_video[2] -= 0.1
+    torch.testing.assert_close(
+        smoother._forecast_weights[(3, 0, 1)],
+        expected_step_3_video,
+    )
     assert not torch.equal(
         smoother._forecast_weights[(1, 0, 1)],
         smoother._forecast_weights[(3, 0, 1)],

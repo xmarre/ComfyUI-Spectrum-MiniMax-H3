@@ -360,6 +360,9 @@ class SpectrumH3Runtime:
 
     def disable_model_aware(self, reason: str) -> None:
         self._model_aware_disabled_reason = str(reason)
+        self._model_profile = None
+        self._model_profile_cache_hit = False
+        self._model_profile_lookup_seconds = 0.0
         self.model_aware.set_profile(None)
 
     @property
@@ -451,6 +454,8 @@ class SpectrumH3Runtime:
         self,
         call: _CallState,
         decision: ModelAwareForecastDecision,
+        *,
+        coordinate: float,
     ) -> tuple[tuple[int, int, torch.Tensor], ...]:
         fit_before = self.forecaster.model_aware_fit_seconds
         correction_before = self.forecaster.model_aware_correction_seconds
@@ -485,7 +490,7 @@ class SpectrumH3Runtime:
                     ),
                 )
             weights = self.forecaster.model_aware_weights(
-                self._step.coordinate if self._step is not None else 0.0,
+                coordinate,
                 blend,
                 degree=decision.degree,
                 ridge_lambda=decision.ridge_lambda,
@@ -1216,10 +1221,11 @@ class SpectrumH3Runtime:
                     model_aware_weighted_segments = self._model_aware_weight_segments(
                         call,
                         step.model_aware_decision,
+                        coordinate=step.coordinate,
                     )
                 else:
                     segments = self._prediction_segments(call)
-            except ValueError as exc:
+            except (RuntimeError, ValueError) as exc:
                 self._fallback_or_retry(step, str(exc))
                 return None
         started = time.perf_counter()

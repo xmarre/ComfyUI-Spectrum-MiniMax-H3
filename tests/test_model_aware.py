@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import gc
 import weakref
 from types import SimpleNamespace
@@ -127,7 +128,10 @@ def test_base_profile_is_scalar_only_and_reused_across_clone_lineage():
     assert first.profile.active_patch_count == 0
     assert first.profile.sampled_base_tensors == 8
     assert first.profile.estimated_bytes <= 4096
-    assert all(not torch.is_tensor(value) for value in first.profile.__dict__.values()) if hasattr(first.profile, "__dict__") else True
+    assert all(
+        not torch.is_tensor(getattr(first.profile, field.name))
+        for field in dataclasses.fields(first.profile)
+    )
 
     reference = weakref.ref(original)
     del original
@@ -394,3 +398,98 @@ def test_model_aware_schedule_can_only_convert_a_legacy_forecast_to_actual():
     assert second["reason"] == "model-aware forecast risk"
     assert runtime.active_model_aware_decision is not None
     assert runtime.active_model_aware_decision.force_actual
+
+
+def test_disabling_model_aware_clears_profile_and_lookup_metadata():
+    runtime = SpectrumH3Runtime(SpectrumH3Config(model_aware_mode="schedule"))
+    runtime.set_model_profile(ProfileLookup(_profile(), True, 0.25))
+
+    runtime.disable_model_aware("profile refresh failed")
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+    )
+
+    assert runtime.model_profile is None
+    assert runtime.model_aware.profile is None
+    assert not runtime.stats.model_profile_cache_hit
+    assert runtime.stats.model_profile_lookup_seconds == 0.0
+    assert runtime.stats.model_profile_bytes == 0
+    runtime.end_run(run_id)
+
+
+def test_model_aware_weight_failure_uses_actual_fallback_with_resolved_coordinate(
+    monkeypatch,
+):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            warmup_steps=2,
+            tail_actual_steps=0,
+            window_size=2.0,
+            bootstrap_first_forecast=False,
+            offline_smoothing_replay=False,
+            model_aware_mode="schedule_confidence",
+            model_aware_risk_threshold=1.0,
+        )
+    )
+    runtime.set_model_profile(ProfileLookup(_profile(forecast_risk_prior=0.0), False, 0.001))
+    runtime.start_run(
+        torch.linspace(1.0, 0.0, 5),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    topology = (("target_audio_rows", 1), ("target_video_rows", 1))
+    labels = ((0, "positive"),)
+    for timestep in (1.0, 0.75):
+        actual_step = runtime.begin_step(torch.tensor([timestep]))
+        call_id, actual = runtime.begin_model_call(
+            actual_step["run_id"],
+            actual_step["step_id"],
+            topology=topology,
+            labels=labels,
+            expected_shape=(1, 2, 2),
+        )
+        assert actual
+        runtime.observe_actual(
+            actual_step["run_id"],
+            actual_step["step_id"],
+            call_id,
+            torch.full((1, 2, 2), timestep),
+        )
+        runtime.finalize_step(actual_step["run_id"], actual_step["step_id"])
+
+    forecast_step = runtime.begin_step(torch.tensor([0.5]))
+    call_id, actual = runtime.begin_model_call(
+        forecast_step["run_id"],
+        forecast_step["step_id"],
+        topology=topology,
+        labels=labels,
+        expected_shape=(1, 2, 2),
+    )
+    assert not actual
+    observed_coordinates = []
+
+    def fail_weight_construction(_call, _decision, *, coordinate):
+        observed_coordinates.append(coordinate)
+        raise RuntimeError("synthetic adaptive factorization failure")
+
+    monkeypatch.setattr(runtime, "_model_aware_weight_segments", fail_weight_construction)
+
+    prediction = runtime.predict(
+        forecast_step["run_id"],
+        forecast_step["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert prediction is None
+    assert observed_coordinates == [pytest.approx(forecast_step["coordinate"])]
+    assert runtime._step is not None
+    assert runtime._step.mode == "actual"
+    assert runtime._step.fallback

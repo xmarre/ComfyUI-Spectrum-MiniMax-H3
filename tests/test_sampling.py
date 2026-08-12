@@ -136,6 +136,40 @@ def test_unsupported_sampler_does_not_build_unused_model_profile(monkeypatch):
     assert calls == []
 
 
+def test_replay_unsafe_er_sde_does_not_build_unused_model_profile(monkeypatch):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(model_aware_mode="schedule", offline_smoothing_replay=True)
+    )
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}}
+    )
+    sampler = _sampler("sample_er_sde")
+    sampler.extra_options = {"noise_sampler": lambda *args: args[0]}
+    profile_calls = []
+    monkeypatch.setattr(
+        sampling_module,
+        "get_model_forecastability_profile",
+        lambda _patcher: profile_calls.append(_patcher),
+    )
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            return "native-er-sde-result"
+
+    result = outer_sample_wrapper(
+        Executor(),
+        torch.ones(1),
+        torch.zeros(1),
+        sampler,
+        torch.tensor([1.0, 0.0]),
+    )
+
+    assert result == "native-er-sde-result"
+    assert profile_calls == []
+
+
 def test_er_sde_native_sampler_components_are_seeded_replay_safe():
     sampler = _sampler("sample_er_sde")
     sampler.extra_options = {"max_stage": 2, "s_noise": 0.75}

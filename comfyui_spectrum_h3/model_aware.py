@@ -246,12 +246,12 @@ def _sample_tensor_rms(value: Any, *, limit: int = _BASE_SAMPLE_ELEMENTS) -> tup
     return rms, int(sample.numel())
 
 
-def _operator_gain(weight: Any) -> float | None:
-    rms, _ = _sample_tensor_rms(weight)
+def _operator_gain(weight: Any) -> tuple[float | None, int]:
+    rms, samples = _sample_tensor_rms(weight)
     if rms is None or not torch.is_tensor(weight) or weight.ndim < 2:
-        return None
+        return None, samples
     in_features = math.prod(int(v) for v in weight.shape[1:])
-    return rms * math.sqrt(max(1, in_features))
+    return rms * math.sqrt(max(1, in_features)), samples
 
 
 def _get_base_weight(model_patcher: Any, key: str) -> Any | None:
@@ -375,8 +375,7 @@ def _build_profile(model_patcher: Any, inner: Any, cache_key: tuple[Any, ...]) -
     sampled_values = 0
     for key in _selected_base_keys(inner):
         weight = _get_base_weight(model_patcher, key)
-        gain = _operator_gain(weight)
-        _, samples = _sample_tensor_rms(weight)
+        gain, samples = _operator_gain(weight)
         sampled_values += samples
         if gain is not None:
             base_gains[key] = gain

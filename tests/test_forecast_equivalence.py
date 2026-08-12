@@ -159,6 +159,28 @@ def test_factorization_is_reused_until_history_changes():
     assert forecaster.factorization_count == count + 1
 
 
+def test_adaptive_factorizations_are_included_in_diagnostics():
+    forecaster = HistoryWeightForecaster(degree=2, ridge_lambda=0.1, max_history=4)
+    for coordinate in (-1.0, -0.25, 0.5):
+        forecaster.update(coordinate, torch.ones(1, 2, 3))
+
+    forecaster.model_aware_weights(
+        0.75,
+        1.0,
+        degree=1,
+        ridge_lambda=0.2,
+    )
+    assert forecaster.factorization_count == 1
+
+    forecaster.model_aware_weights(
+        0.8,
+        1.0,
+        degree=1,
+        ridge_lambda=0.2,
+    )
+    assert forecaster.factorization_count == 2
+
+
 def test_max_history_eviction_and_degree_change_instances():
     low = HistoryWeightForecaster(degree=1, ridge_lambda=0.1, max_history=2)
     for index in range(5):

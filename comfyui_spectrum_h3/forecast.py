@@ -205,28 +205,41 @@ class HistoryWeightForecaster:
 
         coords = torch.tensor([entry.coordinate for entry in self._history], dtype=torch.float32)
         design = self.chebyshev_design(coords, self.degree)
-        gram = design.transpose(0, 1) @ design
-        eye = torch.eye(gram.shape[0], dtype=torch.float32)
-        base = gram + self.ridge_lambda * eye
-        diagonal_scale = max(float(gram.diag().abs().mean().item()), 1.0)
-        jitters = (0.0, 1e-8, 1e-7, 1e-6, 1e-5)
-        last_error: RuntimeError | None = None
-        cholesky = None
-        for attempt, multiplier in enumerate(jitters):
-            try:
-                cholesky = torch.linalg.cholesky(base + (diagonal_scale * multiplier) * eye)
-                self._jitter_attempts += attempt
-                break
-            except RuntimeError as exc:
-                last_error = exc
-        if cholesky is None:
-            raise RuntimeError("Spectrum ridge factorization failed after bounded jitter attempts") from last_error
+        cholesky, jitter_attempts = self._factorize_design(
+            design,
+            self.ridge_lambda,
+            failure_message="Spectrum ridge factorization failed after bounded jitter attempts",
+        )
 
+        self._jitter_attempts += jitter_attempts
+        self._factorization_count += 1
         self._design = design
         self._cholesky = cholesky
         self._factor_generation = self._generation
-        self._factorization_count += 1
         return design, cholesky
+
+    @staticmethod
+    def _factorize_design(
+        design: torch.Tensor,
+        ridge_lambda: float,
+        *,
+        failure_message: str,
+    ) -> tuple[torch.Tensor, int]:
+        gram = design.transpose(0, 1) @ design
+        eye = torch.eye(gram.shape[0], dtype=torch.float32)
+        base = gram + float(ridge_lambda) * eye
+        diagonal_scale = max(float(gram.diag().abs().mean().item()), 1.0)
+        jitters = (0.0, 1e-8, 1e-7, 1e-6, 1e-5)
+        last_error: RuntimeError | None = None
+        for attempt, multiplier in enumerate(jitters):
+            try:
+                cholesky = torch.linalg.cholesky(
+                    base + (diagonal_scale * multiplier) * eye
+                )
+                return cholesky, attempt
+            except RuntimeError as exc:
+                last_error = exc
+        raise RuntimeError(failure_message) from last_error
 
     def _spectral_weights(self, coordinate: float) -> torch.Tensor:
         design, cholesky = self._ensure_factorization()
@@ -259,20 +272,13 @@ class HistoryWeightForecaster:
             raise ValueError("adaptive ridge_lambda must be finite and nonnegative")
         coords = torch.tensor([entry.coordinate for entry in self._history], dtype=torch.float32)
         design = self.chebyshev_design(coords, resolved_degree)
-        gram = design.transpose(0, 1) @ design
-        eye = torch.eye(gram.shape[0], dtype=torch.float32)
-        base = gram + resolved_ridge * eye
-        diagonal_scale = max(float(gram.diag().abs().mean().item()), 1.0)
-        cholesky = None
-        last_error: RuntimeError | None = None
-        for multiplier in (0.0, 1e-8, 1e-7, 1e-6, 1e-5):
-            try:
-                cholesky = torch.linalg.cholesky(base + (diagonal_scale * multiplier) * eye)
-                break
-            except RuntimeError as exc:
-                last_error = exc
-        if cholesky is None:
-            raise RuntimeError("adaptive Spectrum ridge factorization failed") from last_error
+        cholesky, jitter_attempts = self._factorize_design(
+            design,
+            resolved_ridge,
+            failure_message="adaptive Spectrum ridge factorization failed",
+        )
+        self._jitter_attempts += jitter_attempts
+        self._factorization_count += 1
         phi = self.chebyshev_design(torch.tensor([float(coordinate)]), resolved_degree)
         solved = torch.cholesky_solve(design.transpose(0, 1), cholesky)
         return (phi @ solved).reshape(-1)

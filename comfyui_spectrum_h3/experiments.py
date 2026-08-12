@@ -536,10 +536,10 @@ class OfflineSmoother:
                     weights = (
                         effective_blend * spectral + (1.0 - effective_blend) * local
                     )
-                    if correction_gain != 0.0 and position >= 2:
+                    if correction_gain != 0.0:
                         weights = weights.clone()
-                        weights[position - 2] -= correction_gain
-                        weights[position - 1] += correction_gain
+                        weights[position - 1] -= correction_gain
+                        weights[position] += correction_gain
                     weights_by_step[(record.step_id, branch, stream_index)] = weights
                     effective_blends.append(effective_blend)
                     stream_effective_blends[stream_name].append(effective_blend)
