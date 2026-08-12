@@ -157,11 +157,13 @@ class SpectrumApplyMiniMaxH3:
                     {
                         "default": "off",
                         "tooltip": (
-                            "Experimental model/LoRA-aware forecasting. 'schedule' may replace risky forecasts "
-                            "with actual evaluations. 'schedule_confidence' also adapts ridge regularization, "
-                            "usable degree, and spectral share. 'full' additionally enables a bounded reduced-order "
-                            "model-informed correction. A lightweight scalar profile is built lazily and cached; "
-                            "no extra denoiser forward is performed. Existing workflows remain unchanged when off."
+                            "Experimental model/patch-aware scheduling and confidence. 'schedule' may replace "
+                            "risky forecasts with actual evaluations. 'schedule_confidence' also adapts ridge "
+                            "regularization, usable degree, and spectral share without applying a correction. "
+                            "'full' additionally applies the bounded generic latest-delta residual correction; "
+                            "the investigated model-specific Feature-3 correction families did not meet the "
+                            "materiality gate and are not applied. No extra denoiser forward is performed. "
+                            "Existing workflows remain unchanged when off."
                         ),
                     },
                 ),
