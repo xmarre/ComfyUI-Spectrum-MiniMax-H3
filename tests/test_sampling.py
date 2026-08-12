@@ -6,6 +6,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from comfyui_spectrum_h3 import sampling as sampling_module
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.runtime import OfflineReplayAbort, SpectrumH3Runtime
 from comfyui_spectrum_h3.sampling import (
@@ -101,6 +102,38 @@ def test_unsupported_sampler_has_no_forecast_streak_policy():
     assert max_consecutive_forecasts(sampler) is None
     assert min_actual_steps_after_forecast(sampler) == 0
     assert min_tail_actual_steps(sampler) == 0
+
+
+def test_unsupported_sampler_does_not_build_unused_model_profile(monkeypatch):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(model_aware_mode="schedule", offline_smoothing_replay=True)
+    )
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}}
+    )
+    calls = []
+    monkeypatch.setattr(
+        sampling_module,
+        "get_model_forecastability_profile",
+        lambda _patcher: calls.append(_patcher),
+    )
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            return "native-result"
+
+    result = outer_sample_wrapper(
+        Executor(),
+        torch.ones(1),
+        torch.zeros(1),
+        _sampler("sample_heun"),
+        torch.tensor([1.0, 0.0]),
+    )
+
+    assert result == "native-result"
+    assert calls == []
 
 
 def test_er_sde_native_sampler_components_are_seeded_replay_safe():

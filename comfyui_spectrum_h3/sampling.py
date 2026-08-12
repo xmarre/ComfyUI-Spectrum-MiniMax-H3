@@ -188,7 +188,11 @@ def outer_sample_wrapper(
 
     runtime = binding.runtime
     name = sampler_name(sampler)
-    if runtime.config.model_aware_mode != "off":
+    profile_eligible = sampler_is_supported(sampler) and (
+        not runtime.config.offline_smoothing_replay
+        or sampler_supports_seeded_replay(sampler)
+    )
+    if runtime.config.model_aware_mode != "off" and profile_eligible:
         try:
             lookup = get_model_forecastability_profile(guider.model_patcher)
             runtime.set_model_profile(lookup)

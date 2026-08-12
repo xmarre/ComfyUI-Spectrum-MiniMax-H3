@@ -425,7 +425,7 @@ Automated tests cover:
 - scalar-only model/LoRA profile construction for base, single, stacked, differently weighted, zero-strength, and unknown patches; clone reuse, patch UUID invalidation, bounded cache lifetime, and no retained model references;
 - model-aware risk calibration, bounded adaptive ridge/degree/blend and correction, sampled anchor evidence, and risk-only insertion of actual evaluations without relaxing sampler constraints.
 
-The model-aware development suite passes 213 tests against the attached current ComfyUI source in the CPU test environment; 11 native/CUDA cases are skipped where optional runtime dependencies or CUDA are unavailable. GitHub Actions remains the authoritative multi-revision check after this branch is published.
+The model-aware development suite passes 214 tests against the attached current ComfyUI source in the CPU test environment; 11 native/CUDA cases are skipped where optional runtime dependencies or CUDA are unavailable. GitHub Actions remains the authoritative multi-revision check after this branch is published.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).
 
