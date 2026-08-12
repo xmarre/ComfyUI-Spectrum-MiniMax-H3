@@ -1,14 +1,14 @@
 # Model-aware forecasting benchmark protocol
 
-This document records the experimental evidence for `model_aware_mode` and the gates used before a model-informed correction is allowed to affect generated output. The branch remains experimental. Real-checkpoint results take precedence over synthetic unit fixtures.
+This document records the experimental evidence for `model_aware_mode` and the gates used before a model-informed correction is allowed to affect generated output. The branch remains experimental. Real-checkpoint results take precedence over synthetic fixtures.
 
 ## Fixed benchmark rules
 
 Record the exact ComfyUI commit, node commit, MiniMax-H3 checkpoint and precision, LoRA state, prompt, reference-media hashes, seed, sampler, scheduler, steps, resolution, frame count, CFG, Spectrum controls, device, PyTorch build, storage mode, and warm-up procedure.
 
-For a mechanical same-seed comparison, every compared run must retain the same actual/forecast step IDs, total transformer NFE count, Feature-2 risk/confidence values, adaptive ridge, and adaptive blend decisions. A mismatch invalidates the correction comparison.
+A mechanical same-seed correction comparison is valid only when the compared runs retain the same actual/forecast step IDs, total transformer NFE count, Feature-2 risk/confidence values, adaptive ridge, and adaptive blend decisions. Any mismatch invalidates the correction comparison.
 
-Treat forecast-error deltas below 2% as sub-material. Win/loss counts are supporting evidence only. A 7/7 or 8/8 win count with a ~0.1% error delta is still a sub-material result.
+Treat forecast-error deltas below **2%** as sub-material. Win/loss counts are supporting evidence only.
 
 ## Mode boundaries
 
@@ -17,27 +17,29 @@ Treat forecast-error deltas below 2% as sub-material. Win/loss counts are suppor
 | `off` | legacy Spectrum | none |
 | `schedule` | Feature 1 model/profile scheduling prior | none |
 | `schedule_confidence` | Feature 1 + Feature 2 trajectory confidence/adaptive fit | none |
-| `full` | Feature 1 + Feature 2 + Feature 3 | scalar applied correction plus telemetry-only model-direction candidates |
+| `full` | Feature 1 + Feature 2 + Feature 3 | retained scalar correction applied; any new hypothesis telemetry-only until gated |
 
-`schedule_confidence` must report zero K=2 solve work, zero model-direction construction, zero exact-head correction projection, and zero correction applications. `full` must not change the scheduler/NFE policy merely because Feature 3 is enabled.
+`schedule_confidence` must report zero K=2 solve work, zero model-direction work, zero exact-head correction projection, and zero correction applications. `full` must not alter scheduler/NFE policy merely because Feature 3 is enabled.
 
-## Feature-3 experiment history
+# Feature-3 experimental history
 
-### Gram-diagonal scalar metric
+## 1. Gram-diagonal scalar metric
 
-The first model-specific correction approximated the `FinalLayer` head metric with
+The first model-specific scalar metric approximated the FinalLayer head metric with
 
 ```text
 S = diag(W^T W)
 ```
 
-and changed the scalar fit while continuing to apply the correction along the latest trajectory delta `d`.
+while applying the correction along the latest temporal trajectory delta `d`.
 
-A clean paired base-H3 run established that the generic residual correction itself was useful at matched NFE. The model-diagonal increment was small and the video result was qualitatively poor: approximately 5/3 audio wins/losses and 1/7 video wins/losses, with only ~0.069% pure audio improvement and ~0.216% video degradation relative to generic correction.
+A clean base-H3 run showed that the generic temporal residual correction itself was useful, but the diagonal model increment was small and qualitatively unreliable. The diagonal experiment produced approximately 5/3 audio wins/losses and 1/7 video wins/losses, with roughly +0.069% audio and -0.216% video versus the generic scalar correction.
 
-### Exact static output-head scalar metric
+Conclusion: the diagonal approximation discarded important cross-hidden-channel geometry.
 
-The next experiment retained the complete cross-hidden-channel geometry of each static native output head without constructing `W^T W`:
+## 2. Exact static-head scalar metric
+
+The next experiment kept complete static output-head geometry without constructing `W^T W`:
 
 ```text
 R = r @ W.T
@@ -45,41 +47,39 @@ D = d @ W.T
 g_exact = <R, D> / <D, D>
 ```
 
-One clean real run produced 8/0 exact-head wins for audio and 8/0 for video while the diagonal video candidate remained 1/7. The mean exact-head scalar advantage over generic scalar was only approximately 0.22% for audio and 0.06% for video.
+One clean real run produced 8/0 exact-head wins for both audio and video while the diagonal video candidate remained 1/7. The mean exact-head scalar advantage over generic scalar was only approximately 0.22% for audio and 0.06% for video.
 
 **Full output-head cross-channel geometry fixed the diagonal approximation's qualitative error, but scalar gain changes alone remained sub-material.**
 
 This closed the question of repeatedly inventing new scalar weighting metrics.
 
-### K=2 recent-trajectory subspace
+## 3. K=2 recent-trajectory subspace
 
-The next hypothesis changed correction rank while keeping the same causal trajectory family:
+The next hypothesis expanded the correction span:
 
 ```text
 d0 = h[-1] - h[-2]
 d1 = h[-2] - h[-3]
 ```
 
-Generic K=2 solved the Euclidean two-direction least-squares problem. Exact K=2 solved the identical span in static output-head space.
+Generic K=2 solved a Euclidean two-direction least-squares problem. Exact K=2 solved the same span in static output-head space.
 
-A clean base-H3 `full -> schedule_confidence -> full` gate used 20 steps, ER-SDE, 11 actual steps, 9 forecast steps, 11 transformer calls, zero extra NFEs, and identical Feature-2 schedule/risk/confidence behavior.
-
-Mean ordinary feature-RMS ratios were:
+A clean 20-step base-H3 ER-SDE `full -> schedule_confidence -> full` gate used 11 actual steps, 9 forecast steps, 11 transformer calls, zero extra NFEs, and identical Feature-2 scheduling behavior.
 
 | Stream | generic scalar | exact scalar | scalar applied | generic K=2 | exact K=2 | applied K=2 |
 |---|---:|---:|---:|---:|---:|---:|
 | Audio | 1.641362 | 1.640962 | 1.641162 | 1.645173 | 1.644676 | 1.644899 |
 | Video | 1.277945 | 1.277594 | 1.277769 | 1.281283 | 1.281104 | 1.281193 |
 
-Generic K=2 versus generic scalar produced 0/7 audio wins/losses and approximately 0.23% worse mean error. Video produced 1/6 and approximately 0.26% worse mean error. Exact K=2 versus generic K=2 was only approximately +0.03% for audio and +0.01% for video. Exact K=2 versus exact scalar produced 1/6 for both streams. The trust-mixed K=2 path was also slightly worse than the retained scalar applied path.
+Generic K=2 was approximately 0.23% worse than generic scalar for audio (0/7) and 0.26% worse for video (1/6). Exact-head weighting changed K=2 only approximately +0.03% for audio and +0.01% for video. Exact K=2 versus exact scalar was 1/6 for both streams.
 
 **The second recent trajectory direction did not improve Feature 3. Generic K=2 was consistently worse than the generic scalar correction, and exact-head weighting did not rescue it. Therefore increasing temporal trajectory rank is not the next direction of work.**
 
-K=2 remains documented as a rejected hypothesis. Normal generation no longer computes its 2x2 Gram systems or applies its replay stencil. Mathematical helpers/tests remain as historical verification only.
+K=2 is retired from normal runtime. Historical math/tests remain only where useful for regression/documentation.
 
-## K=2 runtime-retirement result
+### K=2 runtime-retirement result
 
-The first post-retirement real gate verified the intended mode boundary. In `schedule_confidence`:
+The first post-retirement real gate verified that `schedule_confidence` now reports:
 
 ```text
 model_aware_subspace_gram_s=0
@@ -92,280 +92,378 @@ model_aware_offline_replay_correction_applications=0
 feature3_direction_evidence_bytes=0
 feature3_direction_workspace_bytes=0
 feature3_direction_compute_s=0
-feature3_static_enqueue_s=0
-feature3_full_enqueue_s=0
-feature3_jvp_enqueue_s=0
-feature3_vjp_enqueue_s=0
 ```
 
-The old ~2.17 s K=2 solve attribution in `schedule_confidence` is therefore gone. The remaining Feature-2 scalar-transfer timing is a separate existing synchronization/attribution issue and is outside the current Feature-3 correction revision.
+The old approximately 2.17 s K=2 solve attribution in `schedule_confidence` disappeared. The literal 2x2 solve was not plausibly the underlying cost; the old timing boundary included asynchronous CUDA work and host dependency attribution. No `torch.cuda.synchronize()` was added merely for measurement.
 
-Current debug summaries explicitly identify K=2 as retired. Legacy K=2 field names that remain for compatibility are marked `retired_k2_inactive`; zero-filled historical counters remain zero.
+# 4. Transformed temporal trajectory directions
 
-## Retained applied scalar correction
+The next family changed the correction **direction** rather than the scalar gain or recent temporal rank.
 
-The generated `full` output continues to use the retained one-direction scalar correction only:
-
-```text
-d = h[-1] - h[-2]
-```
-
-The first post-retirement real gate confirmed that this path remained healthy:
-
-| Stream | raw forecast | generic scalar | exact-head scalar | scalar applied |
-|---|---:|---:|---:|---:|
-| Audio | 1.762326 | 1.661408 | 1.659099 | 1.660249 |
-| Video | 1.367852 | 1.296997 | 1.296834 | 1.296916 |
-
-This is roughly a 5.8% audio and 5.2% video improvement over the raw forecast. The exact-head scalar increment remains small: about 0.14% for audio and 0.01% for video versus generic scalar.
-
-The model-transformed directions below remain counterfactual telemetry only. Offline smoothing replay remains scalar-only.
-
-## Current Feature-3 hypothesis: transform the direction
-
-**Use the actual model geometry to transform the correction direction itself rather than merely reweighting a scalar objective or adding more historical trajectory directions.**
-
-### Static output-head direction
-
-For the latest causal trajectory delta `d` and native stream head `W`:
+Static candidate:
 
 ```text
 m_W_raw = W^T W d
-        = (d @ W.T) @ W
 ```
 
-The production implementation never constructs the 5376 x 5376 Gram matrix.
-
-### Full native FinalLayer local direction
-
-Let `F_t(h)` be the stream-specific native `FinalLayer` mapping at the target timestep and `J_t = dF_t/dh`:
+Full local FinalLayer candidate:
 
 ```text
 m_F_raw = J_t^T J_t d
 ```
 
-`J_t` is never materialized. The implementation uses an analytic FinalLayer-only JVP followed by an analytic VJP. It never differentiates through a transformer block and never adds a denoiser NFE.
+where `J_t = dF_t/dh` for native H3 FinalLayer at the target timestep. `J_t` was never materialized; the experiment used analytic FinalLayer-only JVP/VJP and no extra transformer NFE.
 
-For native H3:
+## Initial unnormalized diagnostic run
 
-```text
-y = W * (RMSNorm(h) * (1 + scale_t) + shift_t) + b
-```
+The first real screen reported approximately:
 
-The local geometry therefore includes exact RMSNorm, target-timestep AdaLN multiplicative scale, and the native FP32 audio/video output head.
-
-## First transformed-direction screen: diagnostic, not a valid rejection
-
-A clean real `full -> schedule_confidence -> full` gate used the same saved base-H3 workflow and seed, 20 steps, native ER-SDE, no active LoRA, 11 actual steps, 9 forecast steps, 11 actual transformer calls, zero extra transformer NFEs, and identical Feature-1/2 schedule/risk/confidence/ridge/blend behavior.
-
-The initial unnormalized screen reported:
-
-| Stream | static `W^T W d` ratio | static vs generic | full `J^T J d` ratio | full vs generic |
+| Stream | static ratio | static vs generic | full ratio | full vs generic |
 |---|---:|---:|---:|---:|
-| Audio | 1.691852 | 0/8, mean advantage -0.070682 | 1.694189 | 0/8, mean advantage -0.072172 |
-| Video | 1.374858 | 0/8, mean advantage -0.060498 | 1.375616 | 0/8, mean advantage -0.061091 |
+| Audio | 1.691852 | 0/8, -0.070682 | 1.694189 | 0/8, -0.072172 |
+| Video | 1.374858 | 0/8, -0.060498 | 1.375616 | 0/8, -0.061091 |
 
-Static raw direction norm ratios were not pathological: approximately 1.875676 for audio and 2.595429 for video. This initial static result is therefore evidence that the direction may genuinely be poor, but the static candidate is rerun under the same scale-invariant calibration as the full candidate before final rejection.
+Static raw direction norm ratios were approximately 1.875676 audio and 2.595429 video. Full `J_t^T J_t d` was printed as `0.000000` at six decimals while finite alpha values and pathological `1e-4`-class radial scales were reported.
 
-The full candidate cannot be rejected from this run. Later anchors reported `full_dir_norm_ratio=0.000000` at six-decimal precision while simultaneously reporting finite coefficients around -0.86 to -1.36, `full_bounded_norm_ratio=0.000000`, `full_radial_scale` in roughly the `1e-4` to `7e-4` range, and `full_bound_active=True`.
+This run was retained as a **diagnostic failed experiment-design run**, not an efficacy rejection.
 
-That exposed two coupled experimental confounds.
+### Radial numerical bug found
 
-### Radial-bound numerical bug
-
-The old implementation formed
+The old implementation effectively used:
 
 ```text
 q_bounded = q / (1 + q/L)
-scale = q_bounded / clamp_min(q, eps)
+radial_scale = q_bounded / clamp_min(q, eps)
 ```
 
-For `0 < q < eps`, `q_bounded ~= q` but the second expression becomes approximately `q/eps`, spuriously suppressing a correction that is already tiny. A rational upper bound must instead use the algebraically equivalent stable scale directly:
+For `0 < q < eps`, this incorrectly produced approximately `q/eps` instead of the correct `radial_scale -> 1` limit.
+
+The stable implementation is:
 
 ```text
-scale = 1 / (1 + q/L)
-q_bounded = q * scale
+radial_scale = 1 / (1 + q/L)
+q_bounded = q * radial_scale
 ```
 
-so `q -> 0` implies `scale -> 1`.
+### Arbitrary operator-scale confound found
 
-### Arbitrary operator-scale confound
+Raw `W^T W d` and `J_t^T J_t d` have arbitrary operator-dependent magnitudes. Least-squares alpha is scale-invariant only before the alpha soft limiter. The limiter therefore mixed orientation with operator magnitude.
 
-The raw transformed directions have operator-dependent magnitude. Raw least squares is scale-invariant because, for `m' = c m`, the fitted coefficient changes by `1/c`. The experiment then soft-limited the instantaneous coefficient around the existing direction-alpha prior, destroying that invariance. For an extremely small `J_t^T J_t d`, an enormous coefficient may be required solely to cancel arbitrary operator scale, so the alpha limiter was testing orientation plus operator magnitude instead of orientation itself.
-
-The first `J_t^T J_t d` screen is therefore retained as a diagnostic failed experiment-design run, not as an efficacy gate.
-
-## Delta-equivalent direction normalization
-
-Every finite, nonzero transformed direction is now normalized before coefficient fitting, EWMA calibration, radial budgeting, and candidate scoring:
+The corrected experiment normalized every finite nonzero model direction to delta-equivalent norm before alpha fitting, EWMA calibration, radial budgeting, and scoring:
 
 ```text
 m_normalized = m_raw * ||d|| / ||m_raw||
 ```
 
-The scale factor is positive, so orientation and sign are preserved exactly. For eligible candidates:
+Positive rescaling of a direction then leaves the normalized candidate/final correction invariant within floating-point tolerance.
+
+# Corrected normalized transformed-direction gate: FINAL RESULT
+
+The corrected real benchmark ran exactly:
 
 ```text
-||m_normalized|| ~= ||d||
+full
+schedule_confidence
+full
 ```
 
-The experiment now separates three quantities:
+with one fixed saved base-H3 workflow and seed, no active LoRA, native `sample_er_sde`, 20 steps, and otherwise identical settings.
 
-1. raw operator scale `||m_raw|| / ||d||`;
-2. normalized model-derived orientation in delta-equivalent units;
-3. final correction magnitude after coefficient calibration and the 0.25 radial budget.
-
-The required positive-scale invariant is:
+All three first passes used:
 
 ```text
-normalize(c * m, d) ~= normalize(m, d),  c > 0
+actual:   0,2,4,6,8,10,12,14,16,18,19
+forecast: 1,3,5,7,9,11,13,15,17
+actual transformer calls = 11
+forecast steps           = 9
+extra transformer NFE    = 0
+risk max                 = 0.568715
+confidence min           = 0.431285
 ```
 
-and, given the same calibration state:
+Degree, ridge, stream blends, and actual/forecast decisions were identical. The efficacy comparison is mechanically valid.
+
+## Normalization/radial sanity gate passed
+
+Every eligible static/full candidate reported:
 
 ```text
-correction(c * m) ~= correction(m)
+normalized_direction_norm_ratio ~= 1.0
 ```
 
-within floating-point tolerance. Negative scaling is not identified as equivalent; sign remains part of the direction.
+Raw model-operator scales were:
 
-The existing `_DIRECTION_ALPHA_LIMIT` is unchanged. After normalization, a coefficient such as `alpha=0.1` again means approximately a 0.1-delta-sized raw correction independently of whether the direction came from `W^T W d` or `J_t^T J_t d`.
+| Stream | static `||W^T W d||/||d||` mean | full `||J^T J d||/||d||` mean |
+|---|---:|---:|
+| Audio | 1.968860e+00 | 8.879409e-09 |
+| Video | 2.728169e+00 | 1.992571e-08 |
 
-## Stable correction budget
+The extremely small full-FinalLayer direction magnitude was therefore genuine native local geometry, not just six-decimal logging loss.
 
-For normalized direction `m`:
+Corrected full-direction radial scales were:
 
 ```text
-c_raw = alpha * m
-q_raw = ||c_raw|| / ||d||
-radial_scale = 1 / (1 + q_raw / 0.25)
-q_bounded = q_raw * radial_scale
-c_bounded = radial_scale * c_raw
+Audio: min 0.784770, mean 0.864360
+Video: min 0.929963, mean 0.951673
 ```
 
-Required limits:
+The old `1e-4` suppression disappeared. The normalization/radial fix is validated.
 
-- `q_raw -> 0`: `radial_scale -> 1`, `q_bounded ~= q_raw`;
-- `q_raw = 1`: `q_bounded = 0.2`;
-- `q_raw -> infinity`: `q_bounded -> 0.25`;
-- the bound never increases correction magnitude;
-- `m=d` preserves the existing scalar trust-budget interpretation.
+## Normalized static `W^T W d`: rejected
 
-Zero directions, non-finite tensors, invalid limits, non-finite normalization scales/results, and reference deltas below the existing finite-resolution threshold fail closed. Finite representable transformed directions are not rejected merely because their raw operator magnitude is below machine epsilon relative to `d`; that is precisely the case normalization must handle.
+| Stream | candidate mean | vs generic scalar | mean advantage | vs exact scalar | mean advantage |
+|---|---:|---:|---:|---:|---:|
+| Audio | 1.653988 | 0/8 | -0.071455 | 0/8 | -0.073525 |
+| Video | 1.394504 | 0/8 | -0.064070 | 0/8 | -0.064525 |
 
-## Causality and calibration
+The approximately 6-7% regression remains after removing operator magnitude, alpha-scale, K=2 conditioning, and radial-bound confounds. The orientation itself is poor.
 
-At completed actual anchor N, the counterfactual candidate is evaluated from the uncorrected spectral prediction constructible from anchors `< N`, the latest causal trajectory delta, and the target timestep's FinalLayer state. The future actual hidden at N is used only as scoring/training evidence after candidate construction.
+## Normalized full `J_t^T J_t d`: rejected
 
-The coefficient applied to candidate N is an EWMA learned from earlier completed anchors only. The instantaneous diagnostic is now fit in normalized units:
+| Stream | candidate mean | vs generic scalar | mean advantage | vs exact scalar | mean advantage |
+|---|---:|---:|---:|---:|---:|
+| Audio | 1.655349 | 0/8 | -0.072343 | 0/8 | -0.074414 |
+| Video | 1.395260 | 0/8 | -0.064658 | 0/8 | -0.065114 |
+
+It also failed to improve the static model direction:
 
 ```text
-alpha_N = <r_N, m_normalized,N> / <m_normalized,N, m_normalized,N>
+Audio full vs static: 0/8, mean advantage -0.000827
+Video full vs static: 0/8, mean advantage -0.000551
 ```
 
-It updates calibration only for later candidates. The sampled current anchor is appended to direction history only after all candidates for that anchor have been scored.
+Native RMSNorm, target-timestep AdaLN, and exact output-head local geometry therefore do not rescue the transformed temporal direction.
 
-## Native FinalLayer magnitude audit
+**The scale-normalization sanity gate passed. Both transformed directions were evaluated in delta-equivalent units. Static `W^T W d` and full `J_t^T J_t d` then lost every eligible comparison against the scalar baseline on both streams by approximately 6-7%. The transformed-trajectory-direction family is therefore rejected.**
 
-The implementation was rechecked against native ComfyUI H3 before normalization was accepted as the remedy:
+Normal runtime no longer computes this rejected WtW/JtJ screen. Its row history, direction-alpha state, geometry capture, per-anchor transformed logging, JVP/VJP calls, direction workspace and evidence buffers are removed. Pure math helpers/tests remain only as historical regression fixtures.
 
-- native `FinalLayer.norm` RMSNorm weight and `eps` are captured from the actual module;
-- native default `final_norm_eps` is `1e-5`;
-- target video/audio modulation tags are 0/2 and are converted back to the native timestep row correctly;
-- native semantics are exactly `RMSNorm(h) * (1 + scale[row]) + shift[row]`;
-- video/audio output heads are the native FP32 heads;
-- the JVP casts the modulated hidden to FP32 before the output projection, and the VJP mirrors the native dtype transition;
-- the reference point is the uncorrected `predicted_native` hidden for the target coordinate;
-- the RMSNorm derivative contains the required single hidden-dimension mean terms only;
-- the JVP/VJP and `J^T J d` continue to match PyTorch autograd/explicit-Jacobian fixtures.
+Do not continue this family with K=3/K4, larger recent-delta bases, PCA/SVD, another WtW/JtJ variant, alternate normalization, transformer JVP/Jacobians, learned regressors, a looser correction bound, or alpha retuning intended only to rescue this mechanism.
 
-No second implementation error explaining the small full-direction magnitude was found in this audit. The previous real log printed the raw ratio only to six decimals, so its exact magnitude cannot be reconstructed after the fact. The corrected telemetry reports raw `J_t^T J_t d` norms and ratios in scientific notation on the next real run. The small scale is currently treated as plausible native local geometry, not as proof of a bug.
+# Retained scalar baseline
 
-## Telemetry
+The latest corrected real `full` scalar summaries are:
 
-Per eligible static/full candidate, debug logs now report separately:
+| Stream | raw forecast | generic scalar | exact-head scalar | scalar applied |
+|---|---:|---:|---:|---:|
+| Audio | 1.721166 | 1.615845 | 1.612975 | 1.614404 |
+| Video | 1.378964 | 1.300207 | 1.299703 | 1.299954 |
+
+The generic temporal residual correction improves forecast error by approximately 6.2% audio and 5.7% video. That remains worthwhile.
+
+The model-specific increment is much smaller:
 
 ```text
-raw_direction_norm
-reference_delta_norm
-raw_direction_norm_ratio
-normalized_direction_norm_ratio
-instantaneous_alpha_raw
-alpha_used
-raw_correction_norm_ratio
-bounded_correction_norm_ratio
-radial_scale
-bound_active
+exact-head scalar vs generic:
+    audio ~0.18%
+    video ~0.04%
+
+trust-mixed applied vs generic:
+    audio ~0.09%
+    video ~0.02%
 ```
 
-Raw-scale fields use scientific notation. Existing ordinary RMS, static-head RMS, FinalLayer/output-space RMS, wins/losses, relative advantages, timing, retained evidence bytes, workspace, head materialization, and no-extra-NFE telemetry remain.
+**The retained scalar correction is useful, but its model-specific exact-head increment remains sub-material and does not satisfy the intended 2% Feature-3 materiality target.**
 
-Run summaries report raw direction-ratio min/mean/max, normalized direction-ratio min/mean/max, instantaneous-alpha min/mean/max, used-alpha mean/max-absolute, raw-correction mean/max, bounded-correction mean/max, and radial-scale min/mean.
+Do not describe the approximately 6% overall correction improvement as a model-specific Feature-3 improvement. Almost all of it is the generic temporal residual correction.
 
-Active labels are:
+**Overall Feature-3 status: generic scalar residual correction remains useful (~6% audio / ~5-6% video in the latest run), while the model-specific scalar increment remains sub-material and all tested model-transformed trajectory directions failed. Feature 3 remains scientifically unresolved.**
+
+# First-principles reassessment: previous-error adjoint
+
+The rejected family always asked model geometry to transform the latest temporal trajectory direction `d`. A distinct hypothesis is to start from a **strictly observed previous forecast error** instead.
+
+At completed actual anchor `k`:
 
 ```text
-feature3_applied_correction=scalar_latest_delta
-feature3_direction_screen=static_head_and_full_final_layer_normalized
-feature3_direction_units=delta_equivalent_norm
-feature3_k2_runtime=retired
+r_k = h_actual,k - h_pred_uncorrected,k
+
+e_k = F_k(h_actual,k) - F_k(h_pred_uncorrected,k)
 ```
 
-## Evidence and memory policy
-
-The direction screen remains deterministic complete-row sampling capped at 32 rows per stream. Sampled hidden rows stay on the feature device. Only reduced scalar telemetry is transferred to CPU.
-
-The global profile cache retains detached CPU output-head tensors/diagonals only and no model/module/GPU references. Per-run GPU heads are released at run end/disable. Base-H3 CPU output heads remain approximately 2.6 MiB total (`32 x 5376` and `96 x 5376`, FP32).
-
-Normalization adds only sampled-vector norm/scaling work and one normalized sampled direction tensor per static/full candidate while it is being evaluated. It does not construct a full-resolution transformed direction, transfer full hidden tensors to CPU, add explicit CUDA synchronization, or add a transformer/denoiser NFE.
-
-## Automated verification requirements
-
-The complete suite must continue to cover the previous Feature-3 invariants, including analytic RMSNorm JVP/VJP, FinalLayer JVP/VJP, `J^T J d` versus explicit Jacobian, no hidden-width Gram materialization, off-diagonal `W` behavior, strict causal predicted-hidden reference, previous-anchor-only coefficient chronology, snapshot/rollback, no model/module retention, `schedule_confidence` zero Feature-3 work, scalar-only applied/replay paths, and no extra transformer calls.
-
-The normalization revision additionally tests:
-
-- tiny positive `q << eps` does not suppress radial scale;
-- exact rational radial behavior from `q=1e-12` through `q=100`;
-- normalized direction norm matches `||d||`;
-- positive direction scaling invariance from `1e-12` through `1e6`;
-- final bounded correction invariance under the same positive scalings;
-- a synthetic tiny-scale `J^T J d` remains eligible, normalizes to delta-equivalent units, and does not receive a spuriously tiny radial scale;
-- zero/non-finite directions, tiny reference deltas, and invalid bounds fail closed.
-
-## Next real benchmark gate
-
-Use the exact same saved base-H3 workflow and fixed seed as the diagnostic run, with no active LoRA:
-
-1. `full`
-2. `schedule_confidence`
-3. `full`
-
-Keep checkpoint/precision, prompt/references, seed, native `sample_er_sde`, scheduler, 20 steps, resolution, frame count, CFG, every Spectrum control, storage mode, and debug setting identical. Enable debug logging.
-
-Reject the comparison if actual/forecast step IDs, transformer NFE, or Feature-2 risk/confidence/ridge/blend decisions differ.
-
-Report separately:
-
-### A. Scalar control
+For a later target `t`, screen three directions:
 
 ```text
-raw
-generic scalar
-exact scalar
-scalar applied
+A. generic previous residual
+   m_R = r_previous
+
+B. static model adjoint
+   m_W = W^T e_previous
+
+C. current local FinalLayer adjoint
+   m_J = J_t^T e_previous
 ```
 
-### B. Static direction after scale normalization
+This is not `J_t^T J_t d`: its source signal is an observed prior forecast error rather than another transformation of temporal trajectory motion.
 
-Report raw `W^T W d` norm ratio, normalized norm ratio, alpha used, raw correction norm ratio, bounded norm ratio, radial scale, and normalized candidate versus generic/exact scalar.
+## Source-grounded feasibility review
 
-### C. Full FinalLayer direction after scale normalization
+### Causality
 
-Report raw `J_t^T J_t d` norm ratio in scientific notation, normalized norm ratio, alpha used, raw correction norm ratio, bounded norm ratio, radial scale, and normalized candidate versus generic scalar, exact scalar, and normalized static candidate.
+GO. At observer/finalization for actual anchor `N`, the forecaster still contains only anchors `< N`; `forecaster.update(N)` occurs after model-aware anchor observation. The uncorrected predicted hidden for `N` can therefore be reconstructed solely from prior history and the same causal weights used by the scalar evidence path.
 
-### D. Sanity gate
+The target timestep and native FinalLayer geometry depend only on current timestep/static model state. The implementation captures this state **before actual N executes**, so candidate construction cannot depend on actual N.
 
-Eligible static/full candidates must show normalized direction norm ratio approximately 1. A tiny raw `J_t^T J_t d` magnitude must no longer produce `radial_scale ~= 1e-4` unless the normalized correction itself genuinely exceeds the trust budget.
+Sequence:
 
-Only after this corrected rerun is the 2% materiality stopping rule applied. If normalized `W^T W d` and normalized `J_t^T J_t d` remain materially worse than scalar correction or improve only at approximately 0.1% scale, this model-transformed-direction family has received a fair test and should be rejected. At that point Feature 3 is reassessed from first principles rather than automatically escalating to K=3, PCA/SVD, learned regressors, transformer JVPs, full Jacobians, or another scalar metric.
+```text
+1. previous residual state from anchors < N already exists
+2. reconstruct uncorrected prediction for N from history < N
+3. construct m_R, m_W, m_J and apply only alpha learned from earlier anchors
+4. score fixed candidates against actual N
+5. compute instantaneous alpha diagnostics from N's residual
+6. compute/store r_N and e_N for future anchors only
+```
+
+No same-anchor hindsight is permitted.
+
+### Row/output correspondence
+
+GO within one generation. Spectrum already rejects changes in target audio/video row count, hidden width, packed topology, and conditional branch identity. Native H3 target audio/video segments remain contiguous and stable. The new experiment additionally fixes deterministic complete-row sample indices per stream and fails closed if row count/branch count changes.
+
+Native output dimensions are stable because the same stream heads remain in use:
+
+```text
+audio: 32
+video: 96
+```
+
+### Computing `e_k`
+
+GO. No new transformer call or full output archive is required. The existing full hidden history already stores each actual final-block target feature. For at most 32 deterministic complete rows per stream, the screen reconstructs the causal predicted hidden, then evaluates the native sampled FinalLayer difference:
+
+```text
+F_k(h_actual,k) - F_k(h_pred_uncorrected,k)
+```
+
+Only sampled residual tensors are retained.
+
+The pre-existing residual-feedback probe cannot be reused as the authoritative source because it is optional, only runs on particular actual refreshes, and evaluates its own shadow/hold policy. The new screen instead reuses the forecaster history/weights/head infrastructure and retains only the small sampled residual state actually required.
+
+### Cross-timestep interpretation
+
+GO as a telemetry hypothesis, not as an identity. `e_previous` lives in a stable stream output coordinate basis (same sampled token rows and output channels). Applying `J_t^T` asks how that persisted output-space error would map back into the current target hidden tangent space.
+
+Changing timestep/AdaLN means `e_previous` is not the exact current output error. That is the hypothesis being tested: short-horizon residual persistence plus current target adjoint transport. The current `J_t` explicitly incorporates current RMSNorm and target-timestep AdaLN scale. The static `W^T e_previous` ablation isolates the value of the output head from the additional current local normalization/modulation geometry.
+
+### Critical generic baseline
+
+The model-specific claim is deliberately harder than “beats the uncorrected forecast.” The primary attribution baseline is:
+
+```text
+m_R = r_previous
+```
+
+All three candidates use the same deterministic rows, same delta-equivalent normalization, same previous-anchor-only alpha calibration, and same 0.25 rational radial budget.
+
+A model-adjoint candidate must beat the previous-hidden-residual baseline materially. Otherwise any improvement is simply residual persistence rather than model geometry.
+
+### Memory
+
+At the maximum 32 sampled rows per stream, FP32 persistent previous-error state for base H3 is:
+
+```text
+hidden residuals:
+    2 streams * 32 rows * 5376 hidden * 4 bytes
+    = 1,376,256 bytes
+
+output residuals:
+    audio: 32 * 32 * 4   = 4,096 bytes
+    video: 32 * 96 * 4   = 12,288 bytes
+
+persistent residual payload:
+    1,392,640 bytes
+    = 1.328125 MiB
+```
+
+Row indices add at most 512 bytes for two 32-element int64 index vectors. Current timestep geometry is transient and small; the existing `full` scalar path already owns the per-run FP32 audio/video head materialization.
+
+No second full hidden history is retained. When history storage is system RAM, only selected rows are transferred for the telemetry calculation.
+
+### Compute
+
+At 32 sampled rows per stream and hidden width 5376:
+
+```text
+W^T e_previous:
+    audio  = 32 * 32 * 5376  = 5.505M MAC
+    video  = 32 * 96 * 5376  = 16.515M MAC
+    total  = 22.020M MAC ~= 44 MFLOP
+```
+
+`J_t^T e_previous` has the same head backprojection order plus O(hidden) RMSNorm/AdaLN VJP work. Constructing the exact sampled current output residual adds another sampled FinalLayer projection of the same order. Candidate scoring remains sub-GFLOP-scale and is substantially cheaper than one 50-block MiniMax-H3 denoiser evaluation.
+
+No production-GPU wall-clock claim is made until the real gate is run.
+
+### Normalization/budget
+
+GO. Each finite nonzero direction is normalized to the latest temporal-delta norm:
+
+```text
+m_normalized = m * ||d|| / ||m||
+```
+
+The already validated 0.25 rational radial budget is reused unchanged. `_DIRECTION_ALPHA_LIMIT` is unchanged. Positive direction rescaling does not affect the final candidate.
+
+### ER-SDE and offline replay
+
+GO. The screen runs only after/beside normal model evaluation and does not touch ER-SDE generator/noise-sampler/derivative state. Extra transformer NFE remains zero.
+
+The experiment is telemetry-only. Offline replay continues to use the retained scalar correction and does not archive/apply previous-error candidates. The screen is skipped during replay; first-pass observations may train/score telemetry without affecting generated output.
+
+## GO decision and isolated implementation
+
+The source review satisfies the causality, correspondence, cost, attribution, sampler and replay requirements, so one telemetry-only screening experiment is implemented.
+
+Active `full` output remains exactly the retained scalar latest-delta correction. The rejected transformed-trajectory screen remains runtime-retired.
+
+The new screen reports, per stream:
+
+- previous-hidden-residual eligibility/ratio/alpha/bounded correction;
+- static `W^T e_previous` eligibility/ratio and static-head ratio;
+- local `J_t^T e_previous` eligibility/ratio and current FinalLayer output-space ratio;
+- raw/normalized direction ratios, radial scale and bound activity;
+- residual vs generic scalar;
+- static vs previous residual and generic scalar;
+- full adjoint vs previous residual, static adjoint and generic scalar;
+- wins/losses, mean paired relative advantage and max absolute advantage;
+- evidence bytes, sampled workspace, compute/geometry/VJP timing;
+- explicit zero extra transformer NFE.
+
+No candidate is eligible for efficacy scoring until it has a coefficient calibrated from an earlier completed anchor.
+
+# Next real gate
+
+Run one mechanical gate only:
+
+```text
+1. full
+2. schedule_confidence
+3. full
+```
+
+Use the same saved base-H3 workflow and fixed seed, no active LoRA, native `sample_er_sde`, 20 steps, identical checkpoint/precision, scheduler, prompt/references, resolution, frames, CFG, Spectrum settings, storage mode, and debug setting.
+
+Reject the comparison if actual/forecast step IDs, transformer NFE, Feature-2 risk/confidence, adaptive ridge or stream blends differ.
+
+Verify first:
+
+```text
+feature3_transformed_trajectory_runtime=retired
+feature3_direction_evidence_bytes=0
+feature3_direction_workspace_bytes=0
+feature3_jvp_enqueue_s=0
+feature3_vjp_enqueue_s=0
+feature3_error_extra_transformer_nfe=0
+```
+
+Then evaluate separately:
+
+1. retained scalar control remains unchanged;
+2. `m_R = r_previous` versus generic scalar;
+3. `m_W = W^T e_previous` versus `m_R` and generic scalar;
+4. `m_J = J_t^T e_previous` versus `m_R`, `m_W`, and generic scalar;
+5. eligible normalized direction ratios are approximately 1;
+6. evidence/workspace/compute remain sampled and much cheaper than a denoiser call.
+
+The **2% materiality gate remains mandatory for model-specific value**. A model adjoint must materially beat the previous-hidden-residual baseline, not merely the raw forecast. Only after such a result should multi-seed validation be considered.
