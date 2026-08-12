@@ -1,101 +1,195 @@
 # Model-aware forecasting benchmark protocol
 
-This matrix is intentionally separate from implementation-unit results. Do not promote `schedule`, `schedule_confidence`, or `full` from experimental status until the same-seed real-checkpoint comparisons below are recorded.
+This document records the experimental evidence for `model_aware_mode` and the gates used before a model-informed correction is allowed to affect generated output. The branch remains experimental. Real-checkpoint results take precedence over synthetic unit fixtures.
 
-## Fixed inputs
+## Fixed benchmark rules
 
-Record the exact ComfyUI commit, node commit, MiniMax-H3 checkpoint and precision, LoRA files and strengths, prompt, reference media hashes, prespecified seeds, sampler, scheduler, steps, resolution, frame count, CFG, Spectrum base controls, device, PyTorch build, and warm-up procedure. Run at least one base-model configuration and one materially strong LoRA configuration. Add a stacked-LoRA configuration when resources permit.
+Record the exact ComfyUI commit, node commit, MiniMax-H3 checkpoint and precision, LoRA state, prompt, reference-media hashes, seed, sampler, scheduler, steps, resolution, frame count, CFG, Spectrum controls, device, PyTorch build, storage mode, and warm-up procedure.
 
-Use at least five independent seeds for each complete comparison matrix, paired across every compared variant. Report every paired result plus the median paired delta and a bootstrap 95% confidence interval. Establish timing repeatability with at least three control repetitions after warm-up; a timing delta is inconclusive when it is smaller than the larger of 3% or twice the control's median absolute deviation. Treat forecast-error deltas smaller than 2% as inconclusive. Perceptual video, audio, and synchronization results require blinded per-seed judgments and remain descriptive.
+For a mechanical same-seed comparison, every compared run must retain the same actual/forecast step IDs, total transformer NFE count, Feature-2 risk/confidence values, adaptive ridge, and adaptive blend decisions. A mismatch invalidates the correction comparison.
 
-Use the same inputs for:
+Treat forecast-error deltas below 2% as sub-material. Win/loss counts are supporting evidence only. A 7/7 or 8/8 win count with a ~0.1% error delta is still a sub-material result.
 
-| ID | Spectrum configuration | Purpose |
+## Mode boundaries
+
+| Mode | Enabled experiment layers | Feature-3 correction work |
 |---|---|---|
-| A | Legacy Spectrum, `model_aware_mode=off` | Current accelerator control |
-| B | `schedule` | Scheduling contribution |
-| C | `schedule_confidence` | Adaptive fitting/blend contribution |
-| D | `full` | Exact linear `FinalLayer` head-space correction contribution |
-| E | Spectrum disabled | Native reference |
+| `off` | legacy Spectrum | none |
+| `schedule` | Feature 1 model/profile scheduling prior | none |
+| `schedule_confidence` | Feature 1 + Feature 2 trajectory confidence/adaptive fit | none |
+| `full` | Feature 1 + Feature 2 + Feature 3 | scalar applied correction plus telemetry-only model-direction candidates |
 
-For equal-NFE comparison, create three separate legacy controls: A-B matches B's actual transformer-call count, A-C matches C's count, and A-D matches D's count for the same seed. Record the actual step IDs as well as the total count for every pair. If the legacy controls cannot express an exact target count, mark that pair's equal-NFE cell unavailable. Do not reuse one A run for variants with different NFE totals. For equal-wall-clock comparison, choose the closest completed run for each pair without changing prompt, seed, model, or sampler, and report the residual timing mismatch.
+`schedule_confidence` must report zero K=2 solve work, zero model-direction construction, zero exact-head correction projection, and zero correction applications. `full` must not change the scheduler/NFE policy merely because Feature 3 is enabled.
 
-## Measurements
+## Feature-3 experiment history
 
-Capture the debug summary plus:
+### Gram-diagonal scalar metric
 
-- actual transformer NFEs, forecast steps, adaptive extra NFEs, discarded/replayed calls;
-- sampler wall time and total generation wall time;
-- profile miss/hit time, temporary workspace estimate, retained profile bytes, and model-aware per-step overhead;
-- peak allocated/reserved VRAM and peak process RSS;
-- sampled counterfactual forecast/hold error and curvature at every actual anchor, separately for audio and video;
-- the explicit aggregate rule and value consumed by the scheduler (`max(audio, video)` in this revision);
-- generic Euclidean, Gram-diagonal, and exact linear-head-space projections for each stream;
-- generic-Euclidean K=2 and exact-head K=2 coefficient vectors over the identical two-delta trajectory span, their 2x2 condition/rank/regularization state, scalar fallbacks, and radial-bound telemetry;
-- raw and smoothly bounded generic/diagonal/exact gains, applied trust-mixed gain, bound-active flags, exact-versus-generic deltas, and exact-versus-diagonal deltas;
-- per-stream applied, pure generic, pure diagonal, and pure exact error ratios in ordinary feature RMS and exact linear-head RMS;
-- per-stream online exact-candidate trust, eligible comparison count, exact wins, and exact losses;
-- generic-2D versus generic-scalar, exact-2D versus exact-scalar, exact-2D versus generic-2D, and exact-2D versus generic-scalar counts, wins/losses, and mean/maximum relative advantages;
-- anchor-evidence timing split into temporal-weight fitting, sample/index selection, one-time head materialization, exact-head projection, scalar device transfer, reductions/error calculations, and fit-condition calculation;
-- retained generic-sample and exact-head evidence bytes, device-materialized head bytes, exact-row temporary workspace, and the separately configured full-history/archive memory;
-- causal correction time and offline-replay correction-weight construction time/application count as separate fields;
-- decoded same-seed video, audio, and synchronization assessments using a blinded ordering where practical.
+The first model-specific correction approximated the `FinalLayer` head metric with
 
-Repeat each timing after one warm-up and include a second generation with the identical effective patch set to measure cache benefit. Run both cache measurements in the same process with the same clone lineage, patch-set identity and strengths, H3 architecture, and bypass-adapter metadata. Do not clear or evict the process-local profile cache between them. Report every seed, repetition, failure, and cancellation.
+```text
+S = diag(W^T W)
+```
 
-When a runtime/bypass LoRA loader is upstream, run one mode that executes the loader and then change only `model_aware_mode` so ComfyUI reuses the cached MODEL output. The second profile must retain the same patch/adaptor identity, active patch and key counts, recognized/unknown counts, perturbation, and cache key. A zero-patch profile after cached reuse invalidates the model-aware comparison.
+and changed the scalar fit while continuing to apply the correction along the latest trajectory delta `d`.
 
-## Pilot observations
+A clean paired base-H3 run established that the generic residual correction itself was useful at matched NFE. The model-diagonal increment was small and the video result was qualitatively poor: approximately 5/3 audio wins/losses and 1/7 video wins/losses, with only ~0.069% pure audio improvement and ~0.216% video degradation relative to generic correction.
 
-The first real 8-step seeded ER-SDE pilot used one workflow/configuration/seed and produced three anchor updates. `schedule` and `schedule_confidence` retained the same 5-actual/3-forecast schedule, confidence mode changed ridge/blend values, and `full` applied correction. At every measured anchor, the model-scaled and generic corrected ratios were identical. The learned projections were large and negative, and both gain paths reached the existing `-0.25` bound, so the clamp erased their pre-clamp difference. This does not disprove the model-sensitivity hypothesis; that pilot could not observe its incremental effect after saturation.
+### Exact static output-head scalar metric
 
-A later 20-step `off` then `full` pilot reported risk up to `0.575384` (below the unchanged `0.65` threshold), nine saturated `-0.25` learned corrections, identical model/generic corrected ratios, and about 3.98 seconds of anchor-evidence work for nine anchors. About 2.756 seconds of the reported 2.904-second model-aware evidence total was device transfer. Its `full` profile also incorrectly reported zero patches after ComfyUI reused a cached output from `RuntimeBypassDoraPowerLoraLoader`, so its weight-prior result is invalid. That exposed a profiler lifetime bug: the loader persists effective adapters as bypass-hook objects in `ModelPatcher.injections`, while the old profiler recognized only manager objects exposing an `.adapters` dictionary. The corrected benchmark must verify persistent hook-derived profile identity before interpreting model-aware results.
+The next experiment retained the complete cross-hidden-channel geometry of each static native output head without constructing `W^T W`:
 
-The first channel-resolved correction architecture retained the generic Euclidean projection as control and used the normalized hidden-channel diagonal of the corresponding native H3 `FinalLayer` head Gram matrix. It added a monotonic rational ±0.25 soft bound and trajectory-calibrated trust. Evidence samples remained in a bounded device-local history and only reduced scalars returned to CPU.
+```text
+R = r @ W.T
+D = d @ W.T
+g_exact = <R, D> / <D, D>
+```
 
-A clean paired 20-step base-H3 `schedule_confidence` / `full` run then held the complete 11-actual / 9-forecast schedule, step IDs, risk/confidence/ridge/blend evolution, and raw anchor ratios fixed. Feature 3 reduced the mean audio ratio from `1.794656` to `1.688162` (5.93%) and video from `1.382575` to `1.309622` (5.28%), establishing that residual correction was useful at matched NFE. Almost all of that came from the generic candidate. Audio generic/diagonal/applied means were `1.688749` / `1.687578` / `1.688162`; video was `1.308225` / `1.311046` / `1.309622`. The diagonal produced only about 0.069% pure audio improvement and was about 0.216% worse for video, with 5/3 audio wins/losses and 1/7 video wins/losses. This is a real negative result for the diagonal approximation, not for generic correction.
+One clean real run produced 8/0 exact-head wins for audio and 8/0 for video while the diagonal video candidate remained 1/7. The mean exact-head scalar advantage over generic scalar was only approximately 0.22% for audio and 0.06% for video.
 
-The current experiment therefore keeps generic and diagonal candidates independently auditable and makes the full linear output-head operator primary. It samples complete hidden rows and computes `<rW^T,dW^T>/<dW^T,dW^T>` without materializing `W^T W`. The result is exact for the linear head and remains explicitly incomplete for timestep RMSNorm/AdaLN.
+**Full output-head cross-channel geometry fixed the diagonal approximation's qualitative error, but scalar gain changes alone remained sub-material.**
 
-A subsequent mechanically stable `full -> schedule_confidence -> full` sequence retained the 20-step ER-SDE 11-actual/9-forecast schedule, step IDs, Feature-2 decisions, ridge/blend values, and zero extra NFEs. The two `full` runs reproduced their correction behavior. Mean ordinary RMS for audio was generic `1.566913`, diagonal `1.563894`, exact `1.563496`, and trust-mixed applied `1.565194`; video was generic `1.284368`, diagonal `1.286266`, exact `1.283642`, and applied `1.284004`. Exact-head scalar produced 8/0 wins/losses for both streams while the diagonal produced 8/0 for audio and 1/7 for video. Preserving cross-hidden-channel terms therefore fixed the diagonal's qualitative video failure, but exact scalar improved over generic scalar by only about 0.22% for audio and 0.06% for video, far below the 2% materiality threshold. The model information is consistent; the one-direction scalar correction cannot exploit enough of it to produce a material gain. Scalar metric iteration stops at this result.
+This closed the question of repeatedly inventing new scalar weighting metrics.
 
-## K=2 correction-dimensionality experiment
+### K=2 recent-trajectory subspace
 
-The next implementation keeps the exact static linear `FinalLayer` head metric and changes only correction dimensionality. For each stream it forms `d0=h[-1]-h[-2]` and `d1=h[-2]-h[-3]` from already-observed actual history. Generic K=2 solves `min ||r-g0*d0-g1*d1||^2`; exact K=2 solves the same span after projecting `r`, `d0`, and `d1` through the stream output head. Both use a regularized 2x2 Gram solve with rank/condition checks and scalar fallback. No feature-sized Gram, extra NFE, second model pass, RMSNorm/AdaLN weighting, or scheduler input is added.
+The next hypothesis changed correction rank while keeping the same causal trajectory family:
 
-The two coefficient candidates are radially soft-bounded in the generic sampled evidence norm relative to `||d0||`, preserving the existing scalar-equivalent 0.25 total correction budget. A separate K=2 model trust is calibrated only from exact-K=2 versus generic-K=2 error in exact-head space; the existing exact-scalar trust and scalar applied ablation remain unchanged. The final correction interpolates between the matching-span K=2 vectors and remains inside the same radial budget. Causal anchor IDs and the bounded two-coefficient stencil are archived for offline replay, so replay applies the first-pass decision to the exact three actual anchors available at that time.
+```text
+d0 = h[-1] - h[-2]
+d1 = h[-2] - h[-3]
+```
 
-## Immediate base-H3 K=2 gate
+Generic K=2 solved the Euclidean two-direction least-squares problem. Exact K=2 solved the identical span in static output-head space.
 
-Use base H3 with no active LoRA. Run the same saved workflow in the order `full`, `schedule_confidence`, `full`, changing only `model_aware_mode`. Keep the exact checkpoint, prompt, seed, sampler/scheduler, 20 steps, resolution, frame count, CFG, Spectrum controls, storage settings, risk threshold, and correction bound. Require identical actual/forecast step IDs, Feature-2 risk/confidence/ridge/blend decisions, and transformer NFE count; reject the comparison if any differ.
+The latest clean base-H3 `full -> schedule_confidence -> full` gate used 20 steps, ER-SDE, 11 actual steps, 9 forecast steps, 11 transformer calls, zero extra NFEs, and identical Feature-2 schedule/risk/confidence behavior.
 
-For every eligible actual anchor and separately for audio/video, record:
+Mean ordinary feature-RMS ratios were:
 
-1. schedule-confidence raw ratios plus generic scalar, diagonal scalar, exact scalar, generic K=2, exact-head K=2, and final applied K=2 ratios in ordinary feature RMS and exact-head RMS where available;
-2. raw and bounded K=2 coefficient vectors, raw/bounded correction norm ratios, bound scale/activity, 2x2 condition/rank/regularization, eligibility, and scalar fallback counts;
-3. generic-K=2 versus generic-scalar, exact-K=2 versus exact-scalar, exact-K=2 versus generic-K=2, and exact-K=2 versus generic-scalar wins/losses and mean/maximum relative advantages;
-4. exact-K=2 trust before each applied forecast and ending trust;
-5. K=2 Gram/reduction and solve time, total evidence time, head materialization/projection time, scalar transfer, retained generic/exact evidence bytes, device head bytes, temporary workspace, and `full - schedule_confidence` wall-clock delta;
-6. decoded video, audio, and synchronization comparison across the paired outputs.
+| Stream | generic scalar | exact scalar | scalar applied | generic K=2 | exact K=2 | applied K=2 |
+|---|---:|---:|---:|---:|---:|---:|
+| Audio | 1.641362 | 1.640962 | 1.641162 | 1.645173 | 1.644676 | 1.644899 |
+| Video | 1.277945 | 1.277594 | 1.277769 | 1.281283 | 1.281104 | 1.281193 |
 
-Answer three separate hypotheses: whether generic K=2 materially improves on generic scalar; whether exact K=2 materially improves on generic K=2 over the same span; and whether final trust-mixed K=2 materially improves on the exact scalar architecture. Use the existing 2% forecast-error materiality threshold. If K=2 remains at approximately 0.1%-scale improvement, stop and report the negative result; do not expand to K=3, larger bases, PCA, or another correction metric without positive evidence that the second direction helped.
+Generic K=2 versus generic scalar produced 0/7 audio wins/losses and approximately 0.23% worse mean error. Video produced 1/6 and approximately 0.26% worse mean error. Exact K=2 versus generic K=2 was only approximately +0.03% for audio and +0.01% for video. Exact K=2 versus exact scalar produced 1/6 for both streams. The trust-mixed K=2 path was also slightly worse than the retained scalar applied path.
 
-## Required ablations
+**The second recent trajectory direction did not improve Feature 3. Generic K=2 was consistently worse than the generic scalar correction, and exact-head weighting did not rescue it. Therefore increasing temporal trajectory rank is not the next direction of work.**
 
-Run, or explicitly mark unavailable:
+K=2 remains documented as a rejected hypothesis. Normal generation no longer computes its 2x2 Gram systems or applies its replay stencil. Small mathematical helpers/tests may remain as historical verification.
 
-1. trajectory only (neutral profile prior);
-2. weight prior only (before live calibration);
-3. trajectory plus correct profile;
-4. trajectory plus a deliberately mismatched profile;
-5. pure exact linear-head candidate, Gram-diagonal ablation, applied trust-mixed correction, and generic Euclidean baseline;
-6. base model, strong single LoRA, and stacked LoRAs;
-7. Euler, deterministic RES/CFG++ where applicable, Turbo, and native seeded `er_sde`.
+## K=2 timing finding
 
-The current public node has no neutral-profile, mismatched-profile, profile-injection, or calibration-freeze control. Consequently, ablations 1-4 are unavailable for end-to-end real-checkpoint runs in this branch. Unit tests can inject profiles directly into `ModelAwareController`, but that does not constitute the required sampling harness. Keep these cells unavailable until a benchmark-only harness can inject a selected immutable profile before `start_run`, optionally replace it with a neutral or deliberately mismatched profile, and freeze `observe_anchor` calibration for the full run without changing ordinary node behavior.
+Warm real runs attributed roughly 2.17-2.24 seconds to `model_aware_subspace_solve_s`, including approximately 2.173 seconds in `schedule_confidence` where the K=2 correction was never applied.
 
-Evaluate each hypothesis from its paired per-seed deltas. Reject the weight-prior hypothesis when the upper bound of the paired 95% confidence interval fails to exceed the 2% forecast-error tolerance against both neutral and mismatched profiles at matched NFE. Reject the exact-head correction hypothesis by the same rule against both generic and diagonal candidates after applying the timing tolerance above. Report exact-versus-generic and exact-versus-diagonal post-bound deltas, pure-candidate win rates, ending trust, and applied-gain delta even when the perceptual result is inconclusive. If the required ablation cells are unavailable or the interval crosses the tolerance boundary, report the hypothesis as untested or inconclusive. A higher NFE count alone is not evidence of a better scheduler.
+The implementation review found that the timer enclosed tiny CUDA reductions/eigensystem/solve operations. CUDA work is asynchronous, so a small scalar operation that introduces a host dependency can inherit synchronization cost from earlier queued work. This makes the reported solve timer an attribution boundary rather than evidence that the literal 2x2 arithmetic takes hundreds of milliseconds.
+
+The required fix is architectural: rejected K=2 runtime work is removed from the normal path, and `schedule_confidence` never enters Feature-3 correction construction. No `torch.cuda.synchronize()` is added to normal inference merely to improve timing attribution.
+
+## Current Feature-3 hypothesis: transform the direction
+
+**Use the actual model geometry to transform the correction direction itself rather than merely reweighting a scalar objective or adding more historical trajectory directions.**
+
+The current applied `full` correction is restored to the retained scalar hierarchy:
+
+1. generic Euclidean scalar;
+2. Gram-diagonal scalar historical ablation;
+3. exact static-head scalar;
+4. exact-versus-generic trust-mixed scalar applied correction.
+
+The two new direction candidates are telemetry-only.
+
+### Static output-head direction
+
+For the latest causal trajectory delta `d` and native stream head `W`:
+
+```text
+m_W = W^T W d
+    = (d @ W.T) @ W
+```
+
+The production implementation never constructs the 5376 x 5376 Gram matrix. This candidate isolates the value of changing the hidden-space direction using complete static head geometry.
+
+### Full native FinalLayer local direction
+
+Let `F_t(h)` be the stream-specific native `FinalLayer` mapping at the target timestep and `J_t = dF_t/dh`. The second candidate is
+
+```text
+m_F = J_t^T J_t d
+```
+
+`J_t` is never materialized. The implementation uses an analytic FinalLayer-only JVP followed by an analytic VJP. It never differentiates through a transformer block and never adds a denoiser NFE.
+
+For native H3:
+
+```text
+y = W * (RMSNorm(h) * (1 + scale_t) + shift_t) + b
+```
+
+The local geometry therefore includes exact RMSNorm, timestep AdaLN multiplicative scale, and the native FP32 audio/video output head.
+
+## Causality and calibration
+
+At completed actual anchor N, the counterfactual candidate is evaluated from the uncorrected spectral prediction that was constructible from anchors `< N`, the latest causal trajectory delta, and the target timestep's FinalLayer state. The future actual hidden at N is used only as scoring/training evidence after candidate construction.
+
+The coefficient applied to candidate N is an EWMA learned from earlier completed anchors only. The instantaneous diagnostic
+
+```text
+alpha_N = <r_N, m_N> / <m_N, m_N>
+```
+
+is scored at N and then updates the calibration for later candidates. It never retroactively modifies candidate N.
+
+The sampled current anchor is appended to the direction-evidence history only after all candidates for that anchor have been scored.
+
+## Correction budget
+
+For candidate direction `m` and coefficient `alpha`, form `c_raw = alpha * m` and measure
+
+```text
+q = ||c_raw|| / max(||d||, eps)
+```
+
+in the same sampled generic hidden-space geometry. Apply the same rational radial soft limit corresponding to 0.25 used by the scalar correction. A large `W^T W` or `J^T J` norm cannot grant a larger physical correction budget.
+
+When `m == d`, the radial rule reduces to the existing scalar rational-bound semantics within numerical tolerance.
+
+## Evidence and memory policy
+
+The first directional screen uses deterministic complete-row sampling only. Sampled hidden rows remain on the feature device. Only reduced scalar telemetry returns to CPU.
+
+The global profile cache retains detached CPU output-head tensors and diagonals only. It never retains model/module/GPU references. GPU head materialization is `full`-only and is released at run end/disable. The CPU audio/video heads are approximately 2.6 MiB total for base H3 (`32 x 5376` and `96 x 5376`, FP32), which is retained because this has simpler and safer cache lifetime semantics than a cache that holds live model references.
+
+Direction evidence is bounded by `max_history` and a small row sample. Debug output reports retained direction evidence bytes, per-run device head bytes, and peak sampled workspace.
+
+## Telemetry required for the next gate
+
+For each eligible stream/anchor, preserve the existing scalar ratios and report static/full model-direction eligibility, direction norm ratio, coefficient used, radial scale, bounded correction norm ratio, bound activity, ordinary-RMS ratio, static-head ratio, full FinalLayer/output-space ratio where available, and relative advantages against generic scalar, exact scalar, and the other model-direction candidate.
+
+Run summaries must include eligible/fallback counts, mean/max ratios, mean/max relative advantage magnitude, wins/losses, direction computation time, JVP/VJP enqueue timing, scalar-transfer time, retained evidence bytes, temporary workspace, head materialization bytes/time, K=2 runtime work equal to zero, and no-extra-transformer-NFE confirmation.
+
+Timing fields that do not introduce a synchronization boundary are labeled as enqueue timing. No explicit synchronization is added for measurement.
+
+## Next real benchmark gate
+
+Use one saved base-H3 workflow and seed, with no active LoRA:
+
+1. `full`
+2. `schedule_confidence`
+3. `full`
+
+Keep the checkpoint/precision, prompt and references, seed, native `sample_er_sde`, scheduler, 20 steps, resolution, frame count, CFG, all Spectrum controls, storage modes, and debug setting identical. Enable debug logging.
+
+Reject the comparison if actual/forecast IDs, total transformer NFE, or Feature-2 risk/confidence/ridge/blend decisions differ.
+
+Report separately:
+
+- existing scalar correction: `schedule_confidence` raw versus scalar applied;
+- static direction: `W^T W d` candidate versus generic scalar and exact-head scalar;
+- full direction: `J_t^T J_t d` candidate versus generic scalar, exact-head scalar, and `W^T W d`;
+- runtime: `schedule_confidence` overhead after K=2 removal, warm `full` overhead, sampled direction/JVP/VJP work, evidence memory/workspace, and head materialization.
+
+Use 2% forecast-error improvement as the materiality gate. If both transformed directions remain at approximately 0.1% scale or are worse, stop this line of Feature-3 work and reassess from first principles. Do not proceed automatically to K=3, larger trajectory bases, PCA/SVD, learned regressors, transformer JVPs, full Jacobians, or another scalar metric.
 
 ## Result status
 
-No full MiniMax-H3 checkpoint is present in the automated environment used to implement this branch. Real-checkpoint quality, equal-NFE, equal-wall-clock, VRAM, and end-to-end timing cells are therefore pending and must not be inferred from unit fixtures. The branch remains experimental until those cells are populated.
+Automated tests validate mathematical equivalence, analytic derivatives, causal ordering, mode boundaries, rollback state, and no explicit Gram/Jacobian materialization. The automated environment does not contain the full MiniMax-H3 checkpoint. Real-checkpoint quality, VRAM, and production wall-clock conclusions remain pending the gate above.
