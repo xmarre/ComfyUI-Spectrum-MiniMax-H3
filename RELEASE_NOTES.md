@@ -1,32 +1,80 @@
-# Spectrum MiniMax H3 v0.2.6
+# Spectrum MiniMax H3 v0.2.7
 
-Adds proper native ComfyUI `er_sde` sampler support to Spectrum's ordinary path and the default offline smoothing replay path.
+Adds opt-in model-aware forecasting controls, retains the useful generic residual correction discovered during that work, and fixes the ER-SDE odd-step terminal replay artifact found during final real-generation validation.
 
-## Native ER-SDE integration
+## Experimental model-aware forecasting
 
-- Recognizes ComfyUI's exact native `sample_er_sde` implementation behind the `er_sde` KSampler name.
-- Preserves the one-to-one mapping between Spectrum logical steps and ER-SDE model evaluations.
-- Applies a conservative schedule of at most one consecutive forecast followed by one completed actual refresh.
-- Keeps ER-SDE's solver-local denoised history, stage updates, callbacks, final sigma-zero behavior, and stochastic update order inside the native sampler loop.
-- Supports the standard `offline_smoothing_replay=true` path with deterministic reconstruction of the native seeded noise sequence.
-- Uses no additional forced actual tail beyond the configured user tail.
+A new `model_aware_mode` input is available and defaults to `off`, so existing workflows keep legacy Spectrum behavior unless explicitly enabled.
 
-## Replay safety
+- `off`: legacy Spectrum scheduling, fitting, blending, and replay.
+- `schedule`: adds a compact model/patch risk prior that may turn a prospective forecast into an actual transformer evaluation.
+- `schedule_confidence`: also adapts fit confidence, ridge/degree selection, and modality-specific blend.
+- `full`: adds the retained bounded generic latest-delta hidden-residual correction on top of scheduling and confidence.
 
-ER-SDE's default noise sampler is recreated from the same ComfyUI seed on each sampler invocation. This allows capture and replay to reproduce the same stochastic innovations from identical inputs.
+`model_aware_risk_threshold` defaults to `0.65`. Existing hard sampler, warmup, history, refresh, and tail rules still take precedence.
 
-Custom `noise_sampler` or `noise_scaler` callables may retain mutable state that Spectrum cannot safely reconstruct. When either override is present, offline replay fails closed to one native pass. Ordinary single-pass Spectrum remains available because the one-model-call topology is unchanged.
+The profile is deliberately compact. It retains scalar sensitivities and patch metadata rather than detached output-head tensors, uses a bounded process cache, and does not add transformer NFEs by itself.
 
-The default-off `anchor_residual_feedback` and `selective_rollback_correction` experiments remain limited to their separately reviewed sampler contracts.
+## Feature-3 result: model-specific correction retired
+
+The model-informed correction experiments were completed rather than shipped speculatively. Exact/diagonal head metrics, K=2 trajectory corrections, transformed directions, previous hidden residual persistence, and static/current-FinalLayer adjoint variants did not produce a material model-specific improvement over the generic baseline in the real base-H3 gates.
+
+Those model-specific correction paths are therefore retired from normal runtime. `full` applies only the generic latest-delta correction:
+
+```text
+d = h[-1] - h[-2]
+r = h_actual - h_pred_uncorrected
+g_raw = <r, d> / <d, d>
+h_corrected = h_pred + bounded(g_raw) * d
+```
+
+In the final same-seed correction gate, that generic correction improved the aggregate hidden forecast-ratio metric by about 6.2% for audio and 5.5% for video. This is a generic trajectory-correction result, not evidence of a successful model-specific Feature 3 and not a claim of an equivalent perceptual-quality percentage.
+
+The complete experimental record remains in `MODEL_AWARE_BENCHMARK.md`.
+
+## ER-SDE terminal replay protection
+
+Final validation exposed a step-count parity failure in native `er_sde` with offline replay: a 25-step run could leave the penultimate logical step forecasted while the final step was actual. Replay then had to reconstruct the penultimate feature across the last wide, nonlinear anchor interval, producing severe visible artifacts in the reproduced case. The failure also reproduced with `model_aware_mode=off`, isolating it from the model-aware features.
+
+ER-SDE now enforces a minimum two-logical-step actual tail. On the failing 25-step schedule the end changes from:
+
+```text
+22 actual
+23 forecast
+24 actual
+```
+
+to:
+
+```text
+22 actual
+23 actual
+24 actual
+```
+
+The protected 25-step real run completed artifact-free with `model_aware_mode=full`, 14 actual transformer calls and 11 forecast steps. Schedules that already end with two actual logical steps do not gain another forced evaluation; the reproduced odd-step case costs one additional actual NFE.
+
+Euler, MiniMax H3 Turbo, and deterministic RES/CFG++ sampler policies are unchanged by this ER-SDE-specific guard. RES continues to enforce its existing three-step protected tail.
+
+## Runtime and telemetry cleanup
+
+- Removes retired exact/diagonal/K=2 experiment payload from the normal shipping path.
+- Keeps the compact scalar model/patch profile and bounded cache.
+- Keeps generic correction telemetry explicit and marks retired model-informed Feature-3 paths as retired.
+- Preserves offline replay decisions without archiving model-profile tensors.
+- Keeps model-aware failures fail-safe: risky/invalid model-aware construction falls back to actual work rather than aborting sampling.
 
 ## Compatibility
 
-Existing workflows retain their saved values. Euler, MiniMax H3 Turbo, RES multistep, RES multistep CFG++, offline smoothing, audio handling, progress reporting, and native fallback behavior are unchanged.
+- `model_aware_mode` defaults to `off`; existing workflows remain on legacy behavior unless changed.
+- Existing offline smoothing, audio default (`audio_blend_weight=0`), Euler, Turbo, RES multistep, RES CFG++, native ER-SDE seeded replay, previews, storage controls, and native fallback behavior remain supported.
+- Custom replay-unsafe ER-SDE stochastic components continue to fail closed to one valid native pass.
 
 ## Validation
 
-- Confirmed in a real MiniMax H3 ER-SDE generation with the default offline smoothing replay path.
-- 116 CPU tests passed; three CUDA-only tests were skipped in the CPU environment.
-- Native sampler-contract tests passed against all three older pinned ComfyUI revisions.
-- The four-version GitHub Actions matrix passed, including reviewed current ComfyUI master `27bca654eb9a70237d93f56a6ea336ab55f8925d`.
-- CodeRabbit reported no actionable review findings.
+- Final real-generation 25-step native ER-SDE gate: artifact-free after protecting the penultimate logical step.
+- The reproduced 25-step first pass changed from 13 actual / 12 forecast to 14 actual / 11 forecast exactly as intended.
+- 20-step and 32-step ER-SDE outputs used during diagnosis were artifact-free; focused tests pin the two-actual-tail invariant across 20, 25, and 32 steps.
+- GitHub Actions run #163 passed the four reviewed ComfyUI revisions, including wheel build, forecaster smoke, scoped Ruff, `compileall`, and full pytest.
+- Representative matrix result: 235 passed, 4 skipped; the skips are existing CUDA-only tests on CPU runners.
+- All current CodeRabbit review threads are resolved.
