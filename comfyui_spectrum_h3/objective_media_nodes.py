@@ -1631,7 +1631,8 @@ class SpectrumH3ObjectiveSequentialCapture:
         "deterministically reduced to a bounded float16 CPU analysis surface "
         "before retention. Full-resolution decoded video is never retained by "
         "the sequential benchmark. The third role automatically evaluates and "
-        "writes reports."
+        "writes reports. Capture failures are returned as status text so they "
+        "do not abort unrelated output nodes."
     )
 
     @classmethod
@@ -1652,6 +1653,62 @@ class SpectrumH3ObjectiveSequentialCapture:
         audio=None,
     ):
         capture_started = time.perf_counter()
+        try:
+            return self._capture_or_raise(
+                video,
+                role,
+                fps,
+                benchmark_id,
+                generation_seed,
+                steps,
+                compatibility_tag,
+                frame_chunk_size,
+                reset_before_capture=reset_before_capture,
+                audio=audio,
+                capture_started=capture_started,
+            )
+        except Exception as exc:
+            benchmark_key = str(benchmark_id).strip() or "<empty>"
+            role_key = _ROLE_KEYS.get(str(role), str(role))
+            error_text = str(exc).replace("\n", " | ")
+            _capture_log(
+                "capture_skipped_nonfatal",
+                started=capture_started,
+                benchmark=benchmark_key,
+                role=role_key,
+                error_type=type(exc).__name__,
+                error=error_text,
+            )
+            if not isinstance(exc, ObjectiveMediaError):
+                LOG.exception(
+                    "Unexpected Spectrum H3 objective capture failure was "
+                    "contained so other output nodes can continue"
+                )
+            summary = (
+                "Spectrum H3 objective capture skipped without aborting the "
+                f"workflow: benchmark={benchmark_key} role={role_key}; "
+                f"{type(exc).__name__}: {error_text}"
+            )
+            print(summary)
+            return (summary, "", "", "", "")
+
+    def _capture_or_raise(
+        self,
+        video,
+        role,
+        fps,
+        benchmark_id,
+        generation_seed,
+        steps,
+        compatibility_tag,
+        frame_chunk_size,
+        reset_before_capture=False,
+        audio=None,
+        *,
+        capture_started: float | None = None,
+    ):
+        if capture_started is None:
+            capture_started = time.perf_counter()
         _capture_log(
             "input_received",
             started=capture_started,

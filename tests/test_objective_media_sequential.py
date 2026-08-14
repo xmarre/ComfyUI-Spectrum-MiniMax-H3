@@ -182,11 +182,16 @@ def test_sequential_capture_retains_bounded_float16_analysis_not_full_media(
     )
 
 
-def test_duplicate_role_is_rejected_and_reset_before_capture_restarts():
+def test_duplicate_role_is_reported_nonfatally_and_reset_restarts():
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
     _capture(node, "R - native reference")
-    with pytest.raises(ObjectiveMediaError, match="already contains role R"):
-        _capture(node, "R - native reference")
+    duplicate = _capture(node, "R - native reference")
+
+    assert "skipped without aborting the workflow" in duplicate[0]
+    assert "already contains role R" in duplicate[0]
+    assert nodes.pending_objective_media_state()["benchmarks"]["seq-1"][
+        "roles"
+    ] == ["R"]
 
     _capture(node, "A - legacy Spectrum", reset=True)
     state = nodes.pending_objective_media_state()
@@ -196,8 +201,10 @@ def test_duplicate_role_is_rejected_and_reset_before_capture_restarts():
 def test_incompatible_source_topology_is_rejected_without_destroying_existing_capture():
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
     _capture(node, "R - native reference")
-    with pytest.raises(ObjectiveMediaError, match="matching decoded source"):
-        _capture(node, "A - legacy Spectrum", video=_video(width=9))
+    result = _capture(node, "A - legacy Spectrum", video=_video(width=9))
+
+    assert "skipped without aborting the workflow" in result[0]
+    assert "matching decoded source" in result[0]
     state = nodes.pending_objective_media_state()
     assert state["benchmarks"]["seq-1"]["roles"] == ["R"]
 
@@ -210,8 +217,9 @@ def test_completion_failure_releases_bounded_analysis_media(monkeypatch):
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
     _capture(node, "R - native reference")
     _capture(node, "A - legacy Spectrum")
-    with pytest.raises(ObjectiveMediaError, match="synthetic evaluation failure"):
-        _capture(node, "B - candidate")
+    result = _capture(node, "B - candidate")
+
+    assert "synthetic evaluation failure" in result[0]
     assert nodes.pending_objective_media_state()["benchmark_count"] == 0
 
 
@@ -227,8 +235,9 @@ def test_pending_benchmark_count_is_bounded_by_eviction(monkeypatch):
 def test_single_capture_over_ram_bound_is_rejected(monkeypatch):
     monkeypatch.setattr(nodes, "MAX_PENDING_BYTES", 1)
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
-    with pytest.raises(ObjectiveMediaError, match="exceeds the sequential RAM limit"):
-        _capture(node, "R - native reference")
+    result = _capture(node, "R - native reference")
+
+    assert "exceeds the sequential RAM limit" in result[0]
     assert nodes.pending_objective_media_state()["benchmark_count"] == 0
 
 
@@ -295,19 +304,20 @@ def test_sequential_schema_requires_linked_int_seed_and_has_no_json_blob():
 def test_generation_seed_validation_is_strict():
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
     for invalid in ("not-a-seed", -1, 2**64):
-        with pytest.raises(ObjectiveMediaError, match="generation_seed"):
-            node.capture(
-                _video(),
-                "R - native reference",
-                24.0,
-                f"bad-{invalid}",
-                invalid,
-                20,
-                "fixture",
-                4,
-                False,
-                _audio(),
-            )
+        result = node.capture(
+            _video(),
+            "R - native reference",
+            24.0,
+            f"bad-{invalid}",
+            invalid,
+            20,
+            "fixture",
+            4,
+            False,
+            _audio(),
+        )
+        assert "generation_seed" in result[0]
+        assert "skipped without aborting the workflow" in result[0]
 
 
 @pytest.mark.parametrize(
@@ -457,11 +467,12 @@ def test_unsafe_host_preflight_rejects_before_destination_allocation(monkeypatch
         raise AssertionError("staging was reached")
 
     monkeypatch.setattr(nodes, "_stage_media_sequential", must_not_stage)
-    with pytest.raises(ObjectiveMediaError, match="aborted before staging"):
-        _capture(
-            nodes.SpectrumH3ObjectiveSequentialCapture(),
-            "R - native reference",
-        )
+    result = _capture(
+        nodes.SpectrumH3ObjectiveSequentialCapture(),
+        "R - native reference",
+    )
+
+    assert "aborted before staging" in result[0]
     assert nodes.pending_objective_media_state()["benchmark_count"] == 0
 
 
@@ -504,11 +515,12 @@ def test_missing_memory_telemetry_uses_conservative_absolute_guard(monkeypatch):
         raise AssertionError("staging was reached")
 
     monkeypatch.setattr(nodes, "_stage_media_sequential", must_not_stage)
-    with pytest.raises(ObjectiveMediaError, match="telemetry is unavailable"):
-        _capture(
-            nodes.SpectrumH3ObjectiveSequentialCapture(),
-            "R - native reference",
-        )
+    result = _capture(
+        nodes.SpectrumH3ObjectiveSequentialCapture(),
+        "R - native reference",
+    )
+
+    assert "telemetry is unavailable" in result[0]
 
 
 def test_duplicate_and_topology_failures_happen_before_staging(monkeypatch):
@@ -519,10 +531,11 @@ def test_duplicate_and_topology_failures_happen_before_staging(monkeypatch):
         raise AssertionError("staging was reached")
 
     monkeypatch.setattr(nodes, "_stage_media_sequential", must_not_stage)
-    with pytest.raises(ObjectiveMediaError, match="already contains role R"):
-        _capture(node, "R - native reference")
-    with pytest.raises(ObjectiveMediaError, match="matching decoded source"):
-        _capture(node, "A - legacy Spectrum", video=_video(width=9))
+    duplicate = _capture(node, "R - native reference")
+    topology = _capture(node, "A - legacy Spectrum", video=_video(width=9))
+
+    assert "already contains role R" in duplicate[0]
+    assert "matching decoded source" in topology[0]
     assert nodes.pending_objective_media_state()["benchmarks"]["seq-1"][
         "roles"
     ] == ["R"]
@@ -536,10 +549,40 @@ def test_staging_failure_preserves_accepted_roles(monkeypatch):
         raise ObjectiveMediaError("synthetic staging failure")
 
     monkeypatch.setattr(nodes, "_stage_media_sequential", fail)
-    with pytest.raises(ObjectiveMediaError, match="synthetic staging failure"):
-        _capture(node, "A - legacy Spectrum")
+    result = _capture(node, "A - legacy Spectrum")
+
+    assert "synthetic staging failure" in result[0]
     state = nodes.pending_objective_media_state()
     assert state["benchmarks"]["seq-1"]["roles"] == ["R"]
+
+
+def test_unexpected_capture_failure_is_logged_and_nonfatal(monkeypatch, caplog):
+    def fail(*args, **kwargs):
+        raise RuntimeError("synthetic unexpected failure")
+
+    monkeypatch.setattr(nodes, "_source_topology", fail)
+    with caplog.at_level("ERROR"):
+        result = _capture(
+            nodes.SpectrumH3ObjectiveSequentialCapture(),
+            "R - native reference",
+        )
+
+    assert "synthetic unexpected failure" in result[0]
+    assert "skipped without aborting the workflow" in result[0]
+    assert "other output nodes can continue" in caplog.text
+    assert nodes.pending_objective_media_state()["benchmark_count"] == 0
+
+
+def test_capture_does_not_swallow_execution_interrupts(monkeypatch):
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(nodes, "_source_topology", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _capture(
+            nodes.SpectrumH3ObjectiveSequentialCapture(),
+            "R - native reference",
+        )
 
 
 def test_pending_capture_does_not_retain_source_tensor_objects():
