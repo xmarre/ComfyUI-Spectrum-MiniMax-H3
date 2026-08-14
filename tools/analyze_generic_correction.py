@@ -38,4 +38,4 @@ for _name, _value in vars(_CORE).items():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_CORE.main())

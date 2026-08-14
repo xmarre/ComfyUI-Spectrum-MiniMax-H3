@@ -712,7 +712,9 @@ def _end_run(self: SpectrumH3Runtime, run_id: int) -> None:
                 "Spectrum H3 generic-correction post-run analysis completed in %.3f s",
                 result.elapsed_seconds,
             )
-        except Exception as exc:
+        # Research is strictly post-run and must never invalidate a completed
+        # generation, including failures from an unexpected report bug.
+        except Exception as exc:  # noqa: BLE001
             LOG.warning(
                 "Spectrum H3 generic-correction research persistence/evaluation failed; "
                 "the completed generation remains valid: %s",

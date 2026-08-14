@@ -247,8 +247,7 @@ def load_blocks(paths: Iterable[Path]) -> list[dict[str, Any]]:
         parsed = parse_calibration_text(path.read_text(encoding="utf-8"))
         if not parsed:
             raise CalibrationError(f"no generic calibration block found in {path}")
-        for block in parsed:
-            blocks.append(block)
+        blocks.extend(parsed)
     return validate_blocks(blocks)
 
 
