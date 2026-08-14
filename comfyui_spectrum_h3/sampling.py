@@ -23,6 +23,7 @@ ACTUAL_KEY = "spectrum_h3_actual"
 REASON_KEY = "spectrum_h3_reason"
 WRAPPER_KEY = "spectrum_minimax_h3"
 KJ_PREVIEW_WRAPPER_KEY = "kj_preview_override"
+CONTINUUM_REQUEST_KEY = "h3_continuum"
 
 SUPPORTED_SINGLE_CALL_SAMPLERS = frozenset(
     {
@@ -53,6 +54,28 @@ ER_SDE_NATIVE_SCALER_FREEVARS = {
 @dataclass(slots=True)
 class SpectrumH3Binding:
     runtime: SpectrumH3Runtime
+
+
+def _continuum_actual_prefix(model_options: dict[str, Any] | None) -> int:
+    transformer_options = (model_options or {}).get("transformer_options")
+    if not isinstance(transformer_options, dict):
+        return 0
+    request = transformer_options.get(CONTINUUM_REQUEST_KEY)
+    if not isinstance(request, dict):
+        return 0
+
+    api = request.get("api")
+    active = request.get("active")
+    prefix = request.get("min_actual_prefix_steps")
+    if type(api) is not int or type(active) is not bool or type(prefix) is not int:
+        return 0
+    if api != 1 or active is not True or prefix < 0:
+        return 0
+    return prefix
+
+
+def _continuum_prefix_for_phase(prefix: int, phase: str) -> int:
+    return 0 if phase == "offline_replay" else prefix
 
 
 def sampler_name(sampler: Any) -> str:
@@ -240,6 +263,8 @@ def outer_sample_wrapper(
 
     runtime = binding.runtime
     name = sampler_name(sampler)
+    continuum_prefix = _continuum_actual_prefix(getattr(guider, "model_options", None))
+    continuum_log_emitted = False
     profile_eligible = sampler_is_supported(sampler) and (
         not runtime.config.offline_smoothing_replay
         or sampler_supports_seeded_replay(sampler)
@@ -290,6 +315,8 @@ def outer_sample_wrapper(
         phase: str,
         complete_offline_capture: bool = False,
     ):
+        nonlocal continuum_log_emitted
+        phase_prefix = _continuum_prefix_for_phase(continuum_prefix, phase)
         run_id = runtime.start_run(
             run_sigmas,
             name,
@@ -297,7 +324,14 @@ def outer_sample_wrapper(
             max_consecutive_forecasts=max_consecutive_forecasts(sampler),
             min_actual_steps_after_forecast=min_actual_steps_after_forecast(sampler),
             min_tail_actual_steps=min_tail_actual_steps(sampler),
+            min_actual_prefix_steps=phase_prefix,
         )
+        if phase_prefix > 0 and runtime.supported_sampler and not continuum_log_emitted:
+            LOG.warning(
+                "Spectrum H3: accepted H3 Continuum API v1, actual prefix=%s",
+                min(phase_prefix, max(0, run_sigmas.numel() - 1)),
+            )
+            continuum_log_emitted = True
         if name in ER_SDE_SAMPLERS and (
             runtime.config.anchor_residual_feedback
             or runtime.config.selective_rollback_correction

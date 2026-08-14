@@ -230,6 +230,7 @@ class _RunState:
     max_consecutive_forecasts: int | None
     min_actual_steps_after_forecast: int
     min_tail_actual_steps: int
+    min_actual_prefix_steps: int
     next_step_id: int = 0
 
 
@@ -642,6 +643,7 @@ class SpectrumH3Runtime:
         max_consecutive_forecasts: int | None = None,
         min_actual_steps_after_forecast: int = 0,
         min_tail_actual_steps: int = 0,
+        min_actual_prefix_steps: int = 0,
     ) -> int:
         if self._run is not None:
             raise RuntimeError("Spectrum H3 runtime already has an active run")
@@ -654,6 +656,7 @@ class SpectrumH3Runtime:
         for name, value in (
             ("min_actual_steps_after_forecast", min_actual_steps_after_forecast),
             ("min_tail_actual_steps", min_tail_actual_steps),
+            ("min_actual_prefix_steps", min_actual_prefix_steps),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be an integer >= 0")
@@ -679,6 +682,7 @@ class SpectrumH3Runtime:
             max_consecutive_forecasts=max_consecutive_forecasts,
             min_actual_steps_after_forecast=min_actual_steps_after_forecast,
             min_tail_actual_steps=min_tail_actual_steps,
+            min_actual_prefix_steps=min(min_actual_prefix_steps, total_steps),
         )
         self._step = None
         self.forecaster.reset()
@@ -885,6 +889,8 @@ class SpectrumH3Runtime:
             actual, reason = True, "anchor residual feedback refresh"
             rollback_replay = False
             consumes_feedback_refresh = True
+        elif step_id < self._run.min_actual_prefix_steps:
+            actual, reason = True, "H3 Continuum actual prefix"
         elif step_id < self.config.warmup_steps:
             actual, reason = True, "warmup"
         elif step_id >= tail_start:
