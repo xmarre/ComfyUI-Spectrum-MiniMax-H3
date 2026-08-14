@@ -73,8 +73,11 @@ def test_calibration_block_contains_only_scalar_rows_and_stable_provenance():
     )
     runtime = SimpleNamespace(_spectrum_h3_observed_seed=123)
     block = build_block(runtime, state)
+    rebuilt = build_block(runtime, state)
     assert block["provenance"]["seed"] == 123
     assert block["provenance"]["config_hash"]
     assert block["provenance"]["trace_fingerprint"]
     assert block["target_rows"][0]["trace_fingerprint"]
+    assert rebuilt == block
+    assert "trace_fingerprint" not in row
     assert not any(torch.is_tensor(value) for value in block["target_rows"][0].values())

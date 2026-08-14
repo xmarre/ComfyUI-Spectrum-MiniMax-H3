@@ -66,18 +66,20 @@ def create_state(
     *,
     enabled: bool,
 ) -> GenericCalibrationState:
-    schedule_tensor = (
-        torch.as_tensor(sigmas)
-        .detach()
-        .to(device="cpu", dtype=torch.float64)
-        .reshape(-1)
-    )
-    schedule = tuple(float(value) for value in schedule_tensor.tolist())
-    if not all(math.isfinite(value) for value in schedule):
-        schedule = ()
     run = runtime._run
     if run is None:
         raise RuntimeError("generic calibration requires an active run")
+    schedule: tuple[float, ...] = ()
+    if enabled:
+        schedule_tensor = (
+            torch.as_tensor(sigmas)
+            .detach()
+            .to(device="cpu", dtype=torch.float64)
+            .reshape(-1)
+        )
+        schedule = tuple(float(value) for value in schedule_tensor.tolist())
+        if not all(math.isfinite(value) for value in schedule):
+            schedule = ()
     return GenericCalibrationState(
         enabled=bool(enabled),
         run_id=int(run.run_id),
