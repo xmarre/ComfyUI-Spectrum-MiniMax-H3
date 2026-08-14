@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import threading
+from collections import OrderedDict
+from typing import Any
+
+import torch
 
 from .objective_media import (
     ObjectiveMediaError,
@@ -8,7 +14,243 @@ from .objective_media import (
     persist_objective_report,
 )
 
+LOG = logging.getLogger(__name__)
+
 OBJECTIVE_MEDIA_TYPE = "SPECTRUM_H3_OBJECTIVE_MEDIA"
+MAX_PENDING_BENCHMARKS = 3
+MAX_PENDING_BYTES = 12 * 1024**3
+
+DEFAULT_PROVENANCE_JSON = json.dumps(
+    {
+        "compatibility": {
+            "model": "MiniMax-H3",
+            "model_weights": "same-workflow",
+            "precision": "same-workflow",
+            "sampler": "er_sde",
+            "scheduler": "same-workflow",
+            "steps": 20,
+            "conditioning": "same-workflow",
+            "video_vae": "same-workflow",
+            "audio_decoder": "same-workflow",
+            "generation_settings": {
+                "provenance_status": "user-unverified-same-workflow",
+            },
+        },
+        "R": {"spectrum": "bypassed", "role": "native_full_compute_reference"},
+        "A": {
+            "spectrum": "enabled",
+            "generic_correction_mode": "legacy",
+            "generic_correction_attenuation": "mode_default",
+            "generic_correction_limiter": "rational",
+            "generic_correction_limit": 0.25,
+        },
+        "B": {
+            "spectrum": "enabled",
+            "generic_correction_mode": "coordinate_rls",
+            "generic_correction_attenuation": "no_attenuation",
+            "generic_correction_limiter": "hard_clip",
+            "generic_correction_limit": 0.40,
+        },
+    },
+    separators=(",", ":"),
+)
+
+_ROLE_OPTIONS = (
+    "R - native reference",
+    "A - legacy Spectrum",
+    "B - candidate",
+)
+_ROLE_KEYS = {
+    _ROLE_OPTIONS[0]: "R",
+    _ROLE_OPTIONS[1]: "A",
+    _ROLE_OPTIONS[2]: "B",
+    "R": "R",
+    "A": "A",
+    "B": "B",
+}
+
+_PENDING_LOCK = threading.RLock()
+_PENDING_CAPTURES: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+
+def _parse_provenance(provenance_json: str) -> dict[str, Any]:
+    try:
+        provenance = json.loads(provenance_json)
+    except json.JSONDecodeError as exc:
+        raise ObjectiveMediaError(f"provenance_json is invalid: {exc}") from exc
+    if not isinstance(provenance, dict):
+        raise ObjectiveMediaError("provenance_json must decode to a JSON object")
+    return provenance
+
+
+def _canonical_provenance(provenance: dict[str, Any]) -> str:
+    return json.dumps(provenance, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _stage_media(video: Any, audio: Any = None) -> dict[str, Any]:
+    if not isinstance(video, torch.Tensor):
+        raise ObjectiveMediaError("video must be a torch IMAGE tensor")
+    staged_video = video.detach().to(device="cpu").contiguous()
+    staged_audio = None
+    if audio is not None:
+        if not isinstance(audio, dict) or "waveform" not in audio or "sample_rate" not in audio:
+            raise ObjectiveMediaError("audio must be a ComfyUI AUDIO object with waveform and sample_rate")
+        waveform = audio["waveform"]
+        if not isinstance(waveform, torch.Tensor):
+            raise ObjectiveMediaError("audio.waveform must be a torch tensor")
+        staged_audio = {
+            "waveform": waveform.detach().to(device="cpu").contiguous(),
+            "sample_rate": int(audio["sample_rate"]),
+        }
+    return {"video": staged_video, "audio": staged_audio}
+
+
+def _media_nbytes(media: dict[str, Any]) -> int:
+    video = media["video"]
+    total = int(video.numel() * video.element_size())
+    audio = media.get("audio")
+    if audio is not None:
+        waveform = audio["waveform"]
+        total += int(waveform.numel() * waveform.element_size())
+    return total
+
+
+def _media_topology(media: dict[str, Any]) -> tuple[Any, ...]:
+    video = media["video"]
+    audio = media.get("audio")
+    audio_topology: tuple[Any, ...] | None = None
+    if audio is not None:
+        waveform = audio["waveform"]
+        audio_topology = (
+            int(waveform.ndim),
+            tuple(int(item) for item in waveform.shape[:-1]),
+        )
+    return (
+        tuple(int(item) for item in video.shape),
+        str(video.dtype),
+        audio is not None,
+        audio_topology,
+    )
+
+
+def _pending_bytes_locked() -> int:
+    return sum(int(entry["bytes"]) for entry in _PENDING_CAPTURES.values())
+
+
+def clear_pending_objective_media(benchmark_id: str | None = None) -> tuple[str, ...]:
+    with _PENDING_LOCK:
+        if benchmark_id is None:
+            released = tuple(_PENDING_CAPTURES.keys())
+            _PENDING_CAPTURES.clear()
+            return released
+        key = str(benchmark_id).strip()
+        if key in _PENDING_CAPTURES:
+            del _PENDING_CAPTURES[key]
+            return (key,)
+        return ()
+
+
+def pending_objective_media_state() -> dict[str, Any]:
+    with _PENDING_LOCK:
+        return {
+            "benchmark_count": len(_PENDING_CAPTURES),
+            "total_bytes": _pending_bytes_locked(),
+            "benchmarks": {
+                benchmark_id: {
+                    "roles": sorted(entry["roles"]),
+                    "bytes": int(entry["bytes"]),
+                }
+                for benchmark_id, entry in _PENDING_CAPTURES.items()
+            },
+        }
+
+
+def _evict_for_capture_locked(benchmark_id: str, extra_bytes: int, *, creating: bool) -> list[str]:
+    if extra_bytes > MAX_PENDING_BYTES:
+        raise ObjectiveMediaError(
+            "one objective-media capture exceeds the sequential capture RAM limit "
+            f"({extra_bytes / 1024**3:.2f} GiB > {MAX_PENDING_BYTES / 1024**3:.2f} GiB)"
+        )
+    evicted: list[str] = []
+    while True:
+        benchmark_overflow = len(_PENDING_CAPTURES) + int(creating) > MAX_PENDING_BENCHMARKS
+        byte_overflow = _pending_bytes_locked() + extra_bytes > MAX_PENDING_BYTES
+        if not benchmark_overflow and not byte_overflow:
+            break
+        victim = next((key for key in _PENDING_CAPTURES if key != benchmark_id), None)
+        if victim is None:
+            raise ObjectiveMediaError(
+                "sequential objective-media capture would exceed its RAM bound; "
+                "clear/restart the pending benchmark or reduce decoded media size"
+            )
+        del _PENDING_CAPTURES[victim]
+        evicted.append(victim)
+    return evicted
+
+
+def _summary_from_report(report: dict[str, Any], persisted) -> str:
+    rows = {row["metric"]: row for row in report["comparisons"]}
+    summary_lines = [
+        f"Spectrum H3 objective media: {report['verdict']['value']}",
+        f"benchmark={report['benchmark_id']} seed={report['seed']} group={persisted.group_id}",
+        f"independent compatible triads={persisted.run_count}",
+        (
+            "VIDEO: MS-SSIM advantage="
+            f"{rows['video_ms_ssim']['candidate_relative_advantage']:+.3%}; "
+            "temporal advantage="
+            f"{rows['video_temporal_derivative_error']['candidate_relative_advantage']:+.3%}; "
+            "motion-detail advantage="
+            f"{rows['video_motion_weighted_detail_error']['candidate_relative_advantage']:+.3%}"
+        ),
+    ]
+    if "audio_mrstft_log_magnitude_error" in rows:
+        summary_lines.append(
+            "AUDIO: MR-STFT advantage="
+            f"{rows['audio_mrstft_log_magnitude_error']['candidate_relative_advantage']:+.3%}; "
+            "correlation advantage="
+            f"{rows['audio_normalized_correlation']['candidate_relative_advantage']:+.3%}"
+        )
+    summary_lines.append(f"report={persisted.markdown_path}")
+    return "\n".join(summary_lines)
+
+
+def _evaluate_and_persist(
+    reference_video,
+    legacy_video,
+    candidate_video,
+    *,
+    fps: float,
+    benchmark_id: str,
+    seed: int,
+    provenance: dict[str, Any],
+    frame_chunk_size: int,
+    reference_audio=None,
+    legacy_audio=None,
+    candidate_audio=None,
+) -> tuple[str, str, str, str, str]:
+    report = evaluate_objective_media(
+        reference_video,
+        legacy_video,
+        candidate_video,
+        fps=float(fps),
+        benchmark_id=str(benchmark_id),
+        seed=int(seed),
+        provenance=provenance,
+        reference_audio=reference_audio,
+        legacy_audio=legacy_audio,
+        candidate_audio=candidate_audio,
+        chunk_size=int(frame_chunk_size),
+    )
+    persisted = persist_objective_report(report)
+    summary = _summary_from_report(report, persisted)
+    print(summary)
+    return (
+        summary,
+        str(persisted.json_path),
+        str(persisted.markdown_path),
+        str(persisted.aggregate_json_path),
+        str(persisted.aggregate_markdown_path),
+    )
 
 
 class SpectrumH3ObjectiveMediaStage:
@@ -24,18 +266,12 @@ class SpectrumH3ObjectiveMediaStage:
     FUNCTION = "stage"
     CATEGORY = "sampling/spectrum/research"
     DESCRIPTION = (
-        "Moves one decoded result to CPU immediately. Use one stage per R/A/B branch to keep decoded triad "
-        "media out of VRAM before the objective comparison; nothing is written to disk."
+        "One-shot three-branch helper only: moves one decoded result to CPU. "
+        "For ordinary R/A/B runs performed sequentially, use Objective Media Capture (Sequential)."
     )
 
     def stage(self, video, audio=None):
-        staged_audio = None
-        if audio is not None:
-            staged_audio = {
-                "waveform": audio["waveform"].detach().to(device="cpu"),
-                "sample_rate": int(audio["sample_rate"]),
-            }
-        return ({"video": video.detach().to(device="cpu"), "audio": staged_audio},)
+        return (_stage_media(video, audio),)
 
 
 class SpectrumH3ObjectiveQualityCompare:
@@ -67,17 +303,11 @@ class SpectrumH3ObjectiveQualityCompare:
                 "provenance_json": (
                     "STRING",
                     {
-                        "default": (
-                            '{"compatibility":{"model":"","model_weights":"","precision":"",'
-                            '"sampler":"","scheduler":"","steps":20,"conditioning":"",'
-                            '"video_vae":"","audio_decoder":"","generation_settings":{}},'
-                            '"R":{"spectrum":"bypassed"},"A":{"generic_correction_mode":"legacy"},'
-                            '"B":{"generic_correction_mode":"coordinate_rls"}}'
-                        ),
+                        "default": DEFAULT_PROVENANCE_JSON,
                         "multiline": True,
                         "tooltip": (
-                            "R/A/B generation provenance plus a compatibility object containing model, weights, precision, "
-                            "sampler, scheduler, steps, conditioning, decoders, and remaining generation settings."
+                            "R/A/B generation provenance plus compatibility metadata. The default is valid but marked "
+                            "user-unverified; fill exact values before using cross-seed aggregate evidence."
                         ),
                     },
                 ),
@@ -102,8 +332,8 @@ class SpectrumH3ObjectiveQualityCompare:
     CATEGORY = "sampling/spectrum/research"
     OUTPUT_NODE = True
     DESCRIPTION = (
-        "Full-reference decoded-media comparison of native H3 (R), accelerated legacy (A), and an accelerated "
-        "candidate (B). It persists bounded JSON/Markdown reports only; raw media is never stored."
+        "One-shot full-reference decoded-media comparison requiring native R, legacy A, and candidate B in the same "
+        "execution. For normal sequential testing, use Objective Media Capture (Sequential)."
     )
 
     def compare(
@@ -120,11 +350,8 @@ class SpectrumH3ObjectiveQualityCompare:
         legacy_audio=None,
         candidate_audio=None,
     ):
-        try:
-            provenance = json.loads(provenance_json)
-        except json.JSONDecodeError as exc:
-            raise ObjectiveMediaError(f"provenance_json is invalid: {exc}") from exc
-        report = evaluate_objective_media(
+        provenance = _parse_provenance(provenance_json)
+        return _evaluate_and_persist(
             reference_video,
             legacy_video,
             candidate_video,
@@ -132,42 +359,10 @@ class SpectrumH3ObjectiveQualityCompare:
             benchmark_id=str(benchmark_id),
             seed=int(seed),
             provenance=provenance,
+            frame_chunk_size=int(frame_chunk_size),
             reference_audio=reference_audio,
             legacy_audio=legacy_audio,
             candidate_audio=candidate_audio,
-            chunk_size=int(frame_chunk_size),
-        )
-        persisted = persist_objective_report(report)
-        rows = {row["metric"]: row for row in report["comparisons"]}
-        summary_lines = [
-            f"Spectrum H3 objective media: {report['verdict']['value']}",
-            f"benchmark={report['benchmark_id']} seed={report['seed']} group={persisted.group_id}",
-            f"independent compatible triads={persisted.run_count}",
-            (
-                "VIDEO: MS-SSIM advantage="
-                f"{rows['video_ms_ssim']['candidate_relative_advantage']:+.3%}; "
-                "temporal advantage="
-                f"{rows['video_temporal_derivative_error']['candidate_relative_advantage']:+.3%}; "
-                "motion-detail advantage="
-                f"{rows['video_motion_weighted_detail_error']['candidate_relative_advantage']:+.3%}"
-            ),
-        ]
-        if "audio_mrstft_log_magnitude_error" in rows:
-            summary_lines.append(
-                "AUDIO: MR-STFT advantage="
-                f"{rows['audio_mrstft_log_magnitude_error']['candidate_relative_advantage']:+.3%}; "
-                "correlation advantage="
-                f"{rows['audio_normalized_correlation']['candidate_relative_advantage']:+.3%}"
-            )
-        summary_lines.append(f"report={persisted.markdown_path}")
-        summary = "\n".join(summary_lines)
-        print(summary)
-        return (
-            summary,
-            str(persisted.json_path),
-            str(persisted.markdown_path),
-            str(persisted.aggregate_json_path),
-            str(persisted.aggregate_markdown_path),
         )
 
 
@@ -194,7 +389,8 @@ class SpectrumH3ObjectiveStagedQualityCompare:
     CATEGORY = "sampling/spectrum/research"
     OUTPUT_NODE = True
     DESCRIPTION = (
-        "CPU-staged form of Spectrum H3 Objective Quality Compare. It accepts three outputs from the media-stage node."
+        "One-shot CPU-staged comparison. Requires three separate Media Stage nodes in one execution. "
+        "For ordinary sequential testing, use Objective Media Capture (Sequential)."
     )
 
     def compare(
@@ -223,22 +419,235 @@ class SpectrumH3ObjectiveStagedQualityCompare:
         )
 
 
+class SpectrumH3ObjectiveSequentialCapture:
+    @classmethod
+    def INPUT_TYPES(cls):
+        direct = SpectrumH3ObjectiveQualityCompare.INPUT_TYPES()["required"]
+        return {
+            "required": {
+                "video": ("IMAGE",),
+                "role": (
+                    list(_ROLE_OPTIONS),
+                    {
+                        "default": _ROLE_OPTIONS[0],
+                        "tooltip": (
+                            "Run the same workflow three times with one benchmark_id: R native reference, "
+                            "A legacy Spectrum, then B candidate. Order does not matter."
+                        ),
+                    },
+                ),
+                "fps": direct["fps"],
+                "benchmark_id": direct["benchmark_id"],
+                "seed": direct["seed"],
+                "provenance_json": direct["provenance_json"],
+                "frame_chunk_size": direct["frame_chunk_size"],
+                "reset_before_capture": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Clear any incomplete capture for this benchmark_id before storing this role.",
+                    },
+                ),
+            },
+            "optional": {"audio": ("AUDIO",)},
+        }
+
+    RETURN_TYPES = SpectrumH3ObjectiveQualityCompare.RETURN_TYPES
+    RETURN_NAMES = SpectrumH3ObjectiveQualityCompare.RETURN_NAMES
+    FUNCTION = "capture"
+    CATEGORY = "sampling/spectrum/research"
+    OUTPUT_NODE = True
+    DESCRIPTION = (
+        "Recommended objective benchmark workflow. Branch the same decoded IMAGE/AUDIO that also feeds Video Combine "
+        "into this node. Run R, A, and B as three ordinary queue executions with the same benchmark_id. Captures live "
+        "only in bounded CPU RAM; the third role automatically evaluates, writes reports, and releases all raw media."
+    )
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def capture(
+        self,
+        video,
+        role,
+        fps,
+        benchmark_id,
+        seed,
+        provenance_json,
+        frame_chunk_size,
+        reset_before_capture=False,
+        audio=None,
+    ):
+        benchmark_key = str(benchmark_id).strip()
+        if not benchmark_key:
+            raise ObjectiveMediaError("benchmark_id must be non-empty")
+        role_key = _ROLE_KEYS.get(str(role))
+        if role_key is None:
+            raise ObjectiveMediaError(f"unknown objective-media role: {role}")
+        provenance = _parse_provenance(provenance_json)
+        canonical_provenance = _canonical_provenance(provenance)
+        staged = _stage_media(video, audio)
+        staged_bytes = _media_nbytes(staged)
+        topology = _media_topology(staged)
+        fps_value = float(fps)
+        seed_value = int(seed)
+        chunk_value = int(frame_chunk_size)
+
+        completed: dict[str, Any] | None = None
+        evicted: list[str] = []
+        with _PENDING_LOCK:
+            if bool(reset_before_capture):
+                _PENDING_CAPTURES.pop(benchmark_key, None)
+            existing = _PENDING_CAPTURES.get(benchmark_key)
+            creating = existing is None
+            evicted = _evict_for_capture_locked(
+                benchmark_key,
+                staged_bytes,
+                creating=creating,
+            )
+            if existing is None:
+                existing = {
+                    "fps": fps_value,
+                    "seed": seed_value,
+                    "provenance": provenance,
+                    "canonical_provenance": canonical_provenance,
+                    "frame_chunk_size": chunk_value,
+                    "topology": topology,
+                    "roles": {},
+                    "bytes": 0,
+                }
+                _PENDING_CAPTURES[benchmark_key] = existing
+            else:
+                if role_key in existing["roles"]:
+                    raise ObjectiveMediaError(
+                        f"benchmark {benchmark_key!r} already contains role {role_key}; "
+                        "set reset_before_capture=true to restart the triad"
+                    )
+                if existing["fps"] != fps_value:
+                    raise ObjectiveMediaError("R/A/B captures for one benchmark must use identical fps")
+                if existing["seed"] != seed_value:
+                    raise ObjectiveMediaError("R/A/B captures for one benchmark must use identical seed")
+                if existing["canonical_provenance"] != canonical_provenance:
+                    raise ObjectiveMediaError(
+                        "R/A/B captures for one benchmark must use identical provenance_json"
+                    )
+                if existing["frame_chunk_size"] != chunk_value:
+                    raise ObjectiveMediaError(
+                        "R/A/B captures for one benchmark must use identical frame_chunk_size"
+                    )
+                if existing["topology"] != topology:
+                    raise ObjectiveMediaError(
+                        "R/A/B captures for one benchmark must have matching decoded video/audio topology"
+                    )
+            existing["roles"][role_key] = staged
+            existing["bytes"] = int(existing["bytes"]) + staged_bytes
+            _PENDING_CAPTURES.move_to_end(benchmark_key)
+            if set(existing["roles"]) == {"R", "A", "B"}:
+                completed = _PENDING_CAPTURES.pop(benchmark_key)
+            else:
+                pending = [key for key in ("R", "A", "B") if key not in existing["roles"]]
+                total_gib = _pending_bytes_locked() / 1024**3
+
+        for victim in evicted:
+            LOG.warning(
+                "Spectrum H3 objective sequential capture evicted incomplete benchmark %s to stay within RAM bounds",
+                victim,
+            )
+
+        if completed is None:
+            summary = (
+                f"Spectrum H3 objective capture: stored {role_key} for benchmark={benchmark_key}; "
+                f"pending={','.join(pending)}; pending_cpu_ram={total_gib:.2f} GiB"
+            )
+            print(summary)
+            return (summary, "", "", "", "")
+
+        roles = completed["roles"]
+        try:
+            return _evaluate_and_persist(
+                roles["R"]["video"],
+                roles["A"]["video"],
+                roles["B"]["video"],
+                fps=completed["fps"],
+                benchmark_id=benchmark_key,
+                seed=completed["seed"],
+                provenance=completed["provenance"],
+                frame_chunk_size=completed["frame_chunk_size"],
+                reference_audio=roles["R"].get("audio"),
+                legacy_audio=roles["A"].get("audio"),
+                candidate_audio=roles["B"].get("audio"),
+            )
+        finally:
+            completed.clear()
+
+
+class SpectrumH3ObjectiveCaptureReset:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "benchmark_id": (
+                    "STRING",
+                    {
+                        "default": "h3-objective-seed-1",
+                        "tooltip": "Benchmark to clear when scope=benchmark.",
+                    },
+                ),
+                "scope": (["benchmark", "all"], {"default": "benchmark"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("summary",)
+    FUNCTION = "clear"
+    CATEGORY = "sampling/spectrum/research"
+    OUTPUT_NODE = True
+    DESCRIPTION = "Optional helper to release incomplete sequential objective-media captures from CPU RAM."
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def clear(self, benchmark_id, scope):
+        released = clear_pending_objective_media(
+            None if str(scope) == "all" else str(benchmark_id)
+        )
+        summary = (
+            "Spectrum H3 objective capture reset: released "
+            + (", ".join(released) if released else "nothing")
+        )
+        print(summary)
+        return (summary,)
+
+
 NODE_CLASS_MAPPINGS = {
     "SpectrumH3ObjectiveMediaStage": SpectrumH3ObjectiveMediaStage,
     "SpectrumH3ObjectiveQualityCompare": SpectrumH3ObjectiveQualityCompare,
     "SpectrumH3ObjectiveStagedQualityCompare": SpectrumH3ObjectiveStagedQualityCompare,
+    "SpectrumH3ObjectiveSequentialCapture": SpectrumH3ObjectiveSequentialCapture,
+    "SpectrumH3ObjectiveCaptureReset": SpectrumH3ObjectiveCaptureReset,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SpectrumH3ObjectiveMediaStage": "Spectrum H3 Objective Media Stage",
-    "SpectrumH3ObjectiveQualityCompare": "Spectrum H3 Objective Quality Compare",
-    "SpectrumH3ObjectiveStagedQualityCompare": "Spectrum H3 Objective Quality Compare (Staged)",
+    "SpectrumH3ObjectiveMediaStage": "Spectrum H3 Objective Media Stage (One-Shot)",
+    "SpectrumH3ObjectiveQualityCompare": "Spectrum H3 Objective Quality Compare (One-Shot)",
+    "SpectrumH3ObjectiveStagedQualityCompare": "Spectrum H3 Objective Quality Compare (Staged One-Shot)",
+    "SpectrumH3ObjectiveSequentialCapture": "Spectrum H3 Objective Media Capture (Sequential - Recommended)",
+    "SpectrumH3ObjectiveCaptureReset": "Spectrum H3 Objective Media Capture Reset",
 }
 
 
 __all__ = [
+    "DEFAULT_PROVENANCE_JSON",
+    "MAX_PENDING_BENCHMARKS",
+    "MAX_PENDING_BYTES",
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
     "SpectrumH3ObjectiveMediaStage",
     "SpectrumH3ObjectiveQualityCompare",
     "SpectrumH3ObjectiveStagedQualityCompare",
+    "SpectrumH3ObjectiveSequentialCapture",
+    "SpectrumH3ObjectiveCaptureReset",
+    "clear_pending_objective_media",
+    "pending_objective_media_state",
 ]
