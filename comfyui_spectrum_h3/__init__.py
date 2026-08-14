@@ -21,7 +21,7 @@ from .trust_probe import install_forecast_trust_probe
 class _SpectrumH3ObjectiveSequentialCaptureLinkedSeed(
     SpectrumH3ObjectiveSequentialCapture
 ):
-    """Expose benchmark seed as a normal linkable INT without seed randomization."""
+    """Expose benchmark seed as the same linked INT that drives generation."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -30,23 +30,21 @@ class _SpectrumH3ObjectiveSequentialCaptureLinkedSeed(
         required["generation_seed"] = (
             "INT",
             {
-                "default": 0,
+                "forceInput": True,
                 "min": 0,
                 "max": 0xFFFFFFFFFFFFFFFF,
-                "step": 1,
                 "tooltip": (
-                    "Actual generation seed. Connect the same fixed INT seed output used by the generation workflow. "
-                    "This input deliberately has no control_after_generate randomizer."
+                    "Connect the exact same fixed INT seed output that drives the generation workflow. "
+                    "The benchmark does not own or randomize a separate seed value."
                 ),
             },
         )
         return {**schema, "required": required}
 
 
-# The recommended sequential benchmark must accept the exact seed already driving
-# the generation graph. Current ComfyUI exposes a socket alongside ordinary INT
-# widgets; omitting control_after_generate keeps the local fallback fixed while
-# still allowing a direct INT link from the user's seed node.
+# The recommended sequential benchmark must consume the exact seed already driving
+# the generation graph. forceInput makes that dependency explicit and removes any
+# independent seed widget/control-after-generate state from the benchmark node.
 NODE_CLASS_MAPPINGS[
     "SpectrumH3ObjectiveSequentialCapture"
 ] = _SpectrumH3ObjectiveSequentialCaptureLinkedSeed
