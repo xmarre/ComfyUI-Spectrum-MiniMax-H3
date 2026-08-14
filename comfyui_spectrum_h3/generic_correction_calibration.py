@@ -22,6 +22,7 @@ LOG_PREFIX = "SPECTRUM_GENERIC_CORRECTION_CALIBRATION_JSON="
 PACKAGE_NAME = "comfyui-spectrum-minimax-h3"
 FALLBACK_PACKAGE_VERSION = "0.2.8"
 MAX_SERIALIZED_BYTES = 512 * 1024
+MAX_RETAINED_ROWS = 4096
 
 
 def canonical_json(value: Any) -> str:
@@ -245,7 +246,14 @@ def record_row(
     elif state.topology != topology:
         state.failures += 1
         return
-    canonical_json(row)
+    if len(state.rows) >= MAX_RETAINED_ROWS:
+        state.failures += 1
+        return
+    try:
+        canonical_json(row)
+    except (TypeError, ValueError):
+        state.failures += 1
+        return
     state.rows.append(row)
 
 
@@ -331,7 +339,7 @@ def emit_block(
         return None
     block = build_block(runtime, state)
     state.emitted = True
-    LOG.warning("%s%s", LOG_PREFIX, canonical_json(block))
+    LOG.debug("%s%s", LOG_PREFIX, canonical_json(block))
     return block
 
 

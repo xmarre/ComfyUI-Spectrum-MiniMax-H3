@@ -20,13 +20,12 @@ sys.modules[_SPEC.name] = evaluator
 _SPEC.loader.exec_module(evaluator)
 
 
-def _row(step: int, stream: str, trace: str, region: str | None = None):
-    a = 1.0 + 0.05 * step
-    b = 0.3 + 0.02 * step
-    c = 0.8
+def _row(step: int, stream: str, region: str | None = None):
+    region_offset = {None: 0.0, "t0": -0.02, "t1": 0.03}[region]
+    a = 1.0 + 0.05 * step + region_offset
+    b = 0.3 + 0.02 * step + region_offset
+    c = 0.8 + abs(region_offset)
     row = {
-        "schema_version": 1,
-        "trace_fingerprint": trace,
         "target_step_id": step,
         "stream": stream,
         "region_id": region,
@@ -49,10 +48,10 @@ def _block(label: str, *, sampler: str = "sample_euler"):
     trace = f"trace-{label}"
     rows = []
     for step in (2, 4, 6):
-        rows.append(_row(step, "audio", trace))
-        rows.append(_row(step, "video", trace))
-        rows.append(_row(step, "video", trace, "t0"))
-        rows.append(_row(step, "video", trace, "t1"))
+        rows.append(_row(step, "audio"))
+        rows.append(_row(step, "video"))
+        rows.append(_row(step, "video", "t0"))
+        rows.append(_row(step, "video", "t1"))
     return {
         "schema_version": 1,
         "kind": "spectrum_h3_generic_correction_calibration",
@@ -97,6 +96,11 @@ def test_single_run_is_explicitly_development_only():
 
 
 def test_multiple_runs_use_whole_run_leave_one_out():
+    preliminary = evaluator.analyze_blocks([_block("a"), _block("b")])
+    assert (
+        preliminary["groups"][0]["report"]["cross_validation"]["status"]
+        == "whole_run_leave_one_out_preliminary"
+    )
     report = evaluator.analyze_blocks([_block("a"), _block("b"), _block("c")])
     cv = report["groups"][0]["report"]["cross_validation"]
     assert cv["status"] == "whole_run_leave_one_out_generalization"
@@ -128,7 +132,7 @@ def test_duplicate_trace_is_rejected(tmp_path):
         evaluator.load_blocks([first, second])
 
 
-def test_post_target_row_order_never_changes_earlier_candidate_score():
+def test_later_targets_never_change_any_candidate_score_at_an_earlier_target():
     block = _block("causal")
     original = evaluator._evaluate_run(block)
     mutated = json.loads(json.dumps(block))
@@ -136,21 +140,25 @@ def test_post_target_row_order_never_changes_earlier_candidate_score():
         if row["target_step_id"] > 2:
             row["B"] *= -1.0
     changed = evaluator._evaluate_run(mutated)
-    candidate = evaluator._candidate_names()[0]
-    first_original = original["candidates"][candidate][0]
-    first_changed = changed["candidates"][candidate][0]
-    assert first_original["ratio"] == first_changed["ratio"]
+    for candidate in evaluator._candidate_names():
+        original_step = next(
+            item for item in original["candidates"][candidate] if item["target_step_id"] == 2
+        )
+        changed_step = next(
+            item for item in changed["candidates"][candidate] if item["target_step_id"] == 2
+        )
+        assert original_step == changed_step
 
 
 def test_reliability_alignment_matches_runtime_threshold_and_clamp():
     state = evaluator._OnlineState(forgetting=0.9)
-    clamped = _row(2, "audio", "trace")
+    clamped = _row(2, "audio")
     clamped.update({"A": 1.0, "B": 2.0, "C": 1.0, "ratio_epsilon": 1.0e-6})
     state.update(clamped, 0.0)
     assert state.alignment == pytest.approx(0.5)
 
     degenerate = evaluator._OnlineState(forgetting=0.9)
-    row = _row(2, "audio", "trace")
+    row = _row(2, "audio")
     row.update({"A": 1.0, "B": 0.5, "C": 1.0, "ratio_epsilon": 2.0})
     degenerate.update(row, 0.0)
     assert degenerate.alignment == 0.0
@@ -176,3 +184,55 @@ def test_cli_normalizes_malformed_numeric_input(tmp_path, capsys):
         evaluator.main([str(path)])
     assert raised.value.code == 2
     assert "malformed numeric data" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
+            lambda block: block["target_rows"].__setitem__(
+                1,
+                {
+                    **block["target_rows"][1],
+                    "region_id": "missing-global",
+                },
+            ),
+            "lacks a global",
+        ),
+        (
+            lambda block: block["target_rows"].__setitem__(
+                -1,
+                {
+                    **block["target_rows"][-1],
+                    "region_id": "changed-region",
+                },
+            ),
+            "topology changed",
+        ),
+        (
+            lambda block: block["target_rows"].__setitem__(
+                2,
+                {
+                    **block["target_rows"][2],
+                    "sample_count": 1,
+                },
+            ),
+            "exactly cover",
+        ),
+    ),
+)
+def test_regional_candidate_rejects_incomplete_geometry(mutation, message):
+    block = _block("bad-regional")
+    if message == "lacks a global":
+        block["target_rows"] = [
+            row
+            for row in block["target_rows"]
+            if not (row["target_step_id"] == 2 and row["stream"] == "video" and row["region_id"] is None)
+        ]
+    else:
+        mutation(block)
+    with pytest.raises(evaluator.CalibrationError, match=message):
+        evaluator._evaluate_regional_candidate(
+            block,
+            evaluator._candidate_names()[0],
+        )

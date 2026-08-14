@@ -322,7 +322,12 @@ The gain is confidence-scaled and bounded before it is applied to the latest-del
 `generic_correction_limit=0.25` preserve this validated path. The selectable
 coordinate/RLS, correction-reliability, and coarse temporal VIDEO controllers are
 experimental live A/B paths. With `debug=true`, full single-pass runs also emit
-scalar-only exact quadratic calibration blocks for the CPU evaluator. See
+scalar-only exact quadratic calibration blocks for the shared CPU evaluator.
+When `offline_smoothing_replay=false`, Spectrum automatically persists each
+completed compatible block, rejects repeated traces/seeds, evaluates its compatible
+whole-run group, prints a concise console recommendation, and refreshes detailed
+Markdown and JSON reports. No log capture or manual evaluator command is required.
+See
 [GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md) for their causal
 contract, topology proof, offline evaluation discipline, and promotion gate.
 

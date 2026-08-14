@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from comfyui_spectrum_h3 import generic_correction_calibration as calibration
 from comfyui_spectrum_h3.forecast import HistoryWeightForecaster
 from comfyui_spectrum_h3.generic_correction_calibration import (
     GenericCalibrationState,
@@ -81,3 +82,32 @@ def test_calibration_block_contains_only_scalar_rows_and_stable_provenance():
     assert rebuilt == block
     assert "trace_fingerprint" not in row
     assert not any(torch.is_tensor(value) for value in block["target_rows"][0].values())
+
+
+def test_row_retention_and_serialization_fail_closed(monkeypatch):
+    state = GenericCalibrationState(
+        enabled=True,
+        run_id=1,
+        sampler_name="sample_euler",
+        total_steps=3,
+        schedule=(1.0, 0.5, 0.0),
+        config_snapshot={},
+    )
+    topology = (("target_video_rows", 2),)
+    monkeypatch.setattr(calibration, "MAX_RETAINED_ROWS", 1)
+    calibration.record_row(state, {"value": 1.0}, topology=topology)
+    calibration.record_row(state, {"value": 2.0}, topology=topology)
+    assert state.rows == [{"value": 1.0}]
+    assert state.failures == 1
+
+    separate = GenericCalibrationState(
+        enabled=True,
+        run_id=2,
+        sampler_name="sample_euler",
+        total_steps=3,
+        schedule=(1.0, 0.5, 0.0),
+        config_snapshot={},
+    )
+    calibration.record_row(separate, {"bad": object()}, topology=topology)
+    assert separate.rows == []
+    assert separate.failures == 1

@@ -6,11 +6,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from comfyui_spectrum_h3 import generic_correction as generic_correction_module
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.experiments import OfflineModelAwareDecision
 from comfyui_spectrum_h3.generic_correction_controller import (
     GenericCorrectionController,
 )
+from comfyui_spectrum_h3.generic_correction_calibration import GenericCalibrationState
 from comfyui_spectrum_h3.model_aware import (
     ModelAwareController,
     ModelForecastabilityProfile,
@@ -355,6 +357,76 @@ def test_debug_summary_keeps_only_explicit_feature3_retirement_state():
     assert "feature3_direction_evidence_bytes=0" in summary
     assert "feature3_error_evidence_bytes=0" in summary
     assert "feature3_extra_transformer_nfe=0" in summary
+
+
+@pytest.mark.parametrize(
+    ("debug", "offline_replay", "expected"),
+    (
+        (False, False, False),
+        (True, True, False),
+        (True, False, True),
+    ),
+)
+def test_automatic_calibration_uses_existing_single_pass_research_trigger(
+    debug,
+    offline_replay,
+    expected,
+):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            debug=debug,
+            model_aware_mode="full",
+            offline_smoothing_replay=offline_replay,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+    )
+    assert runtime._generic_correction_calibration.enabled is expected
+    runtime.end_run(run_id)
+
+
+def test_post_run_research_failure_cannot_invalidate_completed_generation(monkeypatch):
+    events = []
+    state = GenericCalibrationState(
+        enabled=True,
+        run_id=7,
+        sampler_name="sample_euler",
+        total_steps=2,
+        schedule=(1.0, 0.0),
+        config_snapshot={},
+        rows=[{"scalar": 1.0}],
+    )
+    runtime = SimpleNamespace(
+        _run=SimpleNamespace(run_id=7),
+        _generic_correction_calibration=state,
+        _generic_correction_controller=object(),
+        model_aware=SimpleNamespace(_generic_correction_controller=object()),
+    )
+
+    def end_run(instance, run_id):
+        events.append(("end", run_id))
+        instance._run = None
+
+    def persist(_block):
+        events.append(("persist", None))
+        raise OSError("synthetic report failure")
+
+    monkeypatch.setattr(generic_correction_module, "_ORIGINAL_RUNTIME_END", end_run)
+    monkeypatch.setattr(
+        generic_correction_module,
+        "emit_calibration_block",
+        lambda _runtime, _state: {"compatible": True},
+    )
+    monkeypatch.setattr(generic_correction_module, "persist_and_analyze", persist)
+
+    generic_correction_module._end_run(runtime, 7)
+
+    assert events == [("end", 7), ("persist", None)]
+    assert runtime._generic_correction_controller is None
+    assert runtime._generic_correction_calibration is None
 
 
 @pytest.mark.parametrize(

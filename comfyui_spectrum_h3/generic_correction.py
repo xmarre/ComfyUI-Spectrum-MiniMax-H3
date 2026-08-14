@@ -20,6 +20,7 @@ from .generic_correction_calibration import (
 from .generic_correction_calibration import (
     emit_block as emit_calibration_block,
 )
+from .generic_correction_research import persist_and_analyze
 from .generic_correction_controller import GenericCorrectionController
 from .generic_correction_core import (
     GainApplication,
@@ -674,6 +675,7 @@ def _start_run(self: SpectrumH3Runtime, *args, **kwargs):
         enabled=bool(
             self.config.debug
             and self.config.model_aware_mode == "full"
+            and not self.config.offline_smoothing_replay
             and self._offline_phase is None
         ),
     )
@@ -682,17 +684,40 @@ def _start_run(self: SpectrumH3Runtime, *args, **kwargs):
 
 
 def _end_run(self: SpectrumH3Runtime, run_id: int) -> None:
+    active = getattr(self, "_run", None)
+    if active is None or active.run_id != int(run_id):
+        _ORIGINAL_RUNTIME_END(self, run_id)
+        return
     calibration = getattr(self, "_generic_correction_calibration", None)
+    block = None
     if isinstance(calibration, GenericCalibrationState):
         try:
-            emit_calibration_block(self, calibration)
+            block = emit_calibration_block(self, calibration)
         except (TypeError, ValueError) as exc:
             calibration.failures += 1
-            LOG.warning("Spectrum H3 generic correction calibration export failed: %s", exc)
+            LOG.warning(
+                "Spectrum H3 generic-correction calibration export failed: %s",
+                exc,
+            )
     _ORIGINAL_RUNTIME_END(self, run_id)
     self._generic_correction_controller = None
     self._generic_correction_calibration = None
     self.model_aware._generic_correction_controller = None
+    if block is not None and block.get("compatible"):
+        try:
+            result = persist_and_analyze(block)
+            duplicate_note = " (duplicate ignored)" if result.duplicate else ""
+            LOG.warning("\n%s%s", result.console_summary, duplicate_note)
+            LOG.warning(
+                "Spectrum H3 generic-correction post-run analysis completed in %.3f s",
+                result.elapsed_seconds,
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Spectrum H3 generic-correction research persistence/evaluation failed; "
+                "the completed generation remains valid: %s",
+                exc,
+            )
 
 
 def _controller_snapshot(self: ModelAwareController) -> dict[str, Any]:

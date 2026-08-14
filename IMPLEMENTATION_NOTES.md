@@ -100,7 +100,7 @@ subsequent generic-scalar research pass adds coordinate-transported/RLS,
 correction-reliability, and topology-proven regional VIDEO paths behind the
 separate `generic_correction_mode` selector. These paths reuse only the causal
 latest-delta direction, add no transformer evaluation, and do not revive retired
-model-specific Feature-3 geometry. Exact scalar calibration and the CPU evaluator
+model-specific Feature-3 geometry. Exact scalar calibration and the shared CPU evaluator
 are described in [GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md).
 
 `full` applies this gain to the latest-delta correction exactly. The retired exact-head and Gram-diagonal candidates no longer alter the applied value:

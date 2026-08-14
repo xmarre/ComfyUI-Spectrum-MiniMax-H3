@@ -150,7 +150,52 @@ The sign convention is fixed: `residual=actual-predicted` and
 Target-derived moments, oracle gains, and errors are labels. Controller decisions
 for that target are frozen before those labels are read.
 
-## CPU evaluator
+## Automatic research store and shared CPU evaluator
+
+An eligible completed run is one with:
+
+```text
+debug = true
+model_aware_mode = full
+offline_smoothing_replay = false
+```
+
+After the run completes successfully, Spectrum stores the versioned scalar block
+under:
+
+```text
+ComfyUI/user/__cache/spectrum_h3/generic_correction/v1/
+  runs/<trace-fingerprint>.json
+  reports/<compatibility-group>.md
+  reports/<compatibility-group>.json
+  corrupt/...
+```
+
+The exact `user` root follows ComfyUI's configured user directory. Writes use a
+same-directory temporary file, flush it, and atomically replace the destination.
+The store retains at most 12 valid runs per compatibility group and 96 valid runs
+globally, plus 24 compatibility-group report pairs and 16 quarantined corrupt
+files. Cleanup is deterministic by filesystem
+modification time and filename. Close ComfyUI and delete this exact `v1` directory
+to clear the research state safely; Spectrum recreates it on the next eligible run.
+
+Every new compatible independent run immediately refreshes its group report and
+prints the validation level, compact VIDEO/AUDIO rankings, baseline context, and
+strongest live configuration for a later manual perceptual A/B. One run is labeled
+development-only, two runs preliminary whole-run leave-one-out, and three or more
+whole-run leave-one-out generalization. Settings and defaults are never changed
+automatically.
+
+Compatibility includes source schema, package/source provenance, the full sampler
+schedule fingerprint, sampler name, step count, topology fingerprint, and the base
+configuration after deliberately excluding only debug and the candidate mode /
+limiter / limit controls. Exact trace duplicates never count twice. Within one
+group, a repeated known seed is also treated as the same evidence identity; when a
+seed is unavailable, the trace fingerprint is the conservative identity.
+
+The runtime and forensic CLI execute the same implementation in
+`comfyui_spectrum_h3/generic_correction_evaluator.py`. The CLI remains available
+for reproduction:
 
 Run:
 
@@ -177,8 +222,13 @@ Validation discipline is whole-run only:
 3+ runs: whole-run leave-one-run-out generalization
 ```
 
-Incompatible source/config/sampler groups are reported separately, and duplicate
-trace fingerprints are rejected. Target rows are never randomized across folds.
+Incompatible source/config/schedule/sampler/topology groups are reported separately,
+and duplicate trace or seeded-run identities are rejected. Target rows are never
+randomized across folds. Evaluation uses only persisted CPU scalars, retains no GPU
+tensor, makes no transformer call, and cannot change the sampler schedule. Store,
+evaluation, or report failures produce a warning after the completed generation;
+invalid files are skipped and moved into the bounded `corrupt` directory so later
+runs remain analyzable.
 
 ## Replay separation
 
