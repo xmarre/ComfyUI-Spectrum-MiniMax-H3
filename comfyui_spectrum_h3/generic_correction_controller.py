@@ -5,13 +5,16 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .generic_correction_core import (
+    GENERIC_CORRECTION_ATTENUATIONS,
     GENERIC_CORRECTION_LIMITERS,
     GENERIC_CORRECTION_MODES,
     GainApplication,
     GainState,
     ScalarMoments,
     apply_gain,
+    attenuation_flags,
     regularize_region_raw_gains,
+    resolve_attenuation_policy,
 )
 
 
@@ -62,6 +65,7 @@ class GenericCorrectionController:
     mode: str
     limiter: str
     limit: float
+    attenuation: str = "mode_default"
     audio: GainState = field(default_factory=GainState)
     video: GainState = field(default_factory=GainState)
     region_ids: tuple[str, ...] = ()
@@ -79,8 +83,14 @@ class GenericCorrectionController:
             raise ValueError("invalid generic correction mode")
         if self.limiter not in GENERIC_CORRECTION_LIMITERS:
             raise ValueError("invalid generic correction limiter")
+        if self.attenuation not in GENERIC_CORRECTION_ATTENUATIONS:
+            raise ValueError("invalid generic correction attenuation")
         if not math.isfinite(self.limit) or self.limit <= 0.0:
             raise ValueError("generic correction limit must be positive and finite")
+
+    @property
+    def resolved_attenuation(self) -> str:
+        return resolve_attenuation_policy(self.mode, self.attenuation)
 
     def state_for_stream(self, stream: str) -> GainState:
         if stream == "audio":
@@ -108,14 +118,16 @@ class GenericCorrectionController:
         record: bool = False,
     ) -> GainApplication:
         state = self.state_for_stream(stream)
-        use_reliability = self.mode in {
-            "coordinate_rls_reliability",
-            "regional",
-        }
+        policy = self.resolved_attenuation
+        if policy == "legacy_internal":
+            # Calibration keeps the historical shadow RLS path active even while
+            # the executed legacy correction remains owned by ModelAwareController.
+            policy = "general_confidence"
+        use_general_confidence, use_reliability = attenuation_flags(policy)
         application = apply_gain(
             state,
             general_confidence=general_confidence,
-            use_general_confidence=True,
+            use_general_confidence=use_general_confidence,
             use_reliability=use_reliability,
             limiter=self.limiter,
             limit=self.limit,
@@ -136,13 +148,17 @@ class GenericCorrectionController:
     ) -> list[GainApplication]:
         if not self.regions:
             return []
+        policy = self.resolved_attenuation
+        if policy == "legacy_internal":
+            policy = "combined_conservative"
+        use_general_confidence, use_reliability = attenuation_flags(policy)
         raw_values = regularize_region_raw_gains(self.regions, self.video)
         applications = [
             apply_gain(
                 state,
                 general_confidence=general_confidence,
-                use_general_confidence=True,
-                use_reliability=True,
+                use_general_confidence=use_general_confidence,
+                use_reliability=use_reliability,
                 limiter=self.limiter,
                 limit=self.limit,
                 raw_override=raw,
@@ -192,6 +208,8 @@ class GenericCorrectionController:
     def snapshot(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
+            "attenuation": self.attenuation,
+            "resolved_attenuation": self.resolved_attenuation,
             "limiter": self.limiter,
             "limit": self.limit,
             "audio": self.audio.snapshot(),
@@ -213,6 +231,7 @@ class GenericCorrectionController:
             mode=str(value["mode"]),
             limiter=str(value["limiter"]),
             limit=float(value["limit"]),
+            attenuation=str(value.get("attenuation", "mode_default")),
             audio=GainState.from_snapshot(dict(value["audio"])),
             video=GainState.from_snapshot(dict(value["video"])),
             region_ids=tuple(str(item) for item in value.get("region_ids", ())),

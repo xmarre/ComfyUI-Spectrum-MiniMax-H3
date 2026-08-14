@@ -105,6 +105,16 @@ the whole forecast toward an anchor. The bounded score combines causal history o
 Telemetry exposes reliability, accumulated direction energy, effective estimator
 age, raw gain, scaled gain, and applied gain.
 
+## Orthogonal attenuation policy
+
+`generic_correction_attenuation=mode_default` is saved-workflow compatible and
+preserves the former numerical behavior: `coordinate_rls` uses general forecast
+confidence, while `coordinate_rls_reliability` and `regional` use combined
+general-confidence and correction-reliability attenuation. Advanced runs can
+instead select `no_attenuation`, `general_confidence`,
+`correction_reliability`, or `combined_conservative` explicitly. Reports record
+both the requested selector and the resolved policy actually used.
+
 ## Topology-safe temporal VIDEO regions
 
 Native MiniMax H3 patchification is explicitly:
@@ -144,6 +154,22 @@ also carries the exact runtime ratio denominator, causal pre-target gains and
 reliability, anchor IDs/coordinates, sampler/schedule metadata, topology/config
 fingerprints, seed when available, package/source provenance, and candidate gains.
 It serializes no hidden tensor or token payload.
+
+Native H3 audio calibration also records diagnostic-only `audio_start`,
+`audio_middle`, and `audio_end` moments. H3 packs `[B,C,2,T]` channel-major as
+`[left t0..T-1, right t0..T-1]`, so each band combines the corresponding time
+range from both stereo channels rather than slicing one contiguous third of all
+rows. The verified native latent rate is 40 Hz: clips at least three seconds
+use one-second (40-token) start/end windows and a middle remainder; shorter
+supported clips use deterministic non-empty temporal thirds. The aggregate
+AUDIO moments are reconstructed exactly from these bands. No raw tensor is
+persisted and no transformer call is added.
+
+Coordinate transport only rescales the same one-dimensional latest-delta
+direction. It does not create a new correction subspace or increase oracle
+expressiveness; legacy and coordinate oracle headroom are identical when the
+scalar is freely refit per target. Transport exists to make a history-estimated
+coefficient better behaved across nonuniform solver-coordinate spacing.
 
 The sign convention is fixed: `residual=actual-predicted` and
 `direction=latest-previous`, so the quadratic cross term is `-2*g*B`.
@@ -187,9 +213,10 @@ whole-run leave-one-out generalization. Settings and defaults are never changed
 automatically.
 
 Compatibility includes source schema, package/source provenance, the full sampler
-schedule fingerprint, sampler name, step count, topology fingerprint, and the base
-configuration after deliberately excluding only debug and the candidate mode /
-limiter / limit controls. Exact trace duplicates never count twice. Within one
+schedule fingerprint, sampler name, step count, topology fingerprint, and the
+executed base configuration, including correction mode, attenuation, limiter,
+and limit. Only debug is excluded. Missing attenuation in an older saved workflow
+normalizes to the compatibility-safe `mode_default`. Exact trace duplicates never count twice. Within one
 group, a repeated known seed is also treated as the same evidence identity; when a
 seed is unavailable, the trace fingerprint is the conservative identity.
 
@@ -208,6 +235,10 @@ runs. It scores the uncorrected forecast, exact legacy behavior, legacy and
 coordinate-direction oracles, the RLS forgetting-factor family, four attenuation
 policies, three limiter families, three predeclared limits, and global versus
 regional VIDEO.
+Candidates using noncanonical offline RLS lambdas remain clearly labeled
+offline-only. Step-for-step equivalent candidates form an explicit tie group;
+the live recommendation uses canonical `lambda=0.90` when it belongs to that
+group and otherwise emits no unreproducible live configuration.
 
 Reported metrics include mean normalized hidden error, improvement over
 uncorrected and legacy, oracle headroom and captured headroom, target wins/losses,

@@ -15,6 +15,7 @@ from .generic_correction_evaluator import (
     analyze_group,
     compatibility_signature,
     independence_identity,
+    live_configuration_for_candidate,
     validate_blocks,
 )
 
@@ -160,66 +161,45 @@ def _validation_label(run_count: int) -> tuple[str, str]:
     return "loro_generalization", "whole-run leave-one-out generalization"
 
 
-def _actionable_options(group: dict[str, Any]) -> list[dict[str, Any]]:
-    options: list[dict[str, Any]] = []
-    for limiter in ("rational", "hard_clip", "tanh"):
-        for limit in (0.15, 0.25, 0.40):
-            global_specs = (
-                ("coordinate_rls", "general_confidence"),
-                ("coordinate_rls_reliability", "combined_conservative"),
-            )
-            for mode, scaling in global_specs:
-                candidate = f"rls0.90__{scaling}__{limiter}__L{limit:.2f}"
-                metrics = group["candidates"][candidate]["aggregate"]
-                options.append(
-                    {
-                        "candidate": candidate,
-                        "generic_correction_mode": mode,
-                        "generic_correction_limiter": limiter,
-                        "generic_correction_limit": limit,
-                        "scope": "global",
-                        "metrics": metrics,
-                    }
-                )
-            if group["regional_candidate_ranking"]:
-                candidate = (
-                    f"rls0.90__combined_conservative__{limiter}__L{limit:.2f}"
-                )
-                metrics = group["candidates"][candidate]["regional_combined"]
-                options.append(
-                    {
-                        "candidate": candidate,
-                        "generic_correction_mode": "regional",
-                        "generic_correction_limiter": limiter,
-                        "generic_correction_limit": limit,
-                        "scope": "regional_video_global_audio",
-                        "metrics": metrics,
-                    }
-                )
-    return [item for item in options if item["metrics"]["targets"] > 0]
-
-
 def _recommendation(group: dict[str, Any]) -> dict[str, Any]:
     run_count = int(group["run_count"])
-    options = _actionable_options(group)
-    if not options:
+    equivalence_groups = group.get("candidate_equivalence_groups") or []
+    if not equivalence_groups:
         return {
             "available": False,
-            "reason": "no actionable live candidate has scoreable targets",
+            "reason": "no scoreable candidate equivalence group",
         }
-    selected = min(
-        options,
-        key=lambda item: (
-            item["metrics"]["mean_normalized_hidden_error"],
-            item["generic_correction_mode"],
-            item["generic_correction_limiter"],
-            item["generic_correction_limit"],
-        ),
-    )
+    best_group = equivalence_groups[0]
+    mappings = [
+        live_configuration_for_candidate(candidate)
+        for candidate in best_group["members"]
+    ]
+    reproducible = [item for item in mappings if item["live_reproducible"]]
+    if not reproducible:
+        return {
+            "available": False,
+            "reason": (
+                "strongest offline candidate family is not exactly live-reproducible; "
+                "no live A/B configuration is emitted"
+            ),
+            "offline_only_candidates": mappings,
+        }
+    selected = reproducible[0]
+    candidate = selected["candidate"]
+    metrics = group["candidates"][candidate]["aggregate"]
     _, label = _validation_label(run_count)
     return {
         "available": True,
         **selected,
+        "metrics": metrics,
+        "equivalent_candidates": list(best_group["members"]),
+        "numerical_tie": bool(best_group["numerically_equivalent"]),
+        "tie_breaker": best_group.get("tie_breaker"),
+        "rls_lambda_reason": (
+            "numerically equivalent applied gains/errors; canonical runtime lambda retained"
+            if best_group["numerically_equivalent"]
+            else "canonical runtime lambda is the selected live-reproducible candidate"
+        ),
         "evidence_strength": label,
         "ready_for_perceptual_ab": run_count >= 2,
         "interpretation": (
@@ -248,6 +228,9 @@ def _research_report(
         "hidden_space_recommendation": _recommendation(group),
         "production_default": {
             "generic_correction_mode": "legacy",
+            "generic_correction_attenuation": "mode_default",
+            "generic_correction_limiter": "rational",
+            "generic_correction_limit": 0.25,
             "promotion_status": "unchanged; perceptual validation required",
         },
         "analysis": group,
@@ -307,15 +290,35 @@ def render_console_summary(
         if not candidates:
             lines.append("no scoreable targets")
         for candidate, metrics in candidates[:TOP_CONSOLE_CANDIDATES]:
-            lines.append(f"- {candidate}: {_format_metric(metrics)}")
+            live = group["candidates"][candidate]["live_configuration"][
+                "live_reproducible"
+            ]
+            lines.append(
+                f"- {candidate} ({'exact live' if live else 'offline-only'}): "
+                f"{_format_metric(metrics)}"
+            )
+    best = group["candidate_ranking"][0]
+    for band, label in (
+        ("audio_start", "AUDIO start boundary"),
+        ("audio_middle", "AUDIO middle"),
+        ("audio_end", "AUDIO end boundary"),
+    ):
+        metrics = group["candidates"][best][band]
+        lines.extend(("", label))
+        lines.append(
+            _format_metric(metrics) if metrics["targets"] else "unavailable in this calibration schema"
+        )
     recommendation = report["hidden_space_recommendation"]
     lines.extend(("", "Recommended live perceptual A/B candidate:"))
     if recommendation.get("available"):
         lines.extend(
             (
                 f"- generic_correction_mode={recommendation['generic_correction_mode']}",
+                f"- generic_correction_attenuation={recommendation['generic_correction_attenuation']}",
                 f"- generic_correction_limiter={recommendation['generic_correction_limiter']}",
                 f"- generic_correction_limit={recommendation['generic_correction_limit']:.2f}",
+                f"- RLS lambda={recommendation['rls_lambda']:.2f}; {recommendation['rls_lambda_reason']}",
+                f"- numerical equivalence group: {', '.join(recommendation['equivalent_candidates'])}",
                 f"- evidence: {recommendation['evidence_strength']}; {recommendation['interpretation']}",
             )
         )
@@ -360,8 +363,11 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         lines.extend(
             (
                 f"- `generic_correction_mode={recommendation['generic_correction_mode']}`",
+                f"- `generic_correction_attenuation={recommendation['generic_correction_attenuation']}`",
                 f"- `generic_correction_limiter={recommendation['generic_correction_limiter']}`",
                 f"- `generic_correction_limit={recommendation['generic_correction_limit']:.2f}`",
+                f"- RLS lambda: `{recommendation['rls_lambda']:.2f}` — {recommendation['rls_lambda_reason']}",
+                f"- Numerically equivalent candidates: `{', '.join(recommendation['equivalent_candidates'])}`",
                 f"- Evidence: {recommendation['evidence_strength']}",
                 f"- Interpretation: {recommendation['interpretation']}",
             )
@@ -378,7 +384,14 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         )
     )
     for baseline, scopes in group["baselines"].items():
-        for scope in ("aggregate", "video", "audio"):
+        for scope in (
+            "aggregate",
+            "video",
+            "audio",
+            "audio_start",
+            "audio_middle",
+            "audio_end",
+        ):
             metrics = scopes[scope]
             if metrics["targets"]:
                 lines.append(
@@ -389,22 +402,40 @@ def render_markdown_report(report: dict[str, Any]) -> str:
             "",
             "## Complete global candidate ranking",
             "",
-            "| Rank | Candidate | Aggregate error | vs legacy | wins / losses | worst regression | headroom captured | VIDEO error | AUDIO error |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+            "| Rank | Candidate | Live status | Tie | Aggregate error | vs legacy | wins / losses | worst regression | headroom captured | VIDEO error | AUDIO error | AUDIO start | AUDIO middle | AUDIO end |",
+            "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         )
     )
     for rank, candidate in enumerate(group["candidate_ranking"], start=1):
         metrics = group["candidates"][candidate]
         aggregate = metrics["aggregate"]
+        equivalence = next(
+            item
+            for item in group["candidate_equivalence_groups"]
+            if candidate in item["members"]
+        )
+        tie = (
+            f"equivalent ({len(equivalence['members'])})"
+            if equivalence["numerically_equivalent"]
+            else "unique"
+        )
+        live = (
+            "exact live mapping"
+            if metrics["live_configuration"]["live_reproducible"]
+            else "offline-only (noncanonical lambda)"
+        )
         lines.append(
-            f"| {rank} | `{candidate}` | "
+            f"| {rank} | `{candidate}` | {live} | {tie} | "
             f"{aggregate['mean_normalized_hidden_error']:.8f} | "
             f"{aggregate['relative_improvement_over_legacy']:+.4%} | "
             f"{aggregate['wins_vs_legacy']} / {aggregate['losses_vs_legacy']} | "
             f"{aggregate['worst_regression_vs_legacy']:+.8f} | "
             f"{aggregate['oracle_headroom_captured']:+.4%} | "
             f"{metrics['video_global']['mean_normalized_hidden_error']:.8f} | "
-            f"{metrics['audio']['mean_normalized_hidden_error']:.8f} |"
+            f"{metrics['audio']['mean_normalized_hidden_error']:.8f} | "
+            f"{metrics['audio_start']['mean_normalized_hidden_error']:.8f} | "
+            f"{metrics['audio_middle']['mean_normalized_hidden_error']:.8f} | "
+            f"{metrics['audio_end']['mean_normalized_hidden_error']:.8f} |"
         )
     if group["regional_candidate_ranking"]:
         lines.extend(
@@ -439,6 +470,10 @@ def render_markdown_report(report: dict[str, Any]) -> str:
             "```json",
             json.dumps(group["cross_validation"], indent=2, sort_keys=True),
             "```",
+            "",
+            "## Mathematical interpretation",
+            "",
+            group["oracle_interpretation"],
             "",
             "## Compatibility signature",
             "",

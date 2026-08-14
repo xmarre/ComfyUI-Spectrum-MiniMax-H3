@@ -346,4 +346,15 @@ def test_apply_normalizes_reported_warmup_conflict(monkeypatch, caplog):
     assert captured["config"].bootstrap_first_forecast is False
     assert captured["config"].audio_blend_weight == 0.25
     assert captured["config"].offline_archive_storage == "vram"
+    assert captured["config"].generic_correction_attenuation == "mode_default"
     assert "Disabling bootstrap_first_forecast" in caplog.text
+
+
+def test_saved_workflow_default_adds_no_public_rls_lambda_control():
+    optional = SpectrumApplyMiniMaxH3.INPUT_TYPES()["optional"]
+    assert optional["generic_correction_attenuation"][1]["default"] == "mode_default"
+    keys = list(optional)
+    assert keys.index("generic_correction_attenuation") > keys.index(
+        "generic_correction_limit"
+    )
+    assert "generic_correction_rls_lambda" not in optional

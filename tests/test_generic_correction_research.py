@@ -46,6 +46,7 @@ def _block(
     package: str = "0.2.8",
     degree: int = 1,
     mode: str = "legacy",
+    attenuation: str = "mode_default",
 ) -> dict[str, object]:
     trace = f"trace-{label}"
     rows: list[dict[str, object]] = []
@@ -75,6 +76,7 @@ def _block(
         "config": {
             "degree": degree,
             "generic_correction_mode": mode,
+            "generic_correction_attenuation": attenuation,
             "generic_correction_limiter": "rational",
             "generic_correction_limit": 0.25,
             "debug": True,
@@ -120,6 +122,7 @@ def test_automatic_progression_reports_and_console(tmp_path, count, validation):
     assert "VIDEO" in result.console_summary
     assert "AUDIO" in result.console_summary
     assert "generic_correction_mode=" in result.console_summary
+    assert "generic_correction_attenuation=" in result.console_summary
     assert "production/default promotion: unchanged (legacy)" in result.console_summary
     machine = json.loads(result.json_report_path.read_text(encoding="utf-8"))
     assert len(machine["analysis"]["candidate_ranking"]) == 144
@@ -161,15 +164,33 @@ def test_incompatible_evidence_isolated_into_another_group(tmp_path, field, valu
     assert len(list((tmp_path / "reports").glob("*.json"))) == 2
 
 
-def test_candidate_mode_is_intentionally_excluded_from_grouping(tmp_path):
+def test_execution_changing_correction_mode_isolated_into_another_group(tmp_path):
     first = research.persist_and_analyze(
         _block("a", seed=1, mode="legacy"), root=tmp_path
     )
     second = research.persist_and_analyze(
         _block("b", seed=2, mode="coordinate_rls"), root=tmp_path
     )
-    assert first.group_id == second.group_id
-    assert second.run_count == 2
+    assert first.group_id != second.group_id
+    assert second.run_count == 1
+
+
+def test_execution_changing_attenuation_isolated_into_another_group(tmp_path):
+    first = research.persist_and_analyze(
+        _block("a", seed=1, mode="coordinate_rls", attenuation="mode_default"),
+        root=tmp_path,
+    )
+    second = research.persist_and_analyze(
+        _block(
+            "b",
+            seed=2,
+            mode="coordinate_rls",
+            attenuation="no_attenuation",
+        ),
+        root=tmp_path,
+    )
+    assert first.group_id != second.group_id
+    assert second.run_count == 1
 
 
 def test_corruption_is_quarantined_and_does_not_poison_analysis(tmp_path):
@@ -248,3 +269,38 @@ def test_cli_and_runtime_import_the_same_evaluator_implementation():
 def test_evaluator_rejects_repeated_seed_inside_one_group():
     with pytest.raises(evaluator.CalibrationError, match="seed/run identity"):
         evaluator.analyze_blocks([_block("a", seed=5), _block("b", seed=5)])
+
+
+def test_recommendation_serializes_exact_attenuation_and_canonical_tie():
+    tied = [
+        "rls0.75__no_attenuation__hard_clip__L0.40",
+        "rls0.90__no_attenuation__hard_clip__L0.40",
+        "rls0.97__no_attenuation__hard_clip__L0.40",
+        "rls1.00__no_attenuation__hard_clip__L0.40",
+    ]
+    metrics = {
+        "targets": 6,
+        "mean_normalized_hidden_error": 0.5,
+    }
+    recommendation = research._recommendation(
+        {
+            "run_count": 3,
+            "candidate_equivalence_groups": [
+                {
+                    "representative": tied[1],
+                    "members": [tied[1], tied[0], tied[2], tied[3]],
+                    "numerically_equivalent": True,
+                    "tie_breaker": "canonical runtime RLS lambda 0.90, then candidate name",
+                }
+            ],
+            "candidates": {name: {"aggregate": metrics} for name in tied},
+        }
+    )
+    assert recommendation["available"]
+    assert recommendation["candidate"] == tied[1]
+    assert recommendation["generic_correction_mode"] == "coordinate_rls"
+    assert recommendation["generic_correction_attenuation"] == "no_attenuation"
+    assert recommendation["generic_correction_limiter"] == "hard_clip"
+    assert recommendation["generic_correction_limit"] == 0.4
+    assert recommendation["rls_lambda"] == 0.9
+    assert recommendation["numerical_tie"]

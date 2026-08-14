@@ -103,6 +103,13 @@ latest-delta direction, add no transformer evaluation, and do not revive retired
 model-specific Feature-3 geometry. Exact scalar calibration and the shared CPU evaluator
 are described in [GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md).
 
+The orthogonal `generic_correction_attenuation` selector defaults to
+`mode_default`, preserving all previous mode numerics and saved workflows. It
+also allows exact live reproduction of the evaluator's four attenuation
+families without multiplying mode names. The canonical RLS forgetting factor
+remains `0.90`; equivalent clipped candidates are reported as ties rather than
+promoting the first sorted lambda.
+
 `full` applies this gain to the latest-delta correction exactly. The retired exact-head and Gram-diagonal candidates no longer alter the applied value:
 
 ```text
@@ -144,6 +151,12 @@ feature3_extra_transformer_nfe=0
 ## Generic evidence storage
 
 Feature 2 and the legacy generic scalar correction continue to use the existing deterministic sampled hidden evidence. The advanced RLS/reliability candidates reduce exact full-stream `A/B/C` moments through bounded chunks and retain only scalars. Calibration export is enabled only for debug full single-pass runs and serializes no hidden payload.
+
+Diagnostic native-audio calibration uses the proven channel-major stereo layout
+and combines matching left/right time slices into one-second start/end bands at
+the native 40 Hz latent rate (or deterministic thirds for short clips), plus a
+middle band. Aggregate AUDIO moments are reconstructed from the three bands.
+This changes neither live audio geometry nor transformer NFE.
 
 Exact-head projected-row history is no longer populated by normal runtime. Full head materialization, exact-head evidence storage, exact-head projection calls, exact-head temporary workspace, and exact-head projection timing are therefore zero in normal `full`.
 

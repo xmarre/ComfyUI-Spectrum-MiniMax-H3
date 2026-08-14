@@ -31,6 +31,7 @@ class SpectrumH3Config:
     generic_correction_mode: str = "legacy"
     generic_correction_limiter: str = "rational"
     generic_correction_limit: float = 0.25
+    generic_correction_attenuation: str = "mode_default"
 
     def __post_init__(self) -> None:
         trajectory_modes = {
@@ -162,6 +163,18 @@ class SpectrumH3Config:
             raise ValueError(
                 "generic_correction_mode must be 'legacy', 'coordinate_rls', "
                 "'coordinate_rls_reliability', or 'regional'"
+            )
+        if self.generic_correction_attenuation not in {
+            "mode_default",
+            "no_attenuation",
+            "general_confidence",
+            "correction_reliability",
+            "combined_conservative",
+        }:
+            raise ValueError(
+                "generic_correction_attenuation must be 'mode_default', "
+                "'no_attenuation', 'general_confidence', 'correction_reliability', "
+                "or 'combined_conservative'"
             )
         if self.generic_correction_limiter not in {
             "rational",

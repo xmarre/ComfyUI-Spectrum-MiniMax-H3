@@ -14,8 +14,12 @@ from comfyui_spectrum_h3.generic_correction_core import (
     apply_gain,
     coordinate_transport_scale,
     limit_gain,
+    resolve_attenuation_policy,
 )
-from comfyui_spectrum_h3.generic_correction_topology import temporal_video_regions
+from comfyui_spectrum_h3.generic_correction_topology import (
+    temporal_audio_bands,
+    temporal_video_regions,
+)
 
 
 @pytest.mark.parametrize(
@@ -129,6 +133,45 @@ def test_controller_snapshot_restores_recursive_and_reliability_state():
     assert after == before
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    (
+        ("coordinate_rls", "general_confidence"),
+        ("coordinate_rls_reliability", "combined_conservative"),
+        ("regional", "combined_conservative"),
+    ),
+)
+def test_mode_default_preserves_existing_advanced_attenuation(mode, expected):
+    assert resolve_attenuation_policy(mode, "mode_default") == expected
+    default = GenericCorrectionController(mode, "hard_clip", 0.4)
+    explicit = GenericCorrectionController(
+        mode,
+        "hard_clip",
+        0.4,
+        attenuation=expected,
+    )
+    for controller in (default, explicit):
+        controller.observe_stream("audio", _moments(), 0.2)
+    assert default.application("audio", general_confidence=0.8) == explicit.application(
+        "audio", general_confidence=0.8
+    )
+
+
+def test_explicit_no_attenuation_applies_raw_gain_before_limiter():
+    controller = GenericCorrectionController(
+        "coordinate_rls",
+        "hard_clip",
+        0.4,
+        attenuation="no_attenuation",
+    )
+    controller.audio.rls.update(0.3, 0.5)
+    application = controller.application("audio", general_confidence=0.1)
+    assert application.raw_gain == pytest.approx(0.6)
+    assert application.scaled_gain == pytest.approx(0.6)
+    assert application.bounded_gain == pytest.approx(0.4)
+    assert controller.resolved_attenuation == "no_attenuation"
+
+
 def test_temporal_regions_follow_native_t_h_w_flattening():
     topology = (
         ("video_shape", (1, 24, 8, 6, 10)),
@@ -148,6 +191,29 @@ def test_temporal_regions_follow_native_t_h_w_flattening():
         (50, 80),
         (80, 110),
         (110, 140),
+    ]
+
+
+def test_audio_temporal_bands_follow_native_channel_major_stereo_mapping():
+    topology = (
+        ("audio_shape", (1, 32, 2, 160)),
+        ("target_audio_rows", 320),
+    )
+    bands = temporal_audio_bands(
+        topology,
+        audio_start_row=10,
+        audio_end_row=330,
+    )
+    assert bands is not None
+    assert [band.band_id for band in bands] == [
+        "audio_start",
+        "audio_middle",
+        "audio_end",
+    ]
+    assert [band.row_ranges for band in bands] == [
+        ((10, 50), (170, 210)),
+        ((50, 130), (210, 290)),
+        ((130, 170), (290, 330)),
     ]
 
 

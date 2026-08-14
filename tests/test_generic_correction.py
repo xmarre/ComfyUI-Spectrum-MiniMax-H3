@@ -359,6 +359,19 @@ def test_debug_summary_keeps_only_explicit_feature3_retirement_state():
     assert "feature3_extra_transformer_nfe=0" in summary
 
 
+def test_debug_summary_reports_actual_explicit_attenuation_policy():
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            model_aware_mode="full",
+            generic_correction_mode="coordinate_rls",
+            generic_correction_attenuation="no_attenuation",
+        )
+    )
+    summary = runtime.debug_summary()
+    assert "generic_correction_attenuation='no_attenuation'" in summary
+    assert "generic_correction_attenuation_used='no_attenuation'" in summary
+
+
 @pytest.mark.parametrize(
     ("debug", "offline_replay", "expected"),
     (
@@ -430,15 +443,19 @@ def test_post_run_research_failure_cannot_invalidate_completed_generation(monkey
 
 
 @pytest.mark.parametrize(
-    "mode",
+    ("mode", "attenuation"),
     [
-        "legacy",
-        "coordinate_rls",
-        "coordinate_rls_reliability",
-        "regional",
+        ("legacy", "mode_default"),
+        ("coordinate_rls", "mode_default"),
+        ("coordinate_rls", "no_attenuation"),
+        ("coordinate_rls_reliability", "mode_default"),
+        ("regional", "mode_default"),
     ],
 )
-def test_native_er_sde_correction_modes_preserve_nfe_and_schedule_counts(mode):
+def test_native_er_sde_correction_modes_preserve_nfe_and_schedule_counts(
+    mode,
+    attenuation,
+):
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(
             degree=1,
@@ -451,6 +468,7 @@ def test_native_er_sde_correction_modes_preserve_nfe_and_schedule_counts(mode):
             model_aware_mode="full",
             model_aware_risk_threshold=1.0,
             generic_correction_mode=mode,
+            generic_correction_attenuation=attenuation,
         )
     )
     runtime.set_model_profile(ProfileLookup(_profile(), False, 0.0))

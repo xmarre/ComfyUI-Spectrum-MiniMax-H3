@@ -257,6 +257,25 @@ class SpectrumApplyMiniMaxH3:
                         ),
                     },
                 ),
+                # Appended after every pre-existing widget so saved workflow
+                # widget arrays keep their historical positional meaning.
+                "generic_correction_attenuation": (
+                    [
+                        "mode_default",
+                        "no_attenuation",
+                        "general_confidence",
+                        "correction_reliability",
+                        "combined_conservative",
+                    ],
+                    {
+                        "default": "mode_default",
+                        "tooltip": (
+                            "Advanced experimental attenuation policy. mode_default exactly preserves each "
+                            "existing mode. Explicit policies reproduce evaluator candidates without changing "
+                            "legacy production defaults or adding a transformer evaluation."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -292,6 +311,7 @@ class SpectrumApplyMiniMaxH3:
         generic_correction_mode="legacy",
         generic_correction_limiter="rational",
         generic_correction_limit=0.25,
+        generic_correction_attenuation="mode_default",
     ):
         if not enabled:
             return (model,)
@@ -341,6 +361,7 @@ class SpectrumApplyMiniMaxH3:
                 model_aware_replay_generic_correction
             ),
             generic_correction_mode=str(generic_correction_mode),
+            generic_correction_attenuation=str(generic_correction_attenuation),
             generic_correction_limiter=str(generic_correction_limiter),
             generic_correction_limit=float(generic_correction_limit),
             debug=bool(debug),

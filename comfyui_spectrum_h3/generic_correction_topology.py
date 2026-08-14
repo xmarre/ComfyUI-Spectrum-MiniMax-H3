@@ -14,6 +14,83 @@ class TemporalRegion:
     end_temporal_token: int
 
 
+@dataclass(frozen=True, slots=True)
+class AudioTemporalBand:
+    band_id: str
+    row_ranges: tuple[tuple[int, int], ...]
+    start_temporal_token: int
+    end_temporal_token: int
+
+
+NATIVE_H3_AUDIO_LATENT_HZ = 40
+
+
+def temporal_audio_bands(
+    topology: tuple[Any, ...],
+    *,
+    audio_start_row: int,
+    audio_end_row: int,
+) -> tuple[AudioTemporalBand, ...] | None:
+    """Map native channel-major stereo audio rows into temporal boundary bands.
+
+    Native H3 packs ``[B,C,2,T]`` as ``[left t0..T-1, right t0..T-1]``.
+    For clips at least three seconds long, the start/end windows are the first
+    and last 40 latent tokens (one second at the verified native 40 Hz rate).
+    Shorter clips deterministically fall back to non-empty temporal thirds.
+    """
+    values = topology_map(topology)
+    audio_shape = values.get("audio_shape")
+    target_audio_rows = values.get("target_audio_rows")
+    if (
+        not isinstance(audio_shape, (tuple, list))
+        or len(audio_shape) != 4
+        or not isinstance(target_audio_rows, int)
+    ):
+        return None
+    try:
+        batch, _latent_channels, stereo_channels, temporal_tokens = (
+            int(item) for item in audio_shape
+        )
+        start = int(audio_start_row)
+        end = int(audio_end_row)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        batch != 1
+        or stereo_channels != 2
+        or temporal_tokens < 3
+        or target_audio_rows != stereo_channels * temporal_tokens
+        or end - start != target_audio_rows
+    ):
+        return None
+    boundary_tokens = min(NATIVE_H3_AUDIO_LATENT_HZ, temporal_tokens // 3)
+    if boundary_tokens <= 0 or 2 * boundary_tokens >= temporal_tokens:
+        return None
+    spans = (
+        ("audio_start", 0, boundary_tokens),
+        ("audio_middle", boundary_tokens, temporal_tokens - boundary_tokens),
+        ("audio_end", temporal_tokens - boundary_tokens, temporal_tokens),
+    )
+    bands = []
+    for band_id, start_t, end_t in spans:
+        ranges = tuple(
+            (
+                start + channel * temporal_tokens + start_t,
+                start + channel * temporal_tokens + end_t,
+            )
+            for channel in range(stereo_channels)
+        )
+        bands.append(
+            AudioTemporalBand(
+                band_id=band_id,
+                row_ranges=ranges,
+                start_temporal_token=start_t,
+                end_temporal_token=end_t,
+            )
+        )
+    return tuple(bands)
+
+
 def topology_map(topology: tuple[Any, ...]) -> dict[str, Any]:
     return {
         str(entry[0]): entry[1]
@@ -102,4 +179,11 @@ def temporal_video_regions(
     return tuple(regions)
 
 
-__all__ = ["TemporalRegion", "temporal_video_regions", "topology_map"]
+__all__ = [
+    "NATIVE_H3_AUDIO_LATENT_HZ",
+    "AudioTemporalBand",
+    "TemporalRegion",
+    "temporal_audio_bands",
+    "temporal_video_regions",
+    "topology_map",
+]

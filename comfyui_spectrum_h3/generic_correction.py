@@ -26,6 +26,7 @@ from .generic_correction_core import (
     GainApplication,
     coordinate_transport_scale,
     limit_gain,
+    resolve_attenuation_policy,
 )
 from .generic_correction_runtime import (
     _advanced_weight_segments,
@@ -663,6 +664,7 @@ def _start_run(self: SpectrumH3Runtime, *args, **kwargs):
         mode=self.config.generic_correction_mode,
         limiter=self.config.generic_correction_limiter,
         limit=self.config.generic_correction_limit,
+        attenuation=self.config.generic_correction_attenuation,
     )
     self._generic_correction_controller = controller
     self.model_aware._generic_correction_controller = controller
@@ -785,6 +787,8 @@ def _debug_summary(self: SpectrumH3Runtime) -> str:
     if not isinstance(controller, GenericCorrectionController):
         return (
             f"{base} generic_correction_mode={self.config.generic_correction_mode!r} "
+            f"generic_correction_attenuation={self.config.generic_correction_attenuation!r} "
+            f"generic_correction_attenuation_used={resolve_attenuation_policy(self.config.generic_correction_mode, self.config.generic_correction_attenuation)!r} "
             f"generic_correction_limiter={self.config.generic_correction_limiter!r} "
             f"generic_correction_limit={self.config.generic_correction_limit:.6f} "
             "generic_correction_estimator=legacy_ewma generic_correction_regions=0 "
@@ -815,6 +819,8 @@ def _debug_summary(self: SpectrumH3Runtime) -> str:
     return (
         f"{base} "
         f"generic_correction_mode={controller.mode!r} "
+        f"generic_correction_attenuation={controller.attenuation!r} "
+        f"generic_correction_attenuation_used={controller.resolved_attenuation!r} "
         f"generic_correction_geometry={geometry} "
         f"generic_correction_estimator={estimator} "
         f"generic_correction_coordinate_active={controller.coordinate_active_count} "

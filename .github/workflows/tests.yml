@@ -54,15 +54,22 @@ jobs:
       - name: Run Ruff and compileall
         run: |
           python -m ruff check \
+            comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/generic_correction.py \
             comfyui_spectrum_h3/generic_correction_calibration.py \
+            comfyui_spectrum_h3/generic_correction_controller.py \
+            comfyui_spectrum_h3/generic_correction_core.py \
             comfyui_spectrum_h3/generic_correction_evaluator.py \
             comfyui_spectrum_h3/generic_correction_research.py \
+            comfyui_spectrum_h3/generic_correction_runtime.py \
+            comfyui_spectrum_h3/generic_correction_topology.py \
             comfyui_spectrum_h3/nodes.py \
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
+            tests/test_config.py \
             tests/test_generic_correction.py \
             tests/test_generic_correction_calibration.py \
+            tests/test_generic_correction_core.py \
             tests/test_generic_correction_evaluator.py \
             tests/test_generic_correction_research.py \
             tests/test_model_aware.py \

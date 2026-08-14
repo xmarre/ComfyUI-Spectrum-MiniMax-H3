@@ -12,6 +12,7 @@ from typing import Any
 LOG_PREFIX = "SPECTRUM_GENERIC_CORRECTION_CALIBRATION_JSON="
 SCHEMA_VERSION = 1
 RLS_FORGETTING = (0.75, 0.90, 0.97, 1.0)
+CANONICAL_RUNTIME_RLS_FORGETTING = 0.90
 LIMITERS = ("rational", "hard_clip", "tanh")
 LIMITS = (0.15, 0.25, 0.40)
 SCALINGS = (
@@ -21,6 +22,9 @@ SCALINGS = (
     "combined_conservative",
 )
 EPSILON = 1.0e-12
+TIE_REL_TOLERANCE = 1.0e-12
+TIE_ABS_TOLERANCE = 1.0e-12
+AUDIO_TEMPORAL_BANDS = ("audio_start", "audio_middle", "audio_end")
 
 
 class CalibrationError(ValueError):
@@ -183,13 +187,14 @@ def _validate_block(block: dict[str, Any]) -> None:
 def compatibility_signature(block: dict[str, Any]) -> str:
     """Return the exact experiment-family signature used for grouping."""
     config = dict(block.get("config") or {})
-    for name in (
-        "debug",
-        "generic_correction_mode",
-        "generic_correction_limiter",
-        "generic_correction_limit",
-    ):
-        config.pop(name, None)
+    config.pop("debug", None)
+    # Missing means the compatibility-safe saved-workflow default. Correction
+    # mode, attenuation, limiter, and limit remain in the signature because
+    # each can change the trajectory that produced later exact anchors.
+    config.setdefault("generic_correction_mode", "legacy")
+    config.setdefault("generic_correction_attenuation", "mode_default")
+    config.setdefault("generic_correction_limiter", "rational")
+    config.setdefault("generic_correction_limit", 0.25)
     provenance = block["provenance"]
     metadata = block.get("metadata") or {}
     return _canonical_json(
@@ -340,6 +345,44 @@ def _candidate_spec(name: str) -> tuple[float, str, str, float]:
     return float(rls[3:]), scaling, limiter, float(limit[1:])
 
 
+def live_configuration_for_candidate(
+    name: str,
+    *,
+    scope: str = "global",
+) -> dict[str, Any]:
+    """Return an exact live mapping, or mark a research-only RLS candidate."""
+    forgetting, scaling, limiter, limit = _candidate_spec(name)
+    reproducible = math.isclose(
+        forgetting,
+        CANONICAL_RUNTIME_RLS_FORGETTING,
+        rel_tol=0.0,
+        abs_tol=TIE_ABS_TOLERANCE,
+    )
+    return {
+        "candidate": name,
+        "live_reproducible": reproducible,
+        "offline_only_reason": (
+            None
+            if reproducible
+            else "runtime intentionally exposes only canonical RLS lambda 0.90"
+        ),
+        "generic_correction_mode": "regional" if scope == "regional" else "coordinate_rls",
+        "generic_correction_attenuation": scaling,
+        "generic_correction_limiter": limiter,
+        "generic_correction_limit": limit,
+        "rls_lambda": CANONICAL_RUNTIME_RLS_FORGETTING,
+        "scope": scope,
+    }
+
+
+def _scientific_tie_key(name: str) -> tuple[float, str]:
+    forgetting, _scaling, _limiter, _limit = _candidate_spec(name)
+    return (
+        abs(forgetting - CANONICAL_RUNTIME_RLS_FORGETTING),
+        name,
+    )
+
+
 def _scaled_gain(
     state: _OnlineState,
     row: dict[str, Any],
@@ -481,6 +524,19 @@ def _evaluate_run(block: dict[str, Any]) -> dict[str, Any]:
         name: []
         for name in ("uncorrected", "legacy", "oracle_legacy", "oracle_coordinate")
     }
+    audio_temporal_scored = {
+        name: {band: [] for band in AUDIO_TEMPORAL_BANDS}
+        for name in candidates
+    }
+    audio_temporal_baselines = {
+        name: {band: [] for band in AUDIO_TEMPORAL_BANDS}
+        for name in baselines
+    }
+    audio_band_rows = {
+        (int(row["target_step_id"]), str(row.get("region_id"))): row
+        for row in block["target_rows"]
+        if row["stream"] == "audio" and row.get("region_id") in AUDIO_TEMPORAL_BANDS
+    }
 
     for row in _ordered_rows(block):
         is_global = row.get("region_id") is None
@@ -509,6 +565,42 @@ def _evaluate_run(block: dict[str, Any]) -> dict[str, Any]:
             baselines["oracle_coordinate"].append(
                 {**base_entry, "ratio": base_entry["oracle"]}
             )
+            if row["stream"] == "audio":
+                for band in AUDIO_TEMPORAL_BANDS:
+                    band_row = audio_band_rows.get((int(row["target_step_id"]), band))
+                    if band_row is None:
+                        continue
+                    band_entry = {
+                        "stream": "audio",
+                        "audio_temporal_band": band,
+                        "target_step_id": int(row["target_step_id"]),
+                        "uncorrected": _ratio(band_row, 0.0),
+                        "legacy": _ratio(
+                            band_row,
+                            float(band_row["bounded_legacy_gain"]),
+                            legacy=True,
+                        ),
+                        "oracle": _ratio(band_row, _oracle(band_row)),
+                    }
+                    audio_temporal_baselines["uncorrected"][band].append(
+                        {**band_entry, "ratio": band_entry["uncorrected"]}
+                    )
+                    audio_temporal_baselines["legacy"][band].append(
+                        {**band_entry, "ratio": band_entry["legacy"]}
+                    )
+                    audio_temporal_baselines["oracle_legacy"][band].append(
+                        {
+                            **band_entry,
+                            "ratio": _ratio(
+                                band_row,
+                                _oracle(band_row, legacy=True),
+                                legacy=True,
+                            ),
+                        }
+                    )
+                    audio_temporal_baselines["oracle_coordinate"][band].append(
+                        {**band_entry, "ratio": band_entry["oracle"]}
+                    )
 
         if not is_global:
             continue
@@ -518,7 +610,28 @@ def _evaluate_run(block: dict[str, Any]) -> dict[str, Any]:
             state = states.setdefault(key, _OnlineState(forgetting=forgetting))
             gain = _scaled_gain(state, row, scaling, limiter, limit)
             ratio = _ratio(row, gain)
-            scored[candidate].append({**base_entry, "ratio": ratio})
+            scored[candidate].append({**base_entry, "ratio": ratio, "gain": gain})
+            if row["stream"] == "audio":
+                for band in AUDIO_TEMPORAL_BANDS:
+                    band_row = audio_band_rows.get((int(row["target_step_id"]), band))
+                    if band_row is None:
+                        continue
+                    audio_temporal_scored[candidate][band].append(
+                        {
+                            "stream": "audio",
+                            "audio_temporal_band": band,
+                            "target_step_id": int(row["target_step_id"]),
+                            "ratio": _ratio(band_row, gain),
+                            "uncorrected": _ratio(band_row, 0.0),
+                            "legacy": _ratio(
+                                band_row,
+                                float(band_row["bounded_legacy_gain"]),
+                                legacy=True,
+                            ),
+                            "oracle": _ratio(band_row, _oracle(band_row)),
+                            "gain": gain,
+                        }
+                    )
             state.update(row, gain)
 
     global_video_rows = {
@@ -543,7 +656,9 @@ def _evaluate_run(block: dict[str, Any]) -> dict[str, Any]:
     return {
         "trace_fingerprint": block["provenance"]["trace_fingerprint"],
         "baselines": baselines,
+        "audio_temporal_baselines": audio_temporal_baselines,
         "candidates": scored,
+        "audio_temporal_candidates": audio_temporal_scored,
         "regional_video_candidates": regional_scores,
     }
 
@@ -619,6 +734,99 @@ def _candidate_run_score(
     return statistics.fmean(float(item["ratio"]) for item in entries)
 
 
+def _scores_close(left: float, right: float) -> bool:
+    return math.isclose(
+        float(left),
+        float(right),
+        rel_tol=TIE_REL_TOLERANCE,
+        abs_tol=TIE_ABS_TOLERANCE,
+    )
+
+
+def _rank_candidates(candidates: list[str], score) -> list[str]:
+    ordered = sorted(candidates, key=lambda name: (score(name), name))
+    ranked: list[str] = []
+    cursor = 0
+    while cursor < len(ordered):
+        reference = score(ordered[cursor])
+        end = cursor + 1
+        while end < len(ordered) and _scores_close(score(ordered[end]), reference):
+            end += 1
+        ranked.extend(sorted(ordered[cursor:end], key=_scientific_tie_key))
+        cursor = end
+    return ranked
+
+
+def _select_candidate(
+    runs: list[dict[str, Any]],
+    candidates: list[str],
+    *,
+    regional: bool,
+) -> str:
+    def score(name: str) -> float:
+        return statistics.fmean(
+            _candidate_run_score(run, name, regional=regional) for run in runs
+        )
+
+    return _rank_candidates(candidates, score)[0]
+
+
+def _candidate_equivalence_groups(
+    runs: list[dict[str, Any]],
+    ranking: list[str],
+) -> list[dict[str, Any]]:
+    """Group candidates with step-for-step equivalent applied gains and errors."""
+    signatures: dict[str, list[tuple[str, int, float, float]]] = {}
+    for candidate in ranking:
+        signatures[candidate] = [
+            (
+                str(entry["stream"]),
+                int(entry["target_step_id"]),
+                float(entry["gain"]),
+                float(entry["ratio"]),
+            )
+            for run in runs
+            for entry in run["candidates"][candidate]
+        ]
+
+    def equivalent(left: str, right: str) -> bool:
+        left_values = signatures[left]
+        right_values = signatures[right]
+        return len(left_values) == len(right_values) and all(
+            left_entry[:2] == right_entry[:2]
+            and _scores_close(left_entry[2], right_entry[2])
+            and _scores_close(left_entry[3], right_entry[3])
+            for left_entry, right_entry in zip(left_values, right_values, strict=True)
+        )
+
+    remaining = list(ranking)
+    groups: list[dict[str, Any]] = []
+    while remaining:
+        representative = remaining.pop(0)
+        members = [representative]
+        unmatched = []
+        for candidate in remaining:
+            if equivalent(representative, candidate):
+                members.append(candidate)
+            else:
+                unmatched.append(candidate)
+        remaining = unmatched
+        ordered_members = sorted(members, key=_scientific_tie_key)
+        groups.append(
+            {
+                "representative": ordered_members[0],
+                "members": ordered_members,
+                "numerically_equivalent": len(ordered_members) > 1,
+                "tie_breaker": (
+                    "canonical runtime RLS lambda 0.90, then candidate name"
+                    if len(ordered_members) > 1
+                    else None
+                ),
+            }
+        )
+    return groups
+
+
 def _cross_validation(
     runs: list[dict[str, Any]],
     *,
@@ -626,14 +834,7 @@ def _cross_validation(
 ) -> dict[str, Any]:
     candidates = _candidate_names()
     if len(runs) == 1:
-        best = min(
-            candidates,
-            key=lambda name: _candidate_run_score(
-                runs[0],
-                name,
-                regional=regional,
-            ),
-        )
+        best = _select_candidate(runs, candidates, regional=regional)
         return {
             "status": "development_only_non_confirmatory",
             "selected_candidate": best,
@@ -644,12 +845,7 @@ def _cross_validation(
     folds = []
     for held_out in runs:
         training = [run for run in runs if run is not held_out]
-        selected = min(
-            candidates,
-            key=lambda name: statistics.fmean(
-                _candidate_run_score(run, name, regional=regional) for run in training
-            ),
-        )
+        selected = _select_candidate(training, candidates, regional=regional)
         folds.append(
             {
                 "held_out_run": held_out["trace_fingerprint"],
@@ -693,6 +889,14 @@ def analyze_group(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             "audio": _metrics([item for item in entries if item["stream"] == "audio"]),
             "video": _metrics([item for item in entries if item["stream"] == "video"]),
         }
+        for band in AUDIO_TEMPORAL_BANDS:
+            aggregate_baselines[baseline][band] = _metrics(
+                [
+                    item
+                    for run in runs
+                    for item in run["audio_temporal_baselines"][baseline][band]
+                ]
+            )
 
     candidate_reports: dict[str, Any] = {}
     candidate_names = _candidate_names()
@@ -705,6 +909,7 @@ def analyze_group(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             item for item in entries if item["stream"] == "audio"
         ] + regional
         candidate_reports[candidate] = {
+            "live_configuration": live_configuration_for_candidate(candidate),
             "aggregate": _metrics(entries),
             "audio": _metrics([item for item in entries if item["stream"] == "audio"]),
             "video_global": _metrics(
@@ -713,9 +918,17 @@ def analyze_group(blocks: list[dict[str, Any]]) -> dict[str, Any]:
             "video_regional": _metrics(regional),
             "regional_combined": _metrics(regional_combined),
         }
-    ranked = sorted(
+        for band in AUDIO_TEMPORAL_BANDS:
+            candidate_reports[candidate][band] = _metrics(
+                [
+                    item
+                    for run in runs
+                    for item in run["audio_temporal_candidates"][candidate][band]
+                ]
+            )
+    ranked = _rank_candidates(
         candidate_names,
-        key=lambda name: candidate_reports[name]["aggregate"][
+        lambda name: candidate_reports[name]["aggregate"][
             "mean_normalized_hidden_error"
         ],
     )
@@ -723,9 +936,9 @@ def analyze_group(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         run["regional_video_candidates"][candidate_names[0]] for run in runs
     )
     regional_ranked = (
-        sorted(
+        _rank_candidates(
             candidate_names,
-            key=lambda name: candidate_reports[name]["regional_combined"][
+            lambda name: candidate_reports[name]["regional_combined"][
                 "mean_normalized_hidden_error"
             ],
         )
@@ -742,8 +955,14 @@ def analyze_group(blocks: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "baselines": aggregate_baselines,
         "candidate_ranking": ranked,
+        "candidate_equivalence_groups": _candidate_equivalence_groups(runs, ranked),
         "regional_candidate_ranking": regional_ranked,
         "candidates": candidate_reports,
+        "oracle_interpretation": (
+            "coordinate transport rescales the same one-dimensional latest-delta direction; "
+            "it does not create a new correction subspace, so freely refit legacy and "
+            "coordinate oracle headroom is identical"
+        ),
     }
 
 

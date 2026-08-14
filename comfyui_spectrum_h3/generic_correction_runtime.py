@@ -21,7 +21,12 @@ from .generic_correction_core import (
     combine_moments,
     coordinate_transport_scale,
 )
-from .generic_correction_topology import TemporalRegion, temporal_video_regions
+from .generic_correction_topology import (
+    AudioTemporalBand,
+    TemporalRegion,
+    temporal_audio_bands,
+    temporal_video_regions,
+)
 from .model_aware import ModelAwareForecastDecision
 from .runtime import SpectrumH3Runtime
 
@@ -214,7 +219,7 @@ def _calibration_row(
     step: Any,
     *,
     stream: str,
-    region: TemporalRegion | None,
+    region: TemporalRegion | AudioTemporalBand | None,
     legacy_moments: ScalarMoments,
     coordinate_moments: ScalarMoments,
     coordinate_scale: float,
@@ -260,9 +265,25 @@ def _calibration_row(
         "sampler": runtime.stats.sampler_name,
         "schedule_steps": int(runtime.stats.total_steps),
         "stream": stream,
-        "region_id": None if region is None else region.region_id,
-        "region_start_row": None if region is None else region.start_row,
-        "region_end_row": None if region is None else region.end_row,
+        "region_id": (
+            None
+            if region is None
+            else getattr(region, "region_id", getattr(region, "band_id", None))
+        ),
+        "region_kind": (
+            None
+            if region is None
+            else "audio_temporal_band"
+            if isinstance(region, AudioTemporalBand)
+            else "video_temporal_region"
+        ),
+        "region_start_row": None if region is None else getattr(region, "start_row", None),
+        "region_end_row": None if region is None else getattr(region, "end_row", None),
+        "region_row_ranges": (
+            None
+            if not isinstance(region, AudioTemporalBand)
+            else [list(item) for item in region.row_ranges]
+        ),
         "region_start_temporal_token": (
             None if region is None else region.start_temporal_token
         ),
@@ -334,9 +355,25 @@ def _exact_anchor_analysis(
         video_start_row=video[1],
         video_end_row=video[2],
     )
-    weighted_segments: list[tuple[str, int, int, torch.Tensor]] = [
-        ("audio", audio[1], audio[2], base_weights["audio"]),
-    ]
+    audio_bands = temporal_audio_bands(
+        step.calls[0].topology,
+        audio_start_row=audio[1],
+        audio_end_row=audio[2],
+    )
+    weighted_segments: list[tuple[str, int, int, torch.Tensor]] = []
+    if audio_bands is None:
+        weighted_segments.append(("audio", audio[1], audio[2], base_weights["audio"]))
+    else:
+        for band in audio_bands:
+            weighted_segments.extend(
+                (
+                    f"audio:{band.band_id}:channel{channel}",
+                    start,
+                    end,
+                    base_weights["audio"],
+                )
+                for channel, (start, end) in enumerate(band.row_ranges)
+            )
     if regions is None:
         weighted_segments.append(("video", video[1], video[2], base_weights["video"]))
     else:
@@ -354,7 +391,24 @@ def _exact_anchor_analysis(
         combined,
         weighted_segments,
     )
-    audio_legacy = exact["audio"]
+    audio_band_legacy = (
+        [
+            combine_moments(
+                [
+                    exact[f"audio:{band.band_id}:channel{channel}"]
+                    for channel in range(len(band.row_ranges))
+                ]
+            )
+            for band in audio_bands
+        ]
+        if audio_bands is not None
+        else []
+    )
+    audio_legacy = (
+        combine_moments(audio_band_legacy)
+        if audio_band_legacy
+        else exact["audio"]
+    )
     if regions is None:
         video_region_legacy: list[ScalarMoments] = []
         video_legacy = exact["video"]
@@ -369,6 +423,9 @@ def _exact_anchor_analysis(
         step.coordinate,
     )
     audio_coordinate = audio_legacy.transported(transport_scale)
+    audio_band_coordinate = [
+        item.transported(transport_scale) for item in audio_band_legacy
+    ]
     video_coordinate = video_legacy.transported(transport_scale)
     video_region_coordinate = [
         item.transported(transport_scale) for item in video_region_legacy
@@ -427,6 +484,33 @@ def _exact_anchor_analysis(
             row,
             topology=step.calls[0].topology,
         )
+
+    if audio_bands is not None:
+        for band, legacy, transported in zip(
+            audio_bands,
+            audio_band_legacy,
+            audio_band_coordinate,
+            strict=True,
+        ):
+            row = _calibration_row(
+                runtime,
+                step,
+                stream="audio",
+                region=band,
+                legacy_moments=legacy,
+                coordinate_moments=transported,
+                coordinate_scale=transport_scale,
+                coordinate_active=transport_active,
+                legacy_decision=legacy_decision,
+                live_decision=live_decision,
+                advanced_application=audio_application,
+                raw_candidate_gain=controller.audio.raw_gain(),
+            )
+            record_calibration_row(
+                calibration_state,
+                row,
+                topology=step.calls[0].topology,
+            )
 
     if regions is not None and len(region_applications) == len(regions):
         for index, (region, legacy, transported, application) in enumerate(

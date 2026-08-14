@@ -11,10 +11,44 @@ GENERIC_CORRECTION_MODES = (
     "regional",
 )
 GENERIC_CORRECTION_LIMITERS = ("rational", "hard_clip", "tanh")
+GENERIC_CORRECTION_ATTENUATIONS = (
+    "mode_default",
+    "no_attenuation",
+    "general_confidence",
+    "correction_reliability",
+    "combined_conservative",
+)
 DEFAULT_RLS_FORGETTING = 0.90
 RESEARCH_RLS_FORGETTING = (0.75, 0.90, 0.97, 1.0)
 RESEARCH_LIMITS = (0.15, 0.25, 0.40)
 EPSILON = 1.0e-12
+
+
+def resolve_attenuation_policy(mode: str, attenuation: str) -> str:
+    """Resolve the policy actually applied by an experimental live mode."""
+    if attenuation not in GENERIC_CORRECTION_ATTENUATIONS:
+        raise ValueError(f"unknown generic correction attenuation {attenuation!r}")
+    if mode not in GENERIC_CORRECTION_MODES:
+        raise ValueError(f"unknown generic correction mode {mode!r}")
+    if mode == "legacy":
+        return "legacy_internal"
+    if attenuation != "mode_default":
+        return attenuation
+    if mode == "coordinate_rls":
+        return "general_confidence"
+    return "combined_conservative"
+
+
+def attenuation_flags(policy: str) -> tuple[bool, bool]:
+    if policy == "no_attenuation":
+        return False, False
+    if policy == "general_confidence":
+        return True, False
+    if policy == "correction_reliability":
+        return False, True
+    if policy == "combined_conservative":
+        return True, True
+    raise ValueError(f"unknown resolved attenuation policy {policy!r}")
 
 
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -417,6 +451,7 @@ def candidate_gain_family(
 
 __all__ = [
     "DEFAULT_RLS_FORGETTING",
+    "GENERIC_CORRECTION_ATTENUATIONS",
     "GENERIC_CORRECTION_LIMITERS",
     "GENERIC_CORRECTION_MODES",
     "RESEARCH_LIMITS",
@@ -426,10 +461,12 @@ __all__ = [
     "RecursiveLeastSquares",
     "ScalarMoments",
     "apply_gain",
+    "attenuation_flags",
     "candidate_gain_family",
     "clamp",
     "combine_moments",
     "coordinate_transport_scale",
     "limit_gain",
     "regularize_region_raw_gains",
+    "resolve_attenuation_policy",
 ]

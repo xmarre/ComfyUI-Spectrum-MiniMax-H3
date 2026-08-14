@@ -12,6 +12,8 @@ from comfyui_spectrum_h3.generic_correction_calibration import (
     build_block,
     exact_segment_moments,
 )
+from comfyui_spectrum_h3.generic_correction_core import combine_moments
+from comfyui_spectrum_h3.generic_correction_topology import temporal_audio_bands
 
 
 def test_exact_segment_moments_match_direct_tensor_calculation():
@@ -49,6 +51,56 @@ def test_exact_segment_moments_match_direct_tensor_calculation():
     assert moments.hold_error_sq_mean == pytest.approx(
         hold.float().square().mean().item()
     )
+
+
+def test_audio_start_middle_end_moments_reconstruct_aggregate_exactly():
+    forecaster = HistoryWeightForecaster(
+        degree=1,
+        ridge_lambda=0.1,
+        max_history=4,
+        history_storage="system_ram",
+    )
+    previous = torch.arange(24, dtype=torch.float32).reshape(1, 12, 2)
+    latest = previous + torch.linspace(0.5, 2.0, 24).reshape(1, 12, 2)
+    actual = latest + torch.linspace(-1.0, 1.0, 24).reshape(1, 12, 2)
+    forecaster.update(-1.0, previous, anchor_id=0)
+    forecaster.update(0.0, latest, anchor_id=1)
+    weights = torch.tensor([-0.25, 1.25])
+    topology = (("audio_shape", (1, 32, 2, 6)), ("target_audio_rows", 12))
+    bands = temporal_audio_bands(topology, audio_start_row=0, audio_end_row=12)
+    assert bands is not None
+    segments = [("audio", 0, 12, weights)]
+    for band in bands:
+        segments.extend(
+            (
+                f"{band.band_id}:{channel}",
+                start,
+                end,
+                weights,
+            )
+            for channel, (start, end) in enumerate(band.row_ranges)
+        )
+    exact = exact_segment_moments(forecaster, actual, segments)
+    reconstructed = combine_moments(
+        [
+            combine_moments(
+                [exact[f"{band.band_id}:0"], exact[f"{band.band_id}:1"]]
+            )
+            for band in bands
+        ]
+    )
+    aggregate = exact["audio"]
+    assert reconstructed.sample_count == aggregate.sample_count
+    for name in (
+        "residual_sq_mean",
+        "residual_dot_direction_mean",
+        "direction_sq_mean",
+        "hold_error_sq_mean",
+        "actual_sq_mean",
+    ):
+        assert getattr(reconstructed, name) == pytest.approx(
+            getattr(aggregate, name), rel=1e-12, abs=1e-12
+        )
 
 
 def test_calibration_block_contains_only_scalar_rows_and_stable_provenance():

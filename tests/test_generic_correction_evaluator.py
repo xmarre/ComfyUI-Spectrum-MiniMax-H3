@@ -7,6 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from comfyui_spectrum_h3.generic_correction_controller import (
+    GenericCorrectionController,
+)
+from comfyui_spectrum_h3.generic_correction_core import ScalarMoments
+
 _TOOL_PATH = (
     Path(__file__).resolve().parents[1] / "tools" / "analyze_generic_correction.py"
 )
@@ -21,7 +26,14 @@ _SPEC.loader.exec_module(evaluator)
 
 
 def _row(step: int, stream: str, region: str | None = None):
-    region_offset = {None: 0.0, "t0": -0.02, "t1": 0.03}[region]
+    region_offset = {
+        None: 0.0,
+        "t0": -0.02,
+        "t1": 0.03,
+        "audio_start": 0.08,
+        "audio_middle": -0.01,
+        "audio_end": 0.12,
+    }[region]
     a = 1.0 + 0.05 * step + region_offset
     b = 0.3 + 0.02 * step + region_offset
     c = 0.8 + abs(region_offset)
@@ -29,7 +41,7 @@ def _row(step: int, stream: str, region: str | None = None):
         "target_step_id": step,
         "stream": stream,
         "region_id": region,
-        "sample_count": 4 if region is None else 2,
+        "sample_count": 6 if stream == "audio" and region is None else 4 if region is None else 2,
         "A": a,
         "B": b,
         "C": c,
@@ -49,6 +61,10 @@ def _block(label: str, *, sampler: str = "sample_euler"):
     rows = []
     for step in (2, 4, 6):
         rows.append(_row(step, "audio"))
+        rows.extend(
+            _row(step, "audio", band)
+            for band in ("audio_start", "audio_middle", "audio_end")
+        )
         rows.append(_row(step, "video"))
         rows.append(_row(step, "video", "t0"))
         rows.append(_row(step, "video", "t1"))
@@ -93,6 +109,9 @@ def test_single_run_is_explicitly_development_only():
     assert group["candidate_ranking"]
     best = group["candidate_ranking"][0]
     assert group["candidates"][best]["video_regional"]["targets"] == 3
+    assert group["candidates"][best]["audio_start"]["targets"] == 3
+    assert group["candidates"][best]["audio_middle"]["targets"] == 3
+    assert group["candidates"][best]["audio_end"]["targets"] == 3
 
 
 def test_multiple_runs_use_whole_run_leave_one_out():
@@ -175,6 +194,76 @@ def test_empty_candidate_scope_is_rejected_explicitly():
         evaluator._candidate_run_score(run, candidate, regional=True)
 
 
+def _moments_from_row(row):
+    return ScalarMoments(
+        sample_count=int(row["sample_count"]),
+        residual_sq_mean=float(row["A"]),
+        residual_dot_direction_mean=float(row["B"]),
+        direction_sq_mean=float(row["C"]),
+        hold_error_sq_mean=float(row["ratio_denominator_rms"]) ** 2,
+        actual_sq_mean=1.0,
+        ratio_epsilon=float(row["ratio_epsilon"]),
+        ratio_denominator_rms=float(row["ratio_denominator_rms"]),
+    ).validate()
+
+
+def test_evaluator_recommendation_mapping_matches_live_gain_step_for_step():
+    block = _block("parity")
+    candidate = "rls0.90__no_attenuation__hard_clip__L0.40"
+    mapping = evaluator.live_configuration_for_candidate(candidate)
+    assert mapping["live_reproducible"]
+    controller = GenericCorrectionController(
+        mapping["generic_correction_mode"],
+        mapping["generic_correction_limiter"],
+        mapping["generic_correction_limit"],
+        attenuation=mapping["generic_correction_attenuation"],
+    )
+    evaluated = evaluator._evaluate_run(block)["candidates"][candidate]
+    expected = {
+        (item["stream"], item["target_step_id"]): item["gain"]
+        for item in evaluated
+    }
+    rows = [
+        row
+        for row in evaluator._ordered_rows(block)
+        if row.get("region_id") is None
+    ]
+    for row in rows:
+        application = controller.application(
+            row["stream"],
+            general_confidence=float(row["general_forecast_confidence"]),
+        )
+        assert application.bounded_gain == pytest.approx(
+            expected[(row["stream"], int(row["target_step_id"]))],
+            rel=1e-13,
+            abs=1e-13,
+        )
+        controller.observe_stream(
+            row["stream"],
+            _moments_from_row(row),
+            application.bounded_gain,
+        )
+
+
+def test_saturated_rls_lambdas_are_reported_as_one_canonical_tie():
+    run = evaluator._evaluate_run(_block("tied"))
+    candidates = [
+        f"rls{forgetting:.2f}__no_attenuation__hard_clip__L0.40"
+        for forgetting in (0.75, 0.90, 0.97, 1.00)
+    ]
+    groups = evaluator._candidate_equivalence_groups([run], candidates)
+    assert len(groups) == 1
+    assert groups[0]["numerically_equivalent"]
+    assert groups[0]["representative"].startswith("rls0.90__")
+    assert groups[0]["members"][0].startswith("rls0.90__")
+    assert evaluator.live_configuration_for_candidate(candidates[0])[
+        "live_reproducible"
+    ] is False
+    assert evaluator.live_configuration_for_candidate(candidates[1])[
+        "live_reproducible"
+    ] is True
+
+
 def test_cli_normalizes_malformed_numeric_input(tmp_path, capsys):
     block = _block("bad")
     block["target_rows"][0]["A"] = None
@@ -186,36 +275,43 @@ def test_cli_normalizes_malformed_numeric_input(tmp_path, capsys):
     assert "malformed numeric data" in capsys.readouterr().err
 
 
+def _mutate_matching_row(block, predicate, **updates):
+    index = next(
+        index for index, row in enumerate(block["target_rows"]) if predicate(row)
+    )
+    block["target_rows"][index] = {**block["target_rows"][index], **updates}
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
         (
-            lambda block: block["target_rows"].__setitem__(
-                1,
-                {
-                    **block["target_rows"][1],
-                    "region_id": "missing-global",
-                },
+            lambda block: _mutate_matching_row(
+                block,
+                lambda row: row["target_step_id"] == 2
+                and row["stream"] == "video"
+                and row["region_id"] is None,
+                region_id="missing-global",
             ),
             "lacks a global",
         ),
         (
-            lambda block: block["target_rows"].__setitem__(
-                -1,
-                {
-                    **block["target_rows"][-1],
-                    "region_id": "changed-region",
-                },
+            lambda block: _mutate_matching_row(
+                block,
+                lambda row: row["target_step_id"] == 6
+                and row["stream"] == "video"
+                and row["region_id"] == "t1",
+                region_id="changed-region",
             ),
             "topology changed",
         ),
         (
-            lambda block: block["target_rows"].__setitem__(
-                2,
-                {
-                    **block["target_rows"][2],
-                    "sample_count": 1,
-                },
+            lambda block: _mutate_matching_row(
+                block,
+                lambda row: row["target_step_id"] == 2
+                and row["stream"] == "video"
+                and row["region_id"] == "t0",
+                sample_count=1,
             ),
             "exactly cover",
         ),

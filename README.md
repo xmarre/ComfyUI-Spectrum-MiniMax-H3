@@ -28,6 +28,10 @@ offline_smoothing_replay = true
 model_aware_mode = off
 model_aware_trust_shrinkage = false
 model_aware_replay_generic_correction = false
+generic_correction_mode = legacy
+generic_correction_attenuation = mode_default
+generic_correction_limiter = rational
+generic_correction_limit = 0.25
 anchor_residual_feedback = false
 selective_rollback_correction = false
 ```
@@ -230,6 +234,7 @@ Built-in ComfyUI previews, ComfyUI-bleh Better Previews, VHS Preview, and other 
 | `model_aware_trust_shrinkage` | `false` | Research/reproduction switch. The completed perceptual gate did not support promotion. |
 | `model_aware_replay_generic_correction` | `false` | Legacy/research replay transfer of the causal generic correction. Keep disabled for normal use. |
 | `generic_correction_mode` | `legacy` | Advanced `full` controller: exact legacy baseline, coordinate/RLS, coordinate/RLS/reliability, or topology-safe regional VIDEO. New modes are experimental. |
+| `generic_correction_attenuation` | `mode_default` | Orthogonal advanced attenuation policy. `mode_default` preserves every existing mode exactly; explicit policies reproduce evaluator candidates. |
 | `generic_correction_limiter` | `rational` | Generic gain limiter: validated `rational` baseline or experimental `hard_clip`/`tanh`. |
 | `generic_correction_limit` | `0.25` | Symmetric limiter scale. Keep `0.25` for the validated baseline. |
 | `anchor_residual_feedback` | `false` | Experimental video-scored actual-refresh guard. Requires single-pass operation. |
@@ -318,7 +323,8 @@ g_raw = <r, d> / <d, d>
 
 The gain is confidence-scaled and bounded before it is applied to the latest-delta direction. The correction itself adds no transformer evaluation. The scheduling component can still convert risky forecast steps into actual evaluations.
 
-`generic_correction_mode=legacy`, `generic_correction_limiter=rational`, and
+`generic_correction_mode=legacy`, `generic_correction_attenuation=mode_default`,
+`generic_correction_limiter=rational`, and
 `generic_correction_limit=0.25` preserve this validated path. The selectable
 coordinate/RLS, correction-reliability, and coarse temporal VIDEO controllers are
 experimental live A/B paths. With `debug=true`, full single-pass runs also emit
@@ -327,6 +333,10 @@ When `offline_smoothing_replay=false`, Spectrum automatically persists each
 completed compatible block, rejects repeated traces/seeds, evaluates its compatible
 whole-run group, prints a concise console recommendation, and refreshes detailed
 Markdown and JSON reports. No log capture or manual evaluator command is required.
+Recommendations include the exact attenuation policy and are emitted only when
+the selected offline candidate is reproducible by live settings. Numerically
+equivalent RLS candidates are reported as a tie; the canonical live `lambda=0.90`
+is retained instead of exposing a new lambda control without evidence.
 See
 [GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md) for their causal
 contract, topology proof, offline evaluation discipline, and promotion gate.
