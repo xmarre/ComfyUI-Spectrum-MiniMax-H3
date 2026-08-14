@@ -68,6 +68,11 @@ spacing. Duplicate, tiny, or nonfinite anchor spacing falls back to the legacy
 unscaled direction. The real normalized sampler coordinate is used; step index
 is not substituted.
 
+The limiter bounds the dimensionless gain applied to `d_target`. It does not
+re-bound the algebraically equivalent coefficient on the untransported anchor
+delta; doing so would make the candidate geometry depend on which representation
+is used and would break parity with the exact coordinate-direction moments.
+
 ## Recursive scalar estimator
 
 For each exact causal observation, the runtime records:

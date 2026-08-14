@@ -62,6 +62,7 @@ def _block(label: str, *, sampler: str = "sample_euler"):
             "source_schema_revision": "generic-correction-v1",
             "package_version": "0.2.8",
             "source_revision": "abc",
+            "topology_fingerprint": "topology-av",
         },
         "metadata": {"sampler": sampler, "steps": 8},
         "config": {
@@ -78,8 +79,12 @@ def _block(label: str, *, sampler: str = "sample_euler"):
 def test_parser_accepts_raw_json_and_complete_log_markers():
     block = _block("a")
     assert evaluator.parse_calibration_text(json.dumps(block)) == [block]
-    log = f"noise\n{evaluator.LOG_PREFIX}{json.dumps(block)}\nmore noise"
-    assert evaluator.parse_calibration_text(log) == [block]
+    second = _block("b")
+    log = (
+        f"noise\n{evaluator.LOG_PREFIX}   {json.dumps(block)}\n"
+        f"more noise\n{evaluator.LOG_PREFIX}\t{json.dumps(second)}\n"
+    )
+    assert evaluator.parse_calibration_text(log) == [block, second]
 
 
 def test_single_run_is_explicitly_development_only():
@@ -105,6 +110,14 @@ def test_incompatible_sampler_traces_are_reported_as_separate_groups():
     assert report["compatibility_group_count"] == 2
 
 
+def test_incompatible_topologies_are_reported_as_separate_groups():
+    first = _block("a")
+    second = _block("b")
+    second["provenance"]["topology_fingerprint"] = "topology-video-only"
+    report = evaluator.analyze_blocks([first, second])
+    assert report["compatibility_group_count"] == 2
+
+
 def test_duplicate_trace_is_rejected(tmp_path):
     block = _block("same")
     first = tmp_path / "one.json"
@@ -127,3 +140,39 @@ def test_post_target_row_order_never_changes_earlier_candidate_score():
     first_original = original["candidates"][candidate][0]
     first_changed = changed["candidates"][candidate][0]
     assert first_original["ratio"] == first_changed["ratio"]
+
+
+def test_reliability_alignment_matches_runtime_threshold_and_clamp():
+    state = evaluator._OnlineState(forgetting=0.9)
+    clamped = _row(2, "audio", "trace")
+    clamped.update({"A": 1.0, "B": 2.0, "C": 1.0, "ratio_epsilon": 1.0e-6})
+    state.update(clamped, 0.0)
+    assert state.alignment == pytest.approx(0.5)
+
+    degenerate = evaluator._OnlineState(forgetting=0.9)
+    row = _row(2, "audio", "trace")
+    row.update({"A": 1.0, "B": 0.5, "C": 1.0, "ratio_epsilon": 2.0})
+    degenerate.update(row, 0.0)
+    assert degenerate.alignment == 0.0
+    assert degenerate.nondegenerate == 0
+
+
+def test_empty_candidate_scope_is_rejected_explicitly():
+    candidate = evaluator._candidate_names()[0]
+    run = {
+        "candidates": {candidate: []},
+        "regional_video_candidates": {candidate: []},
+    }
+    with pytest.raises(evaluator.CalibrationError, match="no scoreable entries"):
+        evaluator._candidate_run_score(run, candidate, regional=True)
+
+
+def test_cli_normalizes_malformed_numeric_input(tmp_path, capsys):
+    block = _block("bad")
+    block["target_rows"][0]["A"] = None
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(block), encoding="utf-8")
+    with pytest.raises(SystemExit) as raised:
+        evaluator.main([str(path)])
+    assert raised.value.code == 2
+    assert "malformed numeric data" in capsys.readouterr().err

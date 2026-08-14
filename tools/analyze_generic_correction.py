@@ -85,11 +85,13 @@ def _extract_log_blocks(text: str) -> list[dict[str, Any]]:
         if marker < 0:
             break
         start = marker + len(LOG_PREFIX)
+        remainder = text[start:]
+        whitespace = len(remainder) - len(remainder.lstrip())
         try:
-            value, consumed = decoder.raw_decode(text[start:].lstrip())
+            value, consumed = decoder.raw_decode(remainder, whitespace)
         except json.JSONDecodeError as exc:
             raise CalibrationError(
-                f"malformed calibration JSON after marker at byte {marker}"
+                f"malformed calibration JSON after marker at index {marker}"
             ) from exc
         if isinstance(value, dict):
             blocks.append(value)
@@ -161,9 +163,16 @@ def _validate_block(block: dict[str, Any]) -> None:
             "bounded_legacy_gain",
             "general_forecast_confidence",
         )
-        if not all(math.isfinite(float(row[name])) for name in numeric):
+        try:
+            numeric_values = tuple(float(row[name]) for name in numeric)
+            sample_count = int(row["sample_count"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CalibrationError(
+                "generic calibration row contains malformed numeric data"
+            ) from exc
+        if not all(math.isfinite(value) for value in numeric_values):
             raise CalibrationError("generic calibration row contains nonfinite data")
-        if int(row["sample_count"]) <= 0:
+        if sample_count <= 0:
             raise CalibrationError("generic calibration row has no samples")
         if row["stream"] not in {"audio", "video"}:
             raise CalibrationError("generic calibration row has an unknown stream")
@@ -187,6 +196,7 @@ def _compatibility_key(block: dict[str, Any]) -> str:
             "schema": provenance.get("source_schema_revision"),
             "package": provenance.get("package_version"),
             "source_revision": provenance.get("source_revision"),
+            "topology_fingerprint": provenance.get("topology_fingerprint"),
             "sampler": metadata.get("sampler"),
             "steps": metadata.get("steps"),
             "base_config": config,
@@ -250,8 +260,17 @@ class _OnlineState:
     def update(self, row: dict[str, Any], predicted_gain: float) -> None:
         alpha = 0.5 if self.observations < 2 else 0.3
         a, b, c = (float(row[name]) for name in ("A", "B", "C"))
+        direction_threshold = max(
+            EPSILON,
+            float(row["ratio_epsilon"]) ** 2,
+        )
         denominator = math.sqrt(max(0.0, a) * max(0.0, c))
-        alignment = abs(b / denominator) if denominator > EPSILON else 0.0
+        directional_cosine = (
+            _clamp(b / denominator, -1.0, 1.0)
+            if denominator > direction_threshold
+            else 0.0
+        )
+        alignment = abs(directional_cosine)
         oracle = _oracle(row)
         if (
             self.previous_oracle is None
@@ -270,7 +289,7 @@ class _OnlineState:
             advantage, -1.0, 1.0
         )
         self.previous_oracle = oracle
-        if c > max(EPSILON, float(row["ratio_epsilon"]) ** 2):
+        if c > direction_threshold:
             self.nondegenerate += 1
         self.b_acc = self.forgetting * self.b_acc + b
         self.c_acc = self.forgetting * self.c_acc + c
@@ -560,6 +579,10 @@ def _candidate_run_score(
     regional: bool,
 ) -> float:
     entries = _candidate_entries(run, candidate, regional=regional)
+    if not entries:
+        raise CalibrationError(
+            "candidate run has no scoreable entries for the requested scope"
+        )
     return statistics.fmean(float(item["ratio"]) for item in entries)
 
 
@@ -744,7 +767,10 @@ def main(argv: list[str] | None = None) -> int:
         "--json", action="store_true", help="emit the complete JSON report"
     )
     args = parser.parse_args(argv)
-    report = analyze_blocks(load_blocks(args.inputs))
+    try:
+        report = analyze_blocks(load_blocks(args.inputs))
+    except (CalibrationError, OSError) as exc:
+        parser.error(str(exc))
     print(
         json.dumps(report, indent=2, sort_keys=True)
         if args.json

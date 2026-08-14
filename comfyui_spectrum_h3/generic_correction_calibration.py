@@ -129,8 +129,11 @@ def exact_segment_moments(
     if len({key for key, *_ in normalized}) != len(normalized):
         raise ValueError("exact moment segment keys must be unique")
 
+    # MPS does not support float64 reductions. Other backends use five float64
+    # accumulators per segment to minimize drift across large chunked streams.
+    accumulator_dtype = torch.float32 if target_device.type == "mps" else torch.float64
     accumulators = {
-        key: torch.zeros(5, device=target_device, dtype=torch.float32)
+        key: torch.zeros(5, device=target_device, dtype=accumulator_dtype)
         for key, *_ in normalized
     }
     counts = {key: 0 for key, *_ in normalized}
@@ -187,11 +190,11 @@ def exact_segment_moments(
                 hold_error = actual - latest
                 terms = torch.stack(
                     (
-                        residual.square().sum(dtype=torch.float32),
-                        (residual * direction).sum(dtype=torch.float32),
-                        direction.square().sum(dtype=torch.float32),
-                        hold_error.square().sum(dtype=torch.float32),
-                        actual.square().sum(dtype=torch.float32),
+                        residual.square().sum(dtype=accumulator_dtype),
+                        (residual * direction).sum(dtype=accumulator_dtype),
+                        direction.square().sum(dtype=accumulator_dtype),
+                        hold_error.square().sum(dtype=accumulator_dtype),
+                        actual.square().sum(dtype=accumulator_dtype),
                     )
                 )
                 accumulators[key].add_(terms)

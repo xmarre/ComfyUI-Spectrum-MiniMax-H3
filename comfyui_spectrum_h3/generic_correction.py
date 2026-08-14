@@ -87,6 +87,7 @@ def _generic_telemetry(
     source: CorrectionGainTelemetry,
     controller: GenericCorrectionController | None = None,
     *,
+    stream: str = "audio",
     confidence: float = 1.0,
 ) -> CorrectionGainTelemetry:
     """Expose only the surviving generic gain; retired candidate fields stay zero."""
@@ -106,7 +107,7 @@ def _generic_telemetry(
             bound_active = abs(gain - raw_gain) > 1e-12
         else:
             application = controller.application(
-                "audio",
+                stream,
                 general_confidence=confidence,
             )
             projection = application.raw_gain
@@ -155,11 +156,13 @@ def _generic_decision(self: ModelAwareController, **kwargs) -> ModelAwareForecas
         audio = _generic_telemetry(
             decision.audio_correction_telemetry,
             controller if isinstance(controller, GenericCorrectionController) else None,
+            stream="audio",
             confidence=decision.confidence,
         )
         video = _generic_telemetry(
             decision.video_correction_telemetry,
             controller if isinstance(controller, GenericCorrectionController) else None,
+            stream="video",
             confidence=decision.confidence,
         )
     return replace(

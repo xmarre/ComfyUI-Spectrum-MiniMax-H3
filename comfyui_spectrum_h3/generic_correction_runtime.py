@@ -51,6 +51,14 @@ def _advanced_weight_segments(
     coordinate: float,
     controller: GenericCorrectionController,
 ) -> tuple[tuple[int, int, torch.Tensor], ...]:
+    """Apply a bounded gain to the coordinate-transported latest delta.
+
+    ``generic_correction_limit`` bounds the dimensionless gain multiplying the
+    transported direction. The equivalent coefficient on the original anchor
+    delta may therefore exceed the limit when the coordinate-spacing ratio has
+    magnitude greater than one; bounding that coefficient again would change
+    the declared geometry and disagree with exact quadratic calibration.
+    """
     started = time.perf_counter()
     history = runtime.forecaster._history
     if len(history) < 2:
