@@ -32,8 +32,9 @@ def _capture(node, role: str, *, benchmark_id: str = "seq-1", video=None, reset=
         role,
         24.0,
         benchmark_id,
-        123,
-        nodes.DEFAULT_PROVENANCE_JSON,
+        "123",
+        20,
+        "fixture-workflow",
         4,
         reset_before_capture=reset,
         audio=_audio(),
@@ -60,6 +61,11 @@ def test_sequential_capture_three_runs_auto_evaluates_and_releases(monkeypatch):
     assert len(calls) == 1
     assert calls[0][3]["benchmark_id"] == "seq-1"
     assert calls[0][3]["seed"] == 123
+    assert calls[0][3]["provenance"]["compatibility"]["steps"] == 20
+    assert (
+        calls[0][3]["provenance"]["compatibility"]["generation_settings"]["compatibility_tag"]
+        == "fixture-workflow"
+    )
     assert calls[0][3]["reference_audio"]["waveform"].device.type == "cpu"
     assert calls[0][0].device.type == "cpu"
     assert nodes.pending_objective_media_state()["benchmark_count"] == 0
@@ -75,9 +81,9 @@ def test_sequential_capture_role_order_is_independent(monkeypatch):
     monkeypatch.setattr(nodes, "_evaluate_and_persist", fake_evaluate)
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
     base = _video()
-    node.capture(base + 0.2, "B - candidate", 24.0, "order", 123, nodes.DEFAULT_PROVENANCE_JSON, 4, False, _audio())
-    node.capture(base, "R - native reference", 24.0, "order", 123, nodes.DEFAULT_PROVENANCE_JSON, 4, False, _audio())
-    node.capture(base + 0.1, "A - legacy Spectrum", 24.0, "order", 123, nodes.DEFAULT_PROVENANCE_JSON, 4, False, _audio())
+    node.capture(base + 0.2, "B - candidate", 24.0, "order", "123", 20, "fixture", 4, False, _audio())
+    node.capture(base, "R - native reference", 24.0, "order", "123", 20, "fixture", 4, False, _audio())
+    node.capture(base + 0.1, "A - legacy Spectrum", 24.0, "order", "123", 20, "fixture", 4, False, _audio())
 
     assert len(seen) == 1
     assert seen[0][0] < seen[0][1] < seen[0][2]
@@ -175,3 +181,29 @@ def test_default_provenance_is_nonempty_and_node_is_registered():
         is nodes.SpectrumH3ObjectiveSequentialCapture
     )
     assert nodes.SpectrumH3ObjectiveSequentialCapture.OUTPUT_NODE is True
+
+
+def test_sequential_schema_has_no_randomizable_integer_seed_or_json_blob():
+    required = nodes.SpectrumH3ObjectiveSequentialCapture.INPUT_TYPES()["required"]
+    assert required["generation_seed"][0] == "STRING"
+    assert "seed" not in required
+    assert "provenance_json" not in required
+    assert required["compatibility_tag"][0] == "STRING"
+
+
+def test_generation_seed_validation_is_strict():
+    node = nodes.SpectrumH3ObjectiveSequentialCapture()
+    for invalid in ("not-a-seed", "-1", str(2**64)):
+        with pytest.raises(ObjectiveMediaError, match="generation_seed"):
+            node.capture(
+                _video(),
+                "R - native reference",
+                24.0,
+                f"bad-{invalid}",
+                invalid,
+                20,
+                "fixture",
+                4,
+                False,
+                _audio(),
+            )
