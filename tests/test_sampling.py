@@ -681,7 +681,7 @@ def test_replay_only_er_sde_transition_is_timestamped_and_schedule_invariant(cap
         model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}},
         conds={},
     )
-    topology = (("tiny", 1),)
+    topology = (("target_audio_rows", 1), ("target_video_rows", 1))
     labels = ((0, "positive"),)
     schedules = []
     actual_calls = []
@@ -713,7 +713,7 @@ def test_replay_only_er_sde_transition_is_timestamped_and_schedule_invariant(cap
                     decision["step_id"],
                     topology=topology,
                     labels=labels,
-                    expected_shape=(1, 1, 1),
+                    expected_shape=(1, 2, 1),
                 )
                 if actual:
                     phase_actual_calls += 1
@@ -721,7 +721,7 @@ def test_replay_only_er_sde_transition_is_timestamped_and_schedule_invariant(cap
                         decision["run_id"],
                         decision["step_id"],
                         call_id,
-                        torch.full((1, 1, 1), float(index)),
+                        torch.full((1, 2, 1), float(index)),
                     )
                 else:
                     assert runtime.predict(
