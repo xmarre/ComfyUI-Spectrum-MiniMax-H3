@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import time
 from typing import Any
@@ -10,17 +11,29 @@ import torch.nn.functional as F
 
 from . import objective_media as base
 
+LOG = logging.getLogger(__name__)
+
 PROFILE_NAME = "sequential_bounded_luma_block_ssim_v1"
 BLOCK_SIZE = 8
 
 
 def _video_chunk(value: torch.Tensor, start: int, end: int) -> torch.Tensor:
-    chunk = value[start:end, ..., :3].detach().to(device="cpu", dtype=torch.float32)
-    if not torch.isfinite(chunk).all():
+    source = value[start:end, ..., :3].detach()
+    chunk = torch.empty(
+        (end - start, 3, int(source.shape[1]), int(source.shape[2])),
+        dtype=torch.float32,
+        device="cpu",
+    )
+    chunk.copy_(source.movedim(-1, 1))
+    minimum, maximum = torch.aminmax(chunk)
+    bounds = torch.stack((minimum, maximum))
+    if not bool(torch.isfinite(bounds).all().item()):
         raise base.ObjectiveMediaError("video contains NaN or infinite values")
-    if base._safe_float(chunk.min()) < -1.0e-4 or base._safe_float(chunk.max()) > 1.0001:
-        raise base.ObjectiveMediaError("IMAGE values must be in the decoded ComfyUI [0, 1] range")
-    return chunk.clamp(0.0, 1.0).movedim(-1, 1).contiguous()
+    if float(bounds[0]) < -1.0e-4 or float(bounds[1]) > 1.0001:
+        raise base.ObjectiveMediaError(
+            "IMAGE values must be in the decoded ComfyUI [0, 1] range"
+        )
+    return chunk.clamp_(0.0, 1.0)
 
 
 def _luma(value: torch.Tensor) -> torch.Tensor:
@@ -134,14 +147,18 @@ def _video_metrics(
     previous_values: dict[str, torch.Tensor | None] = {name: None for name in names}
     for start in range(0, frames, chunk_size):
         end = min(frames, start + chunk_size)
+        chunk_started = time.perf_counter()
+        LOG.info(
+            "Spectrum H3 objective bounded evaluator: VIDEO chunk start "
+            "frames=%s:%s",
+            start,
+            end,
+        )
         ref_rgb = _video_chunk(reference, start, end)
         ref = _luma(ref_rgb)
-        values_rgb = {
-            "legacy": _video_chunk(legacy, start, end),
-            "candidate": _video_chunk(candidate, start, end),
-        }
         reference_detail = _laplacian(ref)
-        for name, value_rgb in values_rgb.items():
+        for name, source in (("legacy", legacy), ("candidate", candidate)):
+            value_rgb = _video_chunk(source, start, end)
             value = _luma(value_rgb)
             ssim, _ = _block_ssim_and_cs(ref, value)
             ms_ssim = _fast_ms_ssim(ref, value)
@@ -199,7 +216,33 @@ def _video_metrics(
             series[name]["temporal_derivative_error"].extend(temporal_values)
             series[name]["motion_weighted_detail_error"].extend(weighted_values)
             previous_values[name] = value[-1:].clone()
+            del (
+                value_rgb,
+                value,
+                ssim,
+                ms_ssim,
+                mse,
+                psnr,
+                detail_error_map,
+                global_detail,
+                sequence_ref,
+                sequence_value,
+                delta_ref,
+                delta_value,
+                temporal,
+                motion,
+                motion_detail,
+                weighted,
+            )
         previous_reference = ref[-1:].clone()
+        del ref_rgb, ref, reference_detail
+        LOG.info(
+            "Spectrum H3 objective bounded evaluator: VIDEO chunk done "
+            "frames=%s:%s elapsed=%.3fs",
+            start,
+            end,
+            time.perf_counter() - chunk_started,
+        )
 
     directions = {
         "ssim": True,

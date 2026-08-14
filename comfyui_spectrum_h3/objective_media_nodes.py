@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import platform
 import threading
 import time
 from collections import OrderedDict
+from datetime import datetime, timezone
 from typing import Any
 
 import torch
@@ -28,6 +31,11 @@ MAX_PENDING_BENCHMARKS = 2
 MAX_PENDING_BYTES = 4 * 1024**3
 SEQUENTIAL_MAX_ANALYSIS_PIXELS = 393_216
 SEQUENTIAL_STAGE_CHUNK_FRAMES = 4
+SEQUENTIAL_STAGE_WORKSPACE_TARGET_BYTES = 64 * 1024**2
+SEQUENTIAL_AUDIO_WORKSPACE_TARGET_BYTES = 8 * 1024**2
+SEQUENTIAL_HOST_SAFETY_MARGIN_BYTES = 512 * 1024**2
+SEQUENTIAL_CUDA_SAFETY_MARGIN_BYTES = 256 * 1024**2
+SEQUENTIAL_UNMEASURED_INCREMENTAL_LIMIT_BYTES = 6 * 1024**3
 
 _ROLE_PROVENANCE = {
     "R": {"spectrum": "bypassed", "role": "native_full_compute_reference"},
@@ -84,6 +92,167 @@ _ROLE_KEYS = {
 
 _PENDING_LOCK = threading.RLock()
 _PENDING_CAPTURES: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+
+def _format_bytes(value: int | None) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{int(value) / 1024**3:.3f} GiB"
+
+
+def _capture_log(
+    event: str,
+    *,
+    started: float,
+    detail: bool = False,
+    **fields: Any,
+) -> None:
+    rendered = " ".join(
+        f"{name}={value}" for name, value in fields.items() if value is not None
+    )
+    message = (
+        "Spectrum H3 objective capture: "
+        f"ts={datetime.now(timezone.utc).isoformat(timespec='milliseconds')} "
+        f"elapsed={time.perf_counter() - started:.3f}s event={event}"
+    )
+    if rendered:
+        message += f" {rendered}"
+    (LOG.info if detail else LOG.warning)(message)
+
+
+def _linux_memory_value_bytes(name: str) -> int | None:
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, value = line.partition(":")
+                if key == name:
+                    return int(value.strip().split()[0]) * 1024
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _process_rss_bytes() -> int | None:
+    try:
+        import psutil
+    except ImportError:
+        pass
+    else:
+        try:
+            return int(psutil.Process().memory_info().rss)
+        except (psutil.Error, OSError, RuntimeError, ValueError):
+            pass
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as handle:
+            resident_pages = int(handle.read().split()[1])
+        return resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        return None
+
+
+def _available_host_memory_bytes() -> int | None:
+    try:
+        import psutil
+    except ImportError:
+        pass
+    else:
+        try:
+            return int(psutil.virtual_memory().available)
+        except (psutil.Error, OSError, RuntimeError, ValueError):
+            pass
+    available = _linux_memory_value_bytes("MemAvailable")
+    if available is not None:
+        return available
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("length", ctypes.c_ulong),
+                    ("memory_load", ctypes.c_ulong),
+                    ("total_physical", ctypes.c_ulonglong),
+                    ("available_physical", ctypes.c_ulonglong),
+                    ("total_page_file", ctypes.c_ulonglong),
+                    ("available_page_file", ctypes.c_ulonglong),
+                    ("total_virtual", ctypes.c_ulonglong),
+                    ("available_virtual", ctypes.c_ulonglong),
+                    ("available_extended_virtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(MemoryStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.available_physical)
+        except (AttributeError, OSError, ValueError):
+            pass
+    try:
+        return int(os.sysconf("SC_AVPHYS_PAGES")) * int(
+            os.sysconf("SC_PAGE_SIZE")
+        )
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _memory_snapshot(source_device: torch.device) -> dict[str, int | None]:
+    snapshot: dict[str, int | None] = {
+        "rss_bytes": _process_rss_bytes(),
+        "available_host_bytes": _available_host_memory_bytes(),
+        "cuda_allocated_bytes": None,
+        "cuda_reserved_bytes": None,
+        "cuda_free_bytes": None,
+        "cuda_total_bytes": None,
+    }
+    if source_device.type == "cuda":
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(source_device)
+            snapshot.update(
+                {
+                    "cuda_allocated_bytes": int(
+                        torch.cuda.memory_allocated(source_device)
+                    ),
+                    "cuda_reserved_bytes": int(
+                        torch.cuda.memory_reserved(source_device)
+                    ),
+                    "cuda_free_bytes": int(free_bytes),
+                    "cuda_total_bytes": int(total_bytes),
+                }
+            )
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    return snapshot
+
+
+def _dtype_bytes(dtype: torch.dtype) -> int:
+    return int(torch.empty((), dtype=dtype).element_size())
+
+
+def _audio_source(audio: Any) -> torch.Tensor | None:
+    if audio is None:
+        return None
+    if (
+        not isinstance(audio, dict)
+        or "waveform" not in audio
+        or "sample_rate" not in audio
+    ):
+        raise ObjectiveMediaError(
+            "audio must be a ComfyUI AUDIO object with waveform and sample_rate"
+        )
+    waveform = audio["waveform"]
+    if not isinstance(waveform, torch.Tensor):
+        raise ObjectiveMediaError("audio.waveform must be a torch tensor")
+    if waveform.ndim != 3:
+        raise ObjectiveMediaError(
+            "audio.waveform must have shape [batch, channels, samples]"
+        )
+    if not waveform.is_floating_point():
+        raise ObjectiveMediaError("audio.waveform must be floating point")
+    if any(int(size) < 1 for size in waveform.shape):
+        raise ObjectiveMediaError("audio.waveform dimensions must be non-empty")
+    sample_rate = audio["sample_rate"]
+    if not isinstance(sample_rate, int) or sample_rate <= 0:
+        raise ObjectiveMediaError("audio.sample_rate must be a positive integer")
+    return waveform
 
 
 def _parse_provenance(provenance_json: str) -> dict[str, Any]:
@@ -217,23 +386,14 @@ def _source_topology(video: Any, audio: Any = None) -> tuple[Any, ...]:
         raise ObjectiveMediaError("video must contain at least two frames")
     if video.shape[-1] < 3:
         raise ObjectiveMediaError("video must contain at least three channels")
+    if int(video.shape[1]) < 1 or int(video.shape[2]) < 1:
+        raise ObjectiveMediaError("video height and width must be non-empty")
     if not video.is_floating_point():
         raise ObjectiveMediaError("video must be floating point")
     audio_topology: tuple[Any, ...] | None = None
     if audio is not None:
-        if (
-            not isinstance(audio, dict)
-            or "waveform" not in audio
-            or "sample_rate" not in audio
-        ):
-            raise ObjectiveMediaError(
-                "audio must be a ComfyUI AUDIO object with waveform and sample_rate"
-            )
-        waveform = audio["waveform"]
-        if not isinstance(waveform, torch.Tensor) or waveform.ndim != 3:
-            raise ObjectiveMediaError(
-                "audio.waveform must have shape [batch, channels, samples]"
-            )
+        waveform = _audio_source(audio)
+        assert waveform is not None
         audio_topology = (
             tuple(int(item) for item in waveform.shape),
             str(waveform.dtype),
@@ -253,57 +413,653 @@ def _source_video_metadata(video: torch.Tensor) -> dict[str, Any]:
         "width": int(video.shape[2]),
         "channels": int(video.shape[3]),
         "dtype": str(video.dtype),
+        "device": str(video.device),
+        "source_tensor_bytes": int(video.numel() * video.element_size()),
+    }
+
+
+def _memory_estimate_for_shapes(
+    video_shape: tuple[int, int, int, int],
+    video_dtype: torch.dtype,
+    source_device_type: str,
+    *,
+    audio_shape: tuple[int, int, int] | None = None,
+    audio_dtype: torch.dtype | None = None,
+    audio_device_type: str | None = None,
+    existing_pending_bytes: int = 0,
+) -> dict[str, int | str]:
+    frames, height, width, channels = (int(item) for item in video_shape)
+    target_height, target_width = _bounded_analysis_size(height, width)
+    source_video_bytes = frames * height * width * channels * _dtype_bytes(
+        video_dtype
+    )
+    source_rgb_bytes_per_frame = height * width * 3 * _dtype_bytes(video_dtype)
+    retained_video_bytes = frames * target_height * target_width * 3 * 2
+    resize_required = (height, width) != (target_height, target_width)
+    conversion_bytes_per_frame = height * width * 3 * _dtype_bytes(
+        torch.float32 if resize_required else video_dtype
+    )
+    interpolation_bytes_per_frame = (
+        target_height * target_width * 3 * _dtype_bytes(torch.float32)
+        if resize_required
+        else 0
+    )
+    transfer_bytes_per_frame = (
+        target_height * target_width * 3 * _dtype_bytes(torch.float16)
+        if source_device_type != "cpu"
+        else 0
+    )
+    # Area interpolation has an explicit output plus backend-dependent scratch.
+    # Reserve one additional output-sized allowance for that hidden workspace.
+    algorithmic_bytes_per_frame = interpolation_bytes_per_frame
+    allocated_per_frame = (
+        conversion_bytes_per_frame
+        + interpolation_bytes_per_frame
+        + transfer_bytes_per_frame
+        + algorithmic_bytes_per_frame
+    )
+    chunk_frames = min(
+        frames,
+        SEQUENTIAL_STAGE_CHUNK_FRAMES,
+        max(
+            1,
+            SEQUENTIAL_STAGE_WORKSPACE_TARGET_BYTES
+            // max(1, allocated_per_frame),
+        ),
+    )
+    max_source_chunk_bytes = source_rgb_bytes_per_frame * chunk_frames
+    # max_source_chunk_bytes describes the borrowed view into the decoded input.
+    # It is logged as live data but is not counted as a Spectrum allocation.
+    conversion_workspace_bytes = conversion_bytes_per_frame * chunk_frames
+    interpolation_output_bytes = interpolation_bytes_per_frame * chunk_frames
+    cpu_transfer_workspace_bytes = transfer_bytes_per_frame * chunk_frames
+    algorithmic_workspace_bytes = algorithmic_bytes_per_frame * chunk_frames
+    video_workspace_bytes = allocated_per_frame * chunk_frames
+
+    source_audio_bytes = 0
+    retained_audio_bytes = 0
+    audio_workspace_bytes = 0
+    audio_chunk_samples = 0
+    audio_source_host_bytes = 0
+    audio_source_device_bytes = 0
+    if audio_shape is not None:
+        assert audio_dtype is not None
+        batch, audio_channels, samples = (int(item) for item in audio_shape)
+        source_audio_bytes = (
+            batch * audio_channels * samples * _dtype_bytes(audio_dtype)
+        )
+        retained_audio_bytes = batch * audio_channels * samples * _dtype_bytes(
+            torch.float32
+        )
+        bytes_per_output_sample = batch * audio_channels * _dtype_bytes(
+            torch.float32
+        )
+        audio_chunk_samples = min(
+            samples,
+            max(
+                1,
+                SEQUENTIAL_AUDIO_WORKSPACE_TARGET_BYTES
+                // max(1, bytes_per_output_sample),
+            ),
+        )
+        if audio_device_type != "cpu":
+            audio_workspace_bytes = audio_chunk_samples * bytes_per_output_sample
+        if audio_device_type == "cpu":
+            audio_source_host_bytes = source_audio_bytes
+        else:
+            audio_source_device_bytes = source_audio_bytes
+
+    retained_analysis_bytes = retained_video_bytes + retained_audio_bytes
+    source_video_host_bytes = source_video_bytes if source_device_type == "cpu" else 0
+    host_video_workspace_bytes = (
+        video_workspace_bytes
+        if source_device_type == "cpu"
+        else cpu_transfer_workspace_bytes
+    )
+    device_video_workspace_bytes = (
+        0
+        if source_device_type == "cpu"
+        else video_workspace_bytes - cpu_transfer_workspace_bytes
+    )
+    staging_workspace_estimate = max(
+        host_video_workspace_bytes + device_video_workspace_bytes,
+        audio_workspace_bytes,
+    )
+    host_staging_workspace_bytes = max(
+        host_video_workspace_bytes,
+        audio_workspace_bytes,
+    )
+    host_incremental_required_bytes = (
+        retained_analysis_bytes
+        + host_staging_workspace_bytes
+        + SEQUENTIAL_HOST_SAFETY_MARGIN_BYTES
+    )
+    estimated_host_live_bytes = (
+        source_video_host_bytes
+        + audio_source_host_bytes
+        + int(existing_pending_bytes)
+        + retained_analysis_bytes
+        + host_staging_workspace_bytes
+        + SEQUENTIAL_HOST_SAFETY_MARGIN_BYTES
+    )
+    estimated_device_live_bytes = (
+        (source_video_bytes if source_device_type != "cpu" else 0)
+        + audio_source_device_bytes
+        + device_video_workspace_bytes
+        + (
+            SEQUENTIAL_CUDA_SAFETY_MARGIN_BYTES
+            if source_device_type == "cuda" or audio_device_type == "cuda"
+            else 0
+        )
+    )
+    return {
+        "source_device_type": source_device_type,
+        "uses_cuda": int(
+            source_device_type == "cuda" or audio_device_type == "cuda"
+        ),
+        "source_tensor_bytes": source_video_bytes,
+        "source_audio_bytes": source_audio_bytes,
+        "retained_video_bytes": retained_video_bytes,
+        "retained_audio_bytes": retained_audio_bytes,
+        "retained_analysis_bytes": retained_analysis_bytes,
+        "existing_pending_bytes": int(existing_pending_bytes),
+        "chunk_frames": chunk_frames,
+        "max_source_chunk_bytes": max_source_chunk_bytes,
+        "float32_conversion_workspace_bytes": conversion_workspace_bytes,
+        "interpolation_output_workspace_bytes": interpolation_output_bytes,
+        "cpu_transfer_workspace_bytes": cpu_transfer_workspace_bytes,
+        "algorithmic_workspace_bytes": algorithmic_workspace_bytes,
+        "staging_workspace_estimate": staging_workspace_estimate,
+        "host_staging_workspace_bytes": host_staging_workspace_bytes,
+        "device_staging_workspace_bytes": device_video_workspace_bytes,
+        "audio_staging_workspace_bytes": audio_workspace_bytes,
+        "audio_chunk_samples": audio_chunk_samples,
+        "host_safety_margin_bytes": SEQUENTIAL_HOST_SAFETY_MARGIN_BYTES,
+        "cuda_safety_margin_bytes": (
+            SEQUENTIAL_CUDA_SAFETY_MARGIN_BYTES
+            if source_device_type == "cuda" or audio_device_type == "cuda"
+            else 0
+        ),
+        "host_incremental_required_bytes": host_incremental_required_bytes,
+        "estimated_host_live_bytes": estimated_host_live_bytes,
+        "estimated_device_live_bytes": estimated_device_live_bytes,
+        "target_height": target_height,
+        "target_width": target_width,
+    }
+
+
+def _estimate_sequential_memory(
+    video: torch.Tensor,
+    audio: Any,
+    *,
+    existing_pending_bytes: int,
+) -> dict[str, int | str]:
+    waveform = _audio_source(audio)
+    return _memory_estimate_for_shapes(
+        tuple(int(item) for item in video.shape),
+        video.dtype,
+        video.device.type,
+        audio_shape=(
+            None
+            if waveform is None
+            else tuple(int(item) for item in waveform.shape)
+        ),
+        audio_dtype=None if waveform is None else waveform.dtype,
+        audio_device_type=None if waveform is None else waveform.device.type,
+        existing_pending_bytes=existing_pending_bytes,
+    )
+
+
+def _preflight_error(
+    reason: str,
+    estimate: dict[str, int | str],
+    snapshot: dict[str, int | None],
+) -> ObjectiveMediaError:
+    return ObjectiveMediaError(
+        "Objective sequential capture aborted before staging:\n"
+        f"reason: {reason}\n"
+        f"source decoded video (already owned): "
+        f"{_format_bytes(int(estimate['source_tensor_bytes']))}\n"
+        f"source audio (already owned): "
+        f"{_format_bytes(int(estimate['source_audio_bytes']))}\n"
+        f"retained analysis destination: "
+        f"{_format_bytes(int(estimate['retained_analysis_bytes']))}\n"
+        f"estimated staging workspace: "
+        f"{_format_bytes(int(estimate['staging_workspace_estimate']))}\n"
+        f"existing pending captures: "
+        f"{_format_bytes(int(estimate['existing_pending_bytes']))}\n"
+        f"estimated host live requirement: "
+        f"{_format_bytes(int(estimate['estimated_host_live_bytes']))}\n"
+        f"host incremental requirement including safety margin: "
+        f"{_format_bytes(int(estimate['host_incremental_required_bytes']))}\n"
+        f"process RSS: {_format_bytes(snapshot['rss_bytes'])}\n"
+        f"available host RAM: {_format_bytes(snapshot['available_host_bytes'])}\n"
+        f"estimated device live requirement: "
+        f"{_format_bytes(int(estimate['estimated_device_live_bytes']))}\n"
+        f"CUDA free: {_format_bytes(snapshot['cuda_free_bytes'])}"
+    )
+
+
+def _validate_memory_preflight(
+    estimate: dict[str, int | str],
+    snapshot: dict[str, int | None],
+    *,
+    current_benchmark_bytes: int,
+) -> None:
+    retained_bytes = int(estimate["retained_analysis_bytes"])
+    if retained_bytes > MAX_PENDING_BYTES:
+        raise _preflight_error(
+            "one retained analysis capture exceeds the sequential RAM limit "
+            "(MAX_PENDING_BYTES)",
+            estimate,
+            snapshot,
+        )
+    if current_benchmark_bytes + retained_bytes > MAX_PENDING_BYTES:
+        raise _preflight_error(
+            "the current benchmark cannot retain this role within MAX_PENDING_BYTES",
+            estimate,
+            snapshot,
+        )
+    host_incremental = int(estimate["host_incremental_required_bytes"])
+    available_host = snapshot["available_host_bytes"]
+    if available_host is not None and host_incremental > available_host:
+        raise _preflight_error(
+            "estimated new host allocation plus safety margin exceeds available RAM",
+            estimate,
+            snapshot,
+        )
+    if (
+        available_host is None
+        and host_incremental > SEQUENTIAL_UNMEASURED_INCREMENTAL_LIMIT_BYTES
+    ):
+        raise _preflight_error(
+            "host RAM telemetry is unavailable and the conservative absolute "
+            "incremental limit would be exceeded",
+            estimate,
+            snapshot,
+        )
+    if bool(estimate["uses_cuda"]):
+        cuda_free = snapshot["cuda_free_bytes"]
+        cuda_reserved = snapshot["cuda_reserved_bytes"]
+        cuda_allocated = snapshot["cuda_allocated_bytes"]
+        reusable_reserved = (
+            max(0, cuda_reserved - cuda_allocated)
+            if cuda_reserved is not None and cuda_allocated is not None
+            else 0
+        )
+        cuda_required = (
+            int(estimate["device_staging_workspace_bytes"])
+            + SEQUENTIAL_CUDA_SAFETY_MARGIN_BYTES
+        )
+        if cuda_free is not None and cuda_required > cuda_free + reusable_reserved:
+            raise _preflight_error(
+                "estimated CUDA staging workspace plus safety margin exceeds "
+                "CUDA allocator headroom",
+                estimate,
+                snapshot,
+            )
+
+
+def _validated_min_max(
+    chunk: torch.Tensor,
+    *,
+    name: str,
+) -> tuple[float, float]:
+    minimum, maximum = torch.aminmax(chunk)
+    bounds = torch.stack((minimum, maximum)).detach().to(device="cpu")
+    if not bool(torch.isfinite(bounds).all().item()):
+        raise ObjectiveMediaError(f"{name} contains NaN or infinite values")
+    return float(bounds[0].item()), float(bounds[1].item())
+
+
+def _stage_audio_sequential(
+    audio: Any,
+    *,
+    estimate: dict[str, int | str],
+    benchmark_id: str,
+    role: str,
+    started: float,
+) -> dict[str, Any] | None:
+    waveform = _audio_source(audio)
+    if waveform is None:
+        return None
+    destination_bytes = int(estimate["retained_audio_bytes"])
+    _capture_log(
+        "audio_destination_allocation_start",
+        started=started,
+        benchmark=benchmark_id,
+        role=role,
+        bytes=_format_bytes(destination_bytes),
+    )
+    staged_waveform = torch.empty(
+        tuple(int(item) for item in waveform.shape),
+        dtype=torch.float32,
+        device="cpu",
+    )
+    _capture_log(
+        "audio_destination_allocation_end",
+        started=started,
+        benchmark=benchmark_id,
+        role=role,
+        bytes=_format_bytes(destination_bytes),
+    )
+    chunk_samples = int(estimate["audio_chunk_samples"])
+    samples = int(waveform.shape[-1])
+    for chunk_index, start_sample in enumerate(
+        range(0, samples, chunk_samples),
+        start=1,
+    ):
+        end_sample = min(samples, start_sample + chunk_samples)
+        source_chunk = waveform[..., start_sample:end_sample].detach()
+        operation_started = time.perf_counter()
+        _capture_log(
+            "audio_validation_start",
+            started=started,
+            detail=True,
+            benchmark=benchmark_id,
+            role=role,
+            chunk=chunk_index,
+            samples=f"{start_sample}:{end_sample}",
+        )
+        _validated_min_max(source_chunk, name="audio.waveform")
+        _capture_log(
+            "audio_validation_end",
+            started=started,
+            detail=True,
+            benchmark=benchmark_id,
+            role=role,
+            chunk=chunk_index,
+            operation_seconds=f"{time.perf_counter() - operation_started:.3f}",
+        )
+        destination = staged_waveform[..., start_sample:end_sample]
+        operation_started = time.perf_counter()
+        if waveform.device.type == "cpu":
+            _capture_log(
+                "audio_cpu_transfer_skipped",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+                source_device=waveform.device,
+            )
+            _capture_log(
+                "audio_destination_copy_start",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+            )
+            destination.copy_(source_chunk)
+            _capture_log(
+                "audio_destination_copy_end",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+                operation_seconds=f"{time.perf_counter() - operation_started:.3f}",
+            )
+        else:
+            _capture_log(
+                "audio_cpu_transfer_start",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+                source_device=waveform.device,
+            )
+            transferred = torch.empty(
+                tuple(int(item) for item in source_chunk.shape),
+                dtype=torch.float32,
+                device="cpu",
+            )
+            transferred.copy_(source_chunk)
+            _capture_log(
+                "audio_cpu_transfer_end",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+                operation_seconds=f"{time.perf_counter() - operation_started:.3f}",
+            )
+            operation_started = time.perf_counter()
+            _capture_log(
+                "audio_destination_copy_start",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+            )
+            destination.copy_(transferred)
+            del transferred
+            _capture_log(
+                "audio_destination_copy_end",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+                operation_seconds=f"{time.perf_counter() - operation_started:.3f}",
+            )
+        del destination, source_chunk
+    return {
+        "waveform": staged_waveform,
+        "sample_rate": int(audio["sample_rate"]),
     }
 
 
 def _stage_media_sequential(
     video: Any,
     audio: Any = None,
+    *,
+    benchmark_id: str = "direct",
+    role: str = "unknown",
+    estimate: dict[str, int | str] | None = None,
+    capture_started: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     topology = _source_topology(video, audio)
     source_metadata = _source_video_metadata(video)
     frames = source_metadata["frame_count"]
-    target_height, target_width = _bounded_analysis_size(
-        source_metadata["height"],
-        source_metadata["width"],
+    if estimate is None:
+        estimate = _estimate_sequential_memory(
+            video,
+            audio,
+            existing_pending_bytes=0,
+        )
+    target_height = int(estimate["target_height"])
+    target_width = int(estimate["target_width"])
+    chunk_frames = int(estimate["chunk_frames"])
+    started = time.perf_counter() if capture_started is None else capture_started
+    stage_started = time.perf_counter()
+    _capture_log(
+        "video_destination_allocation_start",
+        started=started,
+        benchmark=benchmark_id,
+        role=role,
+        shape=f"{frames}x{target_height}x{target_width}x3",
+        dtype=torch.float16,
+        bytes=_format_bytes(int(estimate["retained_video_bytes"])),
     )
     staged_video = torch.empty(
         (frames, target_height, target_width, 3),
         dtype=torch.float16,
         device="cpu",
     )
-    started = time.perf_counter()
-    for start in range(0, frames, SEQUENTIAL_STAGE_CHUNK_FRAMES):
-        end = min(frames, start + SEQUENTIAL_STAGE_CHUNK_FRAMES)
-        chunk = video[start:end, ..., :3].detach()
-        if not torch.isfinite(chunk).all():
-            raise ObjectiveMediaError("video contains NaN or infinite values")
-        minimum = float(chunk.min().detach().cpu().item())
-        maximum = float(chunk.max().detach().cpu().item())
-        if minimum < -1.0e-4 or maximum > 1.0001:
-            raise ObjectiveMediaError(
-                "IMAGE values must be in the decoded ComfyUI [0, 1] range"
-            )
-        nchw = chunk.clamp(0.0, 1.0).movedim(-1, 1)
-        if (
-            int(nchw.shape[-2]) != target_height
-            or int(nchw.shape[-1]) != target_width
+    _capture_log(
+        "video_destination_allocation_end",
+        started=started,
+        benchmark=benchmark_id,
+        role=role,
+        rss=_format_bytes(_process_rss_bytes()),
+    )
+    try:
+        for chunk_index, start in enumerate(
+            range(0, frames, chunk_frames),
+            start=1,
         ):
-            nchw = F.interpolate(
-                nchw.to(dtype=torch.float32),
-                size=(target_height, target_width),
-                mode="area",
+            end = min(frames, start + chunk_frames)
+            source_chunk = video[start:end, ..., :3].detach()
+            operation_started = time.perf_counter()
+            _capture_log(
+                "chunk_validation_start",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+                frames=f"{start}:{end}",
             )
-        staged_video[start:end].copy_(
-            nchw.movedim(1, -1).to(
-                device="cpu",
-                dtype=torch.float16,
+            minimum, maximum = _validated_min_max(source_chunk, name="video")
+            if minimum < -1.0e-4 or maximum > 1.0001:
+                raise ObjectiveMediaError(
+                    "IMAGE values must be in the decoded ComfyUI [0, 1] range"
+                )
+            _capture_log(
+                "chunk_validation_end",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+                minimum=f"{minimum:.6g}",
+                maximum=f"{maximum:.6g}",
+                operation_seconds=f"{time.perf_counter() - operation_started:.3f}",
             )
+
+            operation_started = time.perf_counter()
+            _capture_log(
+                "chunk_resize_start",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+                source=f"{source_metadata['width']}x{source_metadata['height']}",
+                target=f"{target_width}x{target_height}",
+            )
+            work_dtype = (
+                torch.float32
+                if (source_metadata["height"], source_metadata["width"])
+                != (target_height, target_width)
+                else video.dtype
+            )
+            work = torch.empty(
+                (end - start, 3, source_metadata["height"], source_metadata["width"]),
+                dtype=work_dtype,
+                device=video.device,
+            )
+            work.copy_(source_chunk.movedim(-1, 1))
+            work.clamp_(0.0, 1.0)
+            if (
+                source_metadata["height"] != target_height
+                or source_metadata["width"] != target_width
+            ):
+                resized = F.interpolate(
+                    work,
+                    size=(target_height, target_width),
+                    mode="area",
+                )
+                del work
+            else:
+                resized = work
+            del source_chunk
+            _capture_log(
+                "chunk_resize_end",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+                operation_seconds=f"{time.perf_counter() - operation_started:.3f}",
+            )
+
+            destination = staged_video[start:end]
+            if video.device.type == "cpu":
+                _capture_log(
+                    "chunk_cpu_transfer_skipped",
+                    started=started,
+                    detail=True,
+                    benchmark=benchmark_id,
+                    role=role,
+                    chunk=chunk_index,
+                    source_device=video.device,
+                )
+                transfer_output = resized.movedim(1, -1)
+            else:
+                operation_started = time.perf_counter()
+                _capture_log(
+                    "chunk_cpu_transfer_start",
+                    started=started,
+                    detail=True,
+                    benchmark=benchmark_id,
+                    role=role,
+                    chunk=chunk_index,
+                    source_device=video.device,
+                )
+                transfer_output = torch.empty(
+                    (end - start, target_height, target_width, 3),
+                    dtype=torch.float16,
+                    device="cpu",
+                )
+                transfer_output.copy_(resized.movedim(1, -1))
+                _capture_log(
+                    "chunk_cpu_transfer_end",
+                    started=started,
+                    detail=True,
+                    benchmark=benchmark_id,
+                    role=role,
+                    chunk=chunk_index,
+                    operation_seconds=(
+                        f"{time.perf_counter() - operation_started:.3f}"
+                    ),
+                )
+            del resized
+
+            operation_started = time.perf_counter()
+            _capture_log(
+                "chunk_destination_copy_start",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+            )
+            destination.copy_(transfer_output)
+            del transfer_output, destination
+            _capture_log(
+                "chunk_destination_copy_end",
+                started=started,
+                detail=True,
+                benchmark=benchmark_id,
+                role=role,
+                chunk=chunk_index,
+                operation_seconds=f"{time.perf_counter() - operation_started:.3f}",
+            )
+
+        staged_audio = _stage_audio_sequential(
+            audio,
+            estimate=estimate,
+            benchmark_id=benchmark_id,
+            role=role,
+            started=started,
         )
-    staged = {
-        "video": staged_video,
-        "audio": _stage_audio(audio),
-    }
+    except Exception:
+        _capture_log(
+            "staging_failed",
+            started=started,
+            benchmark=benchmark_id,
+            role=role,
+            rss=_format_bytes(_process_rss_bytes()),
+        )
+        del staged_video
+        raise
+
+    staged = {"video": staged_video, "audio": staged_audio}
     analysis_bytes = _media_nbytes(staged)
     source_metadata.update(
         {
@@ -312,9 +1068,22 @@ def _stage_media_sequential(
             "analysis_dtype": str(staged_video.dtype),
             "analysis_bytes": analysis_bytes,
             "analysis_profile": BOUNDED_PROFILE_NAME,
-            "stage_seconds": time.perf_counter() - started,
+            "stage_seconds": time.perf_counter() - stage_started,
             "source_topology": topology,
+            "stage_chunk_frames": chunk_frames,
+            "staging_workspace_estimate": int(
+                estimate["staging_workspace_estimate"]
+            ),
         }
+    )
+    _capture_log(
+        "staging_complete",
+        started=started,
+        benchmark=benchmark_id,
+        role=role,
+        staging_seconds=f"{time.perf_counter() - stage_started:.3f}",
+        retained_analysis_bytes=_format_bytes(analysis_bytes),
+        rss=_format_bytes(_process_rss_bytes()),
     )
     return staged, source_metadata
 
@@ -398,6 +1167,48 @@ def _evict_for_capture_locked(
         del _PENDING_CAPTURES[victim]
         evicted.append(victim)
     return evicted
+
+
+def _validate_existing_capture(
+    existing: dict[str, Any] | None,
+    *,
+    benchmark_key: str,
+    role_key: str,
+    fps_value: float,
+    seed_value: int,
+    canonical_provenance: str,
+    chunk_value: int,
+    source_topology: tuple[Any, ...],
+) -> None:
+    if existing is None:
+        return
+    if role_key in existing["roles"]:
+        raise ObjectiveMediaError(
+            f"benchmark {benchmark_key!r} already contains role "
+            f"{role_key}; set reset_before_capture=true to restart the triad"
+        )
+    if existing["fps"] != fps_value:
+        raise ObjectiveMediaError(
+            "R/A/B captures for one benchmark must use identical fps"
+        )
+    if existing["seed"] != seed_value:
+        raise ObjectiveMediaError(
+            "R/A/B captures for one benchmark must use identical generation_seed"
+        )
+    if existing["canonical_provenance"] != canonical_provenance:
+        raise ObjectiveMediaError(
+            "R/A/B captures for one benchmark must use identical steps and "
+            "compatibility_tag"
+        )
+    if existing["frame_chunk_size"] != chunk_value:
+        raise ObjectiveMediaError(
+            "R/A/B captures for one benchmark must use identical frame_chunk_size"
+        )
+    if existing["source_topology"] != source_topology:
+        raise ObjectiveMediaError(
+            "R/A/B captures for one benchmark must have matching decoded "
+            "source video/audio topology"
+        )
 
 
 def _summary_from_report(report: dict[str, Any], persisted) -> str:
@@ -493,6 +1304,7 @@ def _evaluate_and_persist_sequential(
     legacy_audio=None,
     candidate_audio=None,
 ) -> tuple[str, str, str, str, str]:
+    evaluator_started = time.perf_counter()
     report = evaluate_objective_media_bounded(
         reference_video,
         legacy_video,
@@ -507,7 +1319,32 @@ def _evaluate_and_persist_sequential(
         candidate_audio=candidate_audio,
         chunk_size=int(frame_chunk_size),
     )
-    return _persist_report(report)
+    LOG.warning(
+        "Spectrum H3 objective sequential report persistence start: "
+        "benchmark=%s evaluator_elapsed=%.3fs rss=%s",
+        benchmark_id,
+        time.perf_counter() - evaluator_started,
+        _format_bytes(_process_rss_bytes()),
+    )
+    persistence_started = time.perf_counter()
+    try:
+        result = _persist_report(report)
+    except Exception:
+        LOG.exception(
+            "Spectrum H3 objective sequential report persistence failed: "
+            "benchmark=%s elapsed=%.3fs",
+            benchmark_id,
+            time.perf_counter() - persistence_started,
+        )
+        raise
+    LOG.warning(
+        "Spectrum H3 objective sequential report persistence done: "
+        "benchmark=%s elapsed=%.3fs rss=%s",
+        benchmark_id,
+        time.perf_counter() - persistence_started,
+        _format_bytes(_process_rss_bytes()),
+    )
+    return result
 
 
 class SpectrumH3ObjectiveMediaStage:
@@ -813,6 +1650,14 @@ class SpectrumH3ObjectiveSequentialCapture:
         reset_before_capture=False,
         audio=None,
     ):
+        capture_started = time.perf_counter()
+        _capture_log(
+            "input_received",
+            started=capture_started,
+            benchmark=str(benchmark_id).strip() or "<empty>",
+            requested_role=role,
+            source_type=type(video).__name__,
+        )
         benchmark_key = str(benchmark_id).strip()
         if not benchmark_key:
             raise ObjectiveMediaError("benchmark_id must be non-empty")
@@ -826,53 +1671,191 @@ class SpectrumH3ObjectiveSequentialCapture:
         )
         canonical_provenance = _canonical_provenance(provenance)
         source_topology = _source_topology(video, audio)
-        staged, source_metadata = _stage_media_sequential(video, audio)
-        staged_bytes = _media_nbytes(staged)
         fps_value = float(fps)
         chunk_value = int(frame_chunk_size)
+        source_metadata = _source_video_metadata(video)
+        target_height, target_width = _bounded_analysis_size(
+            source_metadata["height"],
+            source_metadata["width"],
+        )
+        waveform = _audio_source(audio)
+        _capture_log(
+            "capture_start",
+            started=capture_started,
+            benchmark=benchmark_key,
+            role=role_key,
+            source_shape=tuple(int(item) for item in video.shape),
+            source_dtype=video.dtype,
+            source_device=video.device,
+            source_tensor_bytes=_format_bytes(
+                int(video.numel() * video.element_size())
+            ),
+            source_resolution=f"{source_metadata['width']}x{source_metadata['height']}",
+            frames=source_metadata["frame_count"],
+            target_analysis_shape=(
+                source_metadata["frame_count"],
+                target_height,
+                target_width,
+                3,
+            ),
+            target_analysis_dtype=torch.float16,
+            audio_shape=(
+                None
+                if waveform is None
+                else tuple(int(item) for item in waveform.shape)
+            ),
+            audio_dtype=None if waveform is None else waveform.dtype,
+            audio_device=None if waveform is None else waveform.device,
+        )
 
         completed: dict[str, Any] | None = None
         evicted: list[str] = []
+        staged: dict[str, Any] | None = None
+        pending: list[str] = []
+        total_gib = 0.0
+        # Serialize preflight, staging, and insertion so concurrent capture nodes
+        # cannot jointly exceed a preflight computed from stale pending state.
         with _PENDING_LOCK:
             if bool(reset_before_capture):
-                _PENDING_CAPTURES.pop(benchmark_key, None)
+                released = _PENDING_CAPTURES.pop(benchmark_key, None)
+                _capture_log(
+                    "reset_before_capture",
+                    started=capture_started,
+                    benchmark=benchmark_key,
+                    role=role_key,
+                    released_bytes=(
+                        _format_bytes(int(released["bytes"]))
+                        if released is not None
+                        else _format_bytes(0)
+                    ),
+                )
             existing = _PENDING_CAPTURES.get(benchmark_key)
-            if existing is not None:
-                if role_key in existing["roles"]:
-                    raise ObjectiveMediaError(
-                        f"benchmark {benchmark_key!r} already contains role "
-                        f"{role_key}; set reset_before_capture=true to restart "
-                        "the triad"
-                    )
-                if existing["fps"] != fps_value:
-                    raise ObjectiveMediaError(
-                        "R/A/B captures for one benchmark must use identical fps"
-                    )
-                if existing["seed"] != seed_value:
-                    raise ObjectiveMediaError(
-                        "R/A/B captures for one benchmark must use identical "
-                        "generation_seed"
-                    )
-                if existing["canonical_provenance"] != canonical_provenance:
-                    raise ObjectiveMediaError(
-                        "R/A/B captures for one benchmark must use identical "
-                        "steps and compatibility_tag"
-                    )
-                if existing["frame_chunk_size"] != chunk_value:
-                    raise ObjectiveMediaError(
-                        "R/A/B captures for one benchmark must use identical "
-                        "frame_chunk_size"
-                    )
-                if existing["source_topology"] != source_topology:
-                    raise ObjectiveMediaError(
-                        "R/A/B captures for one benchmark must have matching "
-                        "decoded source video/audio topology"
-                    )
+            _validate_existing_capture(
+                existing,
+                benchmark_key=benchmark_key,
+                role_key=role_key,
+                fps_value=fps_value,
+                seed_value=seed_value,
+                canonical_provenance=canonical_provenance,
+                chunk_value=chunk_value,
+                source_topology=source_topology,
+            )
+            existing_pending_bytes = _pending_bytes_locked()
+            estimate = _estimate_sequential_memory(
+                video,
+                audio,
+                existing_pending_bytes=existing_pending_bytes,
+            )
+            telemetry_device = (
+                waveform.device
+                if video.device.type != "cuda"
+                and waveform is not None
+                and waveform.device.type == "cuda"
+                else video.device
+            )
+            snapshot = _memory_snapshot(telemetry_device)
+            projected_rss = (
+                None
+                if snapshot["rss_bytes"] is None
+                else snapshot["rss_bytes"]
+                + int(estimate["host_incremental_required_bytes"])
+            )
+            _capture_log(
+                "preflight",
+                started=capture_started,
+                benchmark=benchmark_key,
+                role=role_key,
+                retained_analysis_bytes=_format_bytes(
+                    int(estimate["retained_analysis_bytes"])
+                ),
+                destination_video_bytes=_format_bytes(
+                    int(estimate["retained_video_bytes"])
+                ),
+                destination_audio_bytes=_format_bytes(
+                    int(estimate["retained_audio_bytes"])
+                ),
+                max_source_chunk_bytes=_format_bytes(
+                    int(estimate["max_source_chunk_bytes"])
+                ),
+                float32_workspace=_format_bytes(
+                    int(estimate["float32_conversion_workspace_bytes"])
+                ),
+                interpolation_workspace=_format_bytes(
+                    int(estimate["interpolation_output_workspace_bytes"])
+                ),
+                cpu_transfer_workspace=_format_bytes(
+                    int(estimate["cpu_transfer_workspace_bytes"])
+                ),
+                algorithmic_workspace=_format_bytes(
+                    int(estimate["algorithmic_workspace_bytes"])
+                ),
+                staging_workspace_estimate=_format_bytes(
+                    int(estimate["staging_workspace_estimate"])
+                ),
+                existing_pending_bytes=_format_bytes(existing_pending_bytes),
+                estimated_host_live_bytes=_format_bytes(
+                    int(estimate["estimated_host_live_bytes"])
+                ),
+                host_incremental_required=_format_bytes(
+                    int(estimate["host_incremental_required_bytes"])
+                ),
+                rss=_format_bytes(snapshot["rss_bytes"]),
+                projected_rss=_format_bytes(projected_rss),
+                available_host_ram=_format_bytes(
+                    snapshot["available_host_bytes"]
+                ),
+                cuda_allocated=_format_bytes(snapshot["cuda_allocated_bytes"]),
+                cuda_reserved=_format_bytes(snapshot["cuda_reserved_bytes"]),
+                cuda_free=_format_bytes(snapshot["cuda_free_bytes"]),
+                chunk_frames=estimate["chunk_frames"],
+            )
+            try:
+                _validate_memory_preflight(
+                    estimate,
+                    snapshot,
+                    current_benchmark_bytes=(
+                        0 if existing is None else int(existing["bytes"])
+                    ),
+                )
+            except Exception:
+                _capture_log(
+                    "preflight_rejected",
+                    started=capture_started,
+                    benchmark=benchmark_key,
+                    role=role_key,
+                )
+                raise
+            _capture_log(
+                "preflight_passed",
+                started=capture_started,
+                benchmark=benchmark_key,
+                role=role_key,
+            )
+            staged, source_metadata = _stage_media_sequential(
+                video,
+                audio,
+                benchmark_id=benchmark_key,
+                role=role_key,
+                estimate=estimate,
+                capture_started=capture_started,
+            )
+            staged_bytes = _media_nbytes(staged)
+            if staged_bytes != int(estimate["retained_analysis_bytes"]):
+                raise ObjectiveMediaError(
+                    "internal sequential retained-byte estimate mismatch"
+                )
             creating = existing is None
             evicted = _evict_for_capture_locked(
                 benchmark_key,
                 staged_bytes,
                 creating=creating,
+            )
+            _capture_log(
+                "pending_store_start",
+                started=capture_started,
+                benchmark=benchmark_key,
+                role=role_key,
+                staged_bytes=_format_bytes(staged_bytes),
             )
             if existing is None:
                 existing = {
@@ -899,6 +1882,15 @@ class SpectrumH3ObjectiveSequentialCapture:
                     if key not in existing["roles"]
                 ]
                 total_gib = _pending_bytes_locked() / 1024**3
+            _capture_log(
+                "pending_store_end",
+                started=capture_started,
+                benchmark=benchmark_key,
+                role=role_key,
+                triad_complete=completed is not None,
+                pending_total=_format_bytes(_pending_bytes_locked()),
+                rss=_format_bytes(_process_rss_bytes()),
+            )
 
         for victim in evicted:
             LOG.warning(
@@ -906,6 +1898,7 @@ class SpectrumH3ObjectiveSequentialCapture:
                 "benchmark %s to stay within RAM bounds",
                 victim,
             )
+        del staged
 
         if completed is None:
             summary = (
@@ -924,6 +1917,13 @@ class SpectrumH3ObjectiveSequentialCapture:
         roles = completed["roles"]
         retained_gib = int(completed["bytes"]) / 1024**3
         metadata = completed["source_video_metadata"]
+        _capture_log(
+            "evaluation_start",
+            started=capture_started,
+            benchmark=benchmark_key,
+            retained=_format_bytes(int(completed["bytes"])),
+            rss=_format_bytes(_process_rss_bytes()),
+        )
         print(
             "Spectrum H3 objective sequential evaluation start: "
             f"benchmark={benchmark_key} source={metadata['width']}x"
@@ -932,7 +1932,7 @@ class SpectrumH3ObjectiveSequentialCapture:
             f"profile={BOUNDED_PROFILE_NAME}"
         )
         try:
-            return _evaluate_and_persist_sequential(
+            result = _evaluate_and_persist_sequential(
                 roles["R"]["video"],
                 roles["A"]["video"],
                 roles["B"]["video"],
@@ -946,7 +1946,23 @@ class SpectrumH3ObjectiveSequentialCapture:
                 legacy_audio=roles["A"].get("audio"),
                 candidate_audio=roles["B"].get("audio"),
             )
+            _capture_log(
+                "evaluation_end",
+                started=capture_started,
+                benchmark=benchmark_key,
+                rss=_format_bytes(_process_rss_bytes()),
+            )
+            return result
+        except Exception:
+            _capture_log(
+                "evaluation_failed",
+                started=capture_started,
+                benchmark=benchmark_key,
+                rss=_format_bytes(_process_rss_bytes()),
+            )
+            raise
         finally:
+            roles.clear()
             completed.clear()
 
 
