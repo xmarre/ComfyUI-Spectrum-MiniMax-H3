@@ -825,7 +825,7 @@ class SpectrumH3Runtime:
                 transition_logger=self.log_offline_transition,
             )
             self._record_offline_smoother_stats()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - completed first pass is the fallback boundary
             archive.invalidate(f"offline smoother construction failed: {exc}")
             self._offline_smoother = None
             self.log_offline_transition(

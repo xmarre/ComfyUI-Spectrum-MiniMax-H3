@@ -435,7 +435,7 @@ def outer_sample_wrapper(
         )
         try:
             capture_complete = runtime.complete_offline_capture()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - preserve completed first-pass output
             archive = runtime.offline_archive
             if archive is not None:
                 archive.invalidate(f"offline capture completion failed: {exc}")
@@ -466,7 +466,7 @@ def outer_sample_wrapper(
 
         try:
             runtime.begin_offline_replay()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - preserve completed first-pass output
             runtime.log_offline_transition(
                 "begin_offline_replay_failed",
                 error_type=type(exc).__name__,
