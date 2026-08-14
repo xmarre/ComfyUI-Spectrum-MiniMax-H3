@@ -1,7 +1,6 @@
 # Objective decoded-media benchmark
 
-This research tool compares two accelerated MiniMax H3 outputs against the same
-full-compute native result after video and audio decoding:
+This research benchmark compares two accelerated MiniMax H3 outputs against the same full-compute native decoded result:
 
 ```text
 R = native MiniMax H3, Spectrum bypassed
@@ -9,25 +8,20 @@ A = accelerated legacy Spectrum
 B = accelerated correction candidate
 ```
 
-Native H3 is the full-reference target for this acceleration-preservation
-question. Hidden-feature forecast accuracy and decoded-media fidelity remain
-separate evidence layers.
+The benchmark operates on decoded IMAGE/AUDIO before video encoding or audio muxing. Native H3 is the full-reference target for the acceleration-preservation question.
 
-## Recommended workflow: one side-branch node, three normal runs
+## Recommended workflow
 
-For ordinary testing, use only:
+Use:
 
 ```text
-Spectrum H3 Objective Media Capture (Sequential - Recommended)
+Spectrum H3 Objective Media Capture (Sequential - Bounded)
 ```
 
-The capture node is a measurement side branch. The existing Video Combine keeps
-receiving both decoded IMAGE and decoded AUDIO exactly as before. Fan those same
-two outputs out to the capture node as well, and feed the capture node from the
-same fixed INT seed output that already drives generation:
+Keep the existing Video Combine exactly as it is and fan the same decoded outputs to the capture node:
 
 ```text
-fixed seed INT ──────┬────> generation workflow seed input(s)
+fixed seed INT ──────┬────> generation seed input(s)
                      └────> Objective Media Capture [generation_seed]
 
                      ┌────> Video Combine [images]
@@ -39,193 +33,114 @@ decoded AUDIO ───────┤
                      └────> Objective Media Capture [audio]
 ```
 
-`Video Combine [images]` and `Video Combine [audio]` above are the two input
-sockets of the **same existing Video Combine node**. The capture node does not
-replace Video Combine and does not output media for Video Combine.
+`Video Combine [images]` and `Video Combine [audio]` are sockets on the same existing Video Combine node.
 
-Run the same normal workflow three times. Keep `benchmark_id`, the linked fixed
-seed, FPS, steps, `compatibility_tag`, prompt, model, resolution, decoders, and
-all other non-Spectrum generation settings unchanged. Change the capture role
-and Spectrum configuration for each run:
+Run the same workflow three times with one `benchmark_id` and the same linked seed:
 
 ```text
-run 1: role = R - native reference
-run 2: role = A - legacy Spectrum
-run 3: role = B - candidate
+R: role = R - native reference
+   Spectrum bypassed
+
+A: role = A - legacy Spectrum
+   model_aware_mode = full
+   generic_correction_mode = legacy
+   generic_correction_attenuation = mode_default
+   generic_correction_limiter = rational
+   generic_correction_limit = 0.25
+   offline_smoothing_replay = false
+   model_aware_trust_shrinkage = false
+   model_aware_replay_generic_correction = false
+
+B: role = B - candidate
+   model_aware_mode = full
+   generic_correction_mode = coordinate_rls
+   generic_correction_attenuation = no_attenuation
+   generic_correction_limiter = hard_clip
+   generic_correction_limit = 0.40
+   offline_smoothing_replay = false
+   model_aware_trust_shrinkage = false
+   model_aware_replay_generic_correction = false
 ```
 
-The order does not matter. Each incomplete role is moved to CPU RAM and retained
-only in the current ComfyUI Python process. When the third compatible role
-arrives, the node automatically runs the objective evaluator, writes bounded
-JSON/Markdown reports, prints the summary, and releases all raw R/A/B tensors.
-Raw video/audio is never written to disk by the evaluator.
+Keep prompt/conditioning, model and weights, precision, resolution, duration/frame count, FPS, sampler/scheduler, steps, VAE/audio decoder, and other non-Spectrum generation settings identical.
 
-The node is an `OUTPUT_NODE`, so it runs as part of each ordinary queued
-generation. No three-branch generation graph is required.
+## Sequential capture memory/performance design
 
-### Sequential node controls
+The original sequential implementation retained the complete decoded R/A/B IMAGE tensors in process CPU RAM and then ran the full-resolution dense structural evaluator synchronously when the third role arrived. That design was unsafe for real H3 video sizes: it could hold several GiB of decoded float media while starting a CPU- and memory-bandwidth-heavy SSIM/MS-SSIM pass.
 
-- `role`: `R - native reference`, `A - legacy Spectrum`, or `B - candidate`.
-- `fps`: actual output FPS; keep fixed across the triad.
-- `benchmark_id`: one unique identifier for the triad; keep fixed across R/A/B.
-- `generation_seed`: required **INT connection**. Connect the exact same fixed
-  seed output that drives the generation workflow. The benchmark node owns no
-  separate seed value and exposes no `control_after_generate` randomizer.
-- `steps`: native sampler step count, normally 20 for the current ER-SDE gate.
-- `compatibility_tag`: short user assertion identifying the unchanged
-  model/weights/precision/scheduler/conditioning/VAE/audio-decoder setup. Keep it
-  fixed across compatible seeds and change it when those generation settings
-  change.
-- `frame_chunk_size`: CPU evaluator chunk size.
-- `reset_before_capture`: clear an incomplete triad with this benchmark ID
-  before storing the current role.
+The recommended sequential node no longer retains full decoded video.
 
-The recommended sequential node intentionally has no multiline
-`provenance_json` field. It creates valid R/A/B provenance automatically from
-`steps`, `compatibility_tag`, and the fixed controller-role definitions. The
-result records that compatibility as user-asserted rather than pretending the
-capture node can inspect every upstream model-loader setting.
+At the end of each role it immediately constructs a deterministic bounded analysis representation:
 
-A duplicate role for the same incomplete benchmark is rejected unless
-`reset_before_capture=true`. R/A/B captures for one benchmark must have matching
-FPS, generation seed, steps, compatibility tag, frame chunk size, decoded video
-topology, and audio presence/channel topology.
+- source frame count is preserved;
+- source topology/resolution is recorded and still used for compatibility checks;
+- RGB is deterministically downscaled only when necessary to at most 393,216 analysis pixels per frame;
+- retained analysis video is CPU `float16`;
+- staging is performed in small frame chunks;
+- AUDIO is retained on CPU as float32;
+- full-resolution decoded IMAGE is released with the normal ComfyUI execution after the capture node returns;
+- raw video/audio is never persisted to disk by the benchmark.
 
-Incomplete capture memory is bounded to three benchmark IDs and 12 GiB total.
-Old incomplete benchmark IDs may be evicted with a warning to stay inside the
-bound. `Spectrum H3 Objective Media Capture Reset` can release one incomplete
-benchmark or all captures explicitly. Restarting ComfyUI also clears incomplete
-captures.
+Incomplete sequential state is bounded to 2 benchmark IDs and 4 GiB total analysis RAM. Old incomplete IDs may be evicted with a warning if required by the bound. Restarting ComfyUI clears incomplete captures. `Spectrum H3 Objective Media Capture Reset` can clear one pending benchmark or all pending captures explicitly.
 
-## Exact R/A/B Spectrum settings
-
-All three roles must otherwise use the same input and generation settings.
+When the third compatible role arrives, the node evaluates only the bounded analysis surfaces. The sequential video profile is versioned as:
 
 ```text
-R native
-  Spectrum bypassed; every transformer step is native
-
-A legacy
-  model_aware_mode = full
-  generic_correction_mode = legacy
-  generic_correction_attenuation = mode_default
-  generic_correction_limiter = rational
-  generic_correction_limit = 0.25
-  offline_smoothing_replay = false
-  model_aware_trust_shrinkage = false
-  model_aware_replay_generic_correction = false
-
-B candidate
-  model_aware_mode = full
-  generic_correction_mode = coordinate_rls
-  generic_correction_attenuation = no_attenuation
-  generic_correction_limiter = hard_clip
-  generic_correction_limit = 0.40
-  offline_smoothing_replay = false
-  model_aware_trust_shrinkage = false
-  model_aware_replay_generic_correction = false
+sequential_bounded_luma_block_ssim_v1
 ```
 
-The evaluator rejects frame-count, resolution, channel-count, and material
-audio-duration mismatches. Audio is deterministically resampled to the native
-reference rate only when sample rates differ. Channel-count mismatches are
-rejected; the core evaluator never silently downmixes.
+It uses bounded luma block-SSIM/MS-SSIM, RGB PSNR as a diagnostic, luma temporal-derivative error, global luma Laplacian detail error, and native-motion-weighted luma detail error. The same documented comparison/verdict/temporal-bootstrap machinery is reused. AUDIO retains the existing MR-STFT, normalized-correlation, SI-SDR and bounded-lag panel.
 
-## One-shot alternatives
+The evaluator prints explicit VIDEO/AUDIO start/end timings so any future slow point is visible in the console instead of appearing as a silent post-generation stall.
 
-The research category retains the original one-shot nodes for workflows that
-intentionally produce all three roles in the same ComfyUI execution:
+Bounded-profile reports are compatibility-isolated from the older full-resolution objective profile. They must not be numerically mixed as if they were the same metric implementation.
 
-```text
-Spectrum H3 Objective Media Stage (One-Shot)
-Spectrum H3 Objective Quality Compare (One-Shot)
-Spectrum H3 Objective Quality Compare (Staged One-Shot)
-```
+## Controls
 
-The staged one-shot form requires three separate Media Stage nodes:
+- `role`: R, A, or B.
+- `fps`: actual output FPS; identical across the triad.
+- `benchmark_id`: unique ID for one triad; identical across R/A/B.
+- `generation_seed`: required link-only INT. Connect the exact same fixed seed source that drives generation. The capture node owns no independent seed widget and no `control_after_generate` state.
+- `steps`: generation step count.
+- `compatibility_tag`: short identifier for the unchanged model/precision/scheduler/conditioning/decoder setup.
+- `frame_chunk_size`: bounded evaluator frame chunk size.
+- `reset_before_capture`: restart this incomplete benchmark before storing the current role.
 
-```text
-R IMAGE/AUDIO -> Media Stage R -> reference_media ┐
-A IMAGE/AUDIO -> Media Stage A -> legacy_media    ├-> Quality Compare (Staged One-Shot)
-B IMAGE/AUDIO -> Media Stage B -> candidate_media ┘
-```
+The third compatible role automatically evaluates, writes report files, prints the summary, and releases all retained R/A/B analysis tensors in a `finally` path.
 
-`staged_media` is only an internal CPU bundle for that one-shot comparator. It
-never connects to Video Combine. The original IMAGE/AUDIO outputs can fan out to
-both Video Combine and the research nodes.
+## Reports
 
-For normal R/A/B generation in three separate queue executions, use the
-sequential capture node instead.
-
-## VIDEO metrics
-
-All metrics compare A to R and B to R.
-
-| Metric | Direction | Purpose |
-|---|---:|---|
-| SSIM | higher | Single-scale local luminance/contrast/structure diagnostic. |
-| MS-SSIM | higher | Primary multiscale structural-fidelity signal. |
-| PSNR dB | higher | Pixel-error diagnostic only. |
-| Temporal derivative error | lower | Three-scale error on frame-to-frame changes; exposes freezes, jitter, overshoot, and wrong motion. |
-| Global Laplacian detail error | lower | High-frequency spatial-detail difference. |
-| Motion-weighted detail error | lower | Detail error weighted by native-reference motion energy; emphasizes small moving-detail failures. |
-
-Video reports include aggregate, percentile, worst-frame, per-frame, and
-worst-window values. Paired uncertainty uses deterministic temporal block
-bootstrap rather than treating frames as independent samples.
-
-## AUDIO metrics
-
-Audio is scored on decoded waveforms before AAC/container muxing.
-
-| Metric | Direction | Purpose |
-|---|---:|---|
-| Multi-resolution log-STFT error | lower | Log-magnitude distance at FFT sizes 256/512/1024/2048. |
-| Windowed spectral error | lower | 0.5-second local spectral distance with start/middle/end and worst-window summaries. |
-| Normalized correlation | higher | Raw time-domain shape diagnostic. |
-| SI-SDR dB | higher | Scale-invariant reference-fidelity diagnostic. |
-| Bounded lag | diagnostic | ±20 ms correlation search; never changes primary unaligned scores. |
-
-## Verdict rule
-
-The evaluator does not collapse the panel into an undocumented weighted score.
-Primary metrics are:
-
-```text
-VIDEO: MS-SSIM, temporal derivative error, motion-weighted detail error
-AUDIO when present: multi-resolution STFT error
-```
-
-A role is favored only when at least one primary improves by 1% or more, no
-primary regresses by more than 2%, and the worst-frame/worst-window/lag
-guardrails do not regress by more than 5%. The verdict is
-`candidate_favored`, `legacy_favored`, or `mixed_or_inconclusive` and all raw
-metrics remain visible.
-
-## Optional backends
-
-The core evaluator depends only on PyTorch and never downloads weights or uses
-the network.
-
-- LPIPS package availability is reported, but pretrained weights are not fetched
-  automatically.
-- FFmpeg/libvmaf availability is reported; VMAF is not required for the in-memory
-  core evaluator.
-- ViSQOL availability is reported; it is not silently applied because its modes
-  require sample-rate/downmix transformations.
-
-Missing optional backends cannot prevent node registration or core evaluation.
-
-## Reports and retention
-
-Only JSON and Markdown reports are persisted under ComfyUI's internal user
-cache:
+Reports are stored under ComfyUI's internal cache:
 
 ```text
 __cache/spectrum_h3/objective_media/v1/
 ```
 
-Writes are atomic. Raw media is never persisted. Incomplete sequential captures
-exist only in bounded process CPU RAM. Compatible independent triads refresh an
-aggregate report; duplicate benchmark-ID/seed identities are not counted twice,
-and incompatible compatibility groups remain separate.
+A completed triad produces:
+
+```text
+report_json_path
+report_markdown_path
+aggregate_json_path
+aggregate_markdown_path
+```
+
+Only JSON/Markdown metrics and metadata are persisted. Raw media is never persisted.
+
+## One-shot full-media alternatives
+
+These remain research alternatives for a workflow that intentionally has all three roles available in one execution:
+
+```text
+Spectrum H3 Objective Media Stage (One-Shot / Full Media)
+Spectrum H3 Objective Quality Compare (One-Shot / Full Media)
+Spectrum H3 Objective Quality Compare (Staged One-Shot / Full Media)
+```
+
+They retain/evaluate full decoded media and are not the recommended path for normal sequential H3 testing.
+
+## Decision rule
+
+The benchmark does not collapse results into an undocumented weighted score. Primary metrics remain VIDEO structural/temporal/motion-detail fidelity and, when audio is present, MR-STFT error. The existing 1% material-improvement, 2% primary-regression, and 5% worst-case guardrail rules produce `candidate_favored`, `legacy_favored`, or `mixed_or_inconclusive`.
+
+Hidden-feature generic-correction reports and decoded-media reports remain separate evidence layers. A hidden-space improvement is not reported as the same thing as a decoded perceptual-quality improvement.
