@@ -174,6 +174,28 @@ preserves the existing ER-SDE seeded replay ownership rules.
 
 For native `sample_er_sde`, Spectrum still requires the native seeded noise components for replay and does not mutate generator/noise-sampler/solver-derivative state.
 
+Replay capture is intentionally a large-feature owner. For the native layout
+with 640 audio rows, 41,040 video rows, hidden width 5,376, and BF16 storage, a
+single retained branch anchor occupies 448,143,360 bytes (about 427.4 MiB).
+Archive memory therefore scales with the number of actual anchors and branches.
+The smoother's forecaster takes flattened views of those anchors; it does not
+clone a second full archive. The terminal first-pass anchor is not inserted into
+the causal forecaster because there is no later causal prediction to consume it.
+
+The first-pass executor now returns and its causal runtime is torn down before
+archive completion, smoother validation, or replay setup. Debug mode emits
+timestamped `offline transition` events around the final actual capture,
+finalization, archive ownership transfer, causal update, first-pass return,
+smoother attachment/validation/weight construction, and replay start. A model
+call log is a pre-execution marker; only `observe_actual_end` and
+`actual_executor_return` prove that the capture and wrapped executor returned.
+
+Archive completion, smoother construction, and replay setup are guarded by the
+completed first-pass result. Any exception in those stages invalidates/skips the
+replay archive and returns that valid result. With `model_aware_mode=off`, the
+generic-correction controller, calibration state, and post-run research path are
+not constructed.
+
 ## Performance/lifetime invariants
 
 Final model-aware runtime must preserve:

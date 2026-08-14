@@ -375,8 +375,8 @@ def test_debug_summary_reports_actual_explicit_attenuation_policy():
 @pytest.mark.parametrize(
     ("debug", "offline_replay", "expected"),
     (
-        (False, False, False),
-        (True, True, False),
+        (False, False, None),
+        (True, True, None),
         (True, False, True),
     ),
 )
@@ -397,8 +397,50 @@ def test_automatic_calibration_uses_existing_single_pass_research_trigger(
         "sample_euler",
         supported_sampler=True,
     )
-    assert runtime._generic_correction_calibration.enabled is expected
+    calibration = runtime._generic_correction_calibration
+    if expected is None:
+        assert calibration is None
+    else:
+        assert calibration.enabled is expected
     runtime.end_run(run_id)
+
+
+def test_model_aware_off_replay_does_not_construct_generic_research_state(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        generic_correction_module,
+        "create_calibration_state",
+        lambda *_args, **_kwargs: calls.append("calibration"),
+    )
+    monkeypatch.setattr(
+        generic_correction_module,
+        "GenericCorrectionController",
+        lambda *_args, **_kwargs: calls.append("controller"),
+    )
+    monkeypatch.setattr(
+        generic_correction_module,
+        "persist_and_analyze",
+        lambda *_args, **_kwargs: calls.append("research"),
+    )
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            debug=True,
+            model_aware_mode="off",
+            offline_smoothing_replay=True,
+        )
+    )
+
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_er_sde",
+        supported_sampler=True,
+    )
+
+    assert calls == []
+    assert runtime._generic_correction_controller is None
+    assert runtime._generic_correction_calibration is None
+    runtime.end_run(run_id)
+    assert calls == []
 
 
 def test_post_run_research_failure_cannot_invalidate_completed_generation(monkeypatch):

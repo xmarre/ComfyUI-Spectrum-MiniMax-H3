@@ -4,6 +4,7 @@ import bisect
 import math
 import time
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -310,6 +311,7 @@ class OfflineSmoother:
         blend_weight: float,
         audio_blend_weight: float = 0.0,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+        transition_logger: Callable[..., None] | None = None,
     ) -> None:
         if not archive.valid or not archive.anchors or archive.labels is None:
             raise ValueError("offline archive is incomplete")
@@ -332,12 +334,20 @@ class OfflineSmoother:
             chunk_bytes=chunk_bytes,
             history_storage=archive.history_storage,
         )
+        attach_started = time.perf_counter()
         for anchor in archive.anchors:
             self._forecaster.update(
                 anchor.coordinate,
                 anchor.feature,
                 anchor_id=anchor.step_id,
                 take_ownership=True,
+            )
+        if transition_logger is not None:
+            transition_logger(
+                "offline_smoother_archive_attached",
+                elapsed_s=time.perf_counter() - attach_started,
+                anchors=len(archive.anchors),
+                shared_bytes=archive.tensor_bytes,
             )
         self._stream_ranges = self._resolve_stream_ranges()
         if (
@@ -381,11 +391,31 @@ class OfflineSmoother:
         self.model_aware_offline_correction_seconds = 0.0
         self.model_aware_offline_correction_applications = 0
         validation_started = time.perf_counter()
+        if transition_logger is not None:
+            transition_logger(
+                "offline_smoother_validation_begin",
+                anchors=len(archive.anchors),
+                streams=len(self._stream_ranges),
+            )
         try:
             self._validation_scores = self._build_validation_scores()
         finally:
             self.validation_seconds = time.perf_counter() - validation_started
+            if transition_logger is not None:
+                transition_logger(
+                    "offline_smoother_validation_end",
+                    elapsed_s=self.validation_seconds,
+                    anchors=len(archive.anchors),
+                    samples_per_branch=self.validation_samples_per_branch,
+                )
+        weights_started = time.perf_counter()
         self._forecast_weights = self._build_forecast_weights()
+        if transition_logger is not None:
+            transition_logger(
+                "offline_smoother_weights_end",
+                elapsed_s=time.perf_counter() - weights_started,
+                forecast_weight_sets=len(self._forecast_weights),
+            )
 
     @property
     def history_length(self) -> int:

@@ -659,6 +659,13 @@ def _observe_anchor(
 
 def _start_run(self: SpectrumH3Runtime, *args, **kwargs):
     run_id = _ORIGINAL_RUNTIME_START(self, *args, **kwargs)
+    if self.config.model_aware_mode == "off":
+        self.forecaster._generic_correction_capture_mode = None
+        self._generic_correction_controller = None
+        self._generic_correction_calibration = None
+        self.model_aware._generic_correction_controller = None
+        self._generic_fit_marker = 0.0
+        return run_id
     self.forecaster._generic_correction_capture_mode = self.config.model_aware_mode
     controller = GenericCorrectionController(
         mode=self.config.generic_correction_mode,
@@ -671,15 +678,16 @@ def _start_run(self: SpectrumH3Runtime, *args, **kwargs):
     sigmas = args[0] if args else kwargs.get("sigmas")
     if sigmas is None:
         raise RuntimeError("generic correction run setup did not receive a sigma schedule")
-    self._generic_correction_calibration = create_calibration_state(
-        self,
-        sigmas,
-        enabled=bool(
-            self.config.debug
-            and self.config.model_aware_mode == "full"
-            and not self.config.offline_smoothing_replay
-            and self._offline_phase is None
-        ),
+    calibration_enabled = bool(
+        self.config.debug
+        and self.config.model_aware_mode == "full"
+        and not self.config.offline_smoothing_replay
+        and self._offline_phase is None
+    )
+    self._generic_correction_calibration = (
+        create_calibration_state(self, sigmas, enabled=True)
+        if calibration_enabled
+        else None
     )
     self._generic_fit_marker = 0.0
     return run_id
