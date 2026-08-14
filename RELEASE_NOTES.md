@@ -1,73 +1,63 @@
-# Spectrum MiniMax H3 v0.2.9
+# Spectrum MiniMax H3 v0.2.10
 
-v0.2.9 promotes the validated generic-correction controller for the opt-in full causal path, adds bounded decoded-media research and reporting, hardens the offline first-pass transition, and preserves native behavior for per-token denoise masks.
+v0.2.10 hardens the Objective Sequential Capture research path against host/CUDA memory pressure and makes recoverable capture failures non-fatal to the surrounding ComfyUI workflow. The bounded analysis transform, objective R/A/B semantics, report schema, forecasting behavior, and production Spectrum defaults are unchanged.
 
-## Validated generic-correction default
+## Memory-safe Objective Sequential Capture
 
-When `model_aware_mode = full` uses causal generic correction, the validated controller is now:
+Sequential capture now performs validation and memory admission before allocating the retained analysis destination. The preflight accounts for the decoded source media already live, the new bounded VIDEO/AUDIO destinations, existing pending captures, bounded staging workspaces, and explicit host/CUDA safety margins.
 
-```text
-generic_correction_mode = coordinate_rls
-generic_correction_attenuation = no_attenuation
-generic_correction_limiter = hard_clip
-generic_correction_limit = 0.40
-RLS lambda = 0.90
-```
+The retained research format remains the same:
 
-Two independent three-run hidden-space compatibility groups selected the same candidate with approximately 15.78% lower normalized reconstruction error than exact legacy, 48 wins / 0 losses per group, and zero worst regression. Three controlled decoded native-H3 R/A/B triads then produced two candidate-favored verdicts, one mixed verdict, and no legacy-favored verdict. Broad VIDEO MS-SSIM, PSNR, and temporal-derivative fidelity favored the candidate in all three triads. AUDIO spectral metrics were generally candidate-favored; normalized correlation and SI-SDR remain phase-sensitive diagnostics outside the predeclared verdict gate.
+- VIDEO is reduced deterministically to the bounded CPU `float16` analysis surface capped at 393,216 pixels per frame;
+- AUDIO is retained as an independent CPU `float32` waveform;
+- at most two incomplete benchmark IDs and 4 GiB of retained analysis media are kept;
+- raw decoded input tensors are never stored in `_PENDING_CAPTURES`.
 
-The decoded validation used native MiniMax H3, ER-SDE, 20 steps, 512x768, 192 frames, 24 fps, eight seconds, and three fixed seeds. Candidate and legacy used identical actual/forecast schedules and transformer-call budgets, with zero model-aware extra NFEs. Their observed sampler wall times were approximately 174.66 and 174.78 seconds. These results do not establish the same ranking for other samplers, step counts, resolutions, prompts, LoRAs, or model variants. The hidden-space percentage is reconstruction-ranking evidence, not a perceptual-quality percentage.
+Video staging derives its chunk size from a conservative 64 MiB workspace target, capped at four frames. The approximately 0.7 MP, 192-frame float32 case that exceeded that workspace target at four frames now stages three frames at a time. Audio uses bounded sample chunks as well.
 
-The exact legacy configuration remains available for reproduction and saved workflows:
+Finite/range validation no longer materializes a boolean tensor for every source element. It reduces each chunk with `aminmax`, checks only the resulting scalar bounds, clamps the owned work buffer in place, and releases intermediate representations before the next chunk allocation.
 
-```text
-generic_correction_mode = legacy
-generic_correction_attenuation = mode_default
-generic_correction_limiter = rational
-generic_correction_limit = 0.25
-```
+Preflight, staging, and pending insertion are serialized under the pending-state lock so concurrent capture nodes cannot both admit themselves from stale accounting.
 
-The global defaults remain compatibility-safe:
+## Lower bounded-evaluator peak memory
 
-```text
-model_aware_mode = off
-model_aware_trust_shrinkage = false
-model_aware_replay_generic_correction = false
-offline_smoothing_replay = true
-```
+The bounded VIDEO evaluator now processes legacy and candidate chunks sequentially against one reference chunk instead of materializing both comparison chunks together. Intermediate float32 tensors are released after each comparison.
 
-Widget ordering and explicit saved values remain stable.
+This reduces the Spectrum-owned evaluator live set without changing the existing bounded metric profile or verdict calculations.
 
-## Objective decoded-media benchmark and reporting
+## Recoverable failures no longer abort unrelated output nodes
 
-The recommended sequential R/A/B benchmark now reduces each decoded VIDEO immediately to a deterministic CPU `float16` analysis surface capped at 393,216 pixels per frame and retains AUDIO on CPU as `float32`. It keeps at most two pending benchmark IDs within a 4 GiB analysis-memory limit, preserves source topology in compatibility checks, rejects duplicate/incompatible roles and seeds, releases completed triads on success or failure, and never persists raw media. The original one-shot nodes remain available as explicitly labeled Full Media research alternatives.
+Objective Sequential Capture now converts recoverable capture/evaluation failures into its status output instead of raising through the ComfyUI graph. This includes validation errors, incompatible or duplicate R/A/B roles, preflight rejection, staging failures, report/evaluator failures, and unexpected non-resource-exhaustion exceptions. Earlier accepted R/A roles remain intact when a later role is rejected before completion, while a completed triad is always released after evaluation succeeds or fails.
 
-Objective comparison rows now expose raw legacy/candidate values, absolute candidate deltas, metric direction, verdict role, display units, and the existing decision-relative advantage where the predeclared gate requires it. Human-facing diagnostics use native units:
+This lets unrelated output nodes, including video saving/combine nodes on the same execution, continue when the research capture itself cannot complete.
 
-- normalized correlation: correlation-point delta;
-- SI-SDR and PSNR: dB delta;
-- bounded lag: milliseconds.
+Actual resource-exhaustion exceptions are deliberately not swallowed. `MemoryError`, CUDA OOM, and non-objective exceptions reporting an out-of-memory condition still propagate so ComfyUI/PyTorch can perform their normal OOM recovery behavior.
 
-Diagnostics are visibly separated from verdict-primary and guardrail metrics in Markdown, aggregate output, and the ComfyUI console summary. Existing schema-v1 case JSON remains authoritative and can be normalized, rendered, and aggregated without regenerating the three collected triads. The verdict implementation and thresholds are unchanged.
+## Capture diagnostics and ownership
 
-## Offline replay transition hardening
+Major capture boundaries now emit timestamped diagnostics with elapsed time and available memory telemetry where supported. Logged stages include input receipt, preflight, destination allocation, bounded chunk validation/resize/transfer/copy, pending insertion, evaluation, and report persistence.
 
-The completed first-pass executor now returns and tears down before smoother construction. Transition telemetry covers the final actual observation, archive record/finalization, executor return, archive completion, smoother setup, and replay setup. The causal forecaster no longer retains a redundant terminal anchor after the archive becomes its long-lived owner. Completion/setup failures preserve the valid completed first-pass result.
+Host telemetry uses `psutil` when available with platform fallbacks; CUDA captures also report allocator/free-memory state when available. If host telemetry is unavailable, a conservative absolute incremental guard remains in force.
 
-This addresses the observed end-of-first-pass stall boundary without attributing the historical freeze to a replay pass that had not started.
+Source ownership is explicit: only newly allocated reduced VIDEO and copied AUDIO tensors enter the pending store. Tests cover source release, reset, eviction, completed-triad teardown, staging failure, and evaluation failure.
 
-## Native fallback for per-token denoise masks
+## Compatibility
 
-Spectrum detects the `denoise_mask` and `audio_denoise_mask` arguments introduced by ComfyUI's MiniMax H3 per-token masking support. When either mask is active, Spectrum disables feature forecasting for that run and delegates the call unchanged to the native MiniMax H3 executor before registering a forecast model call.
+This release does not alter:
 
-Forecast reconstruction currently has one timestep-modulation row per target stream. Per-token masking can assign different timestep rows to individual VIDEO or AUDIO tokens, so forecasting that call would apply incorrect output-head modulation. The guard preserves the exact mask object and native semantics. It is inert when the arguments are absent or `None`, including on older reviewed ComfyUI revisions.
+- the production feature forecaster or sampler schedules;
+- model-aware controller defaults;
+- offline smoothing replay behavior;
+- the validated `coordinate_rls + no_attenuation + hard_clip + 0.40` full-mode generic-correction default;
+- exact legacy generic-correction reproduction;
+- Objective Media schema-v1 verdict thresholds or existing collected reports.
 
-## Runtime and research boundaries
+The package and source-checkout calibration provenance versions are advanced to `0.2.10`.
 
-The promoted controller retains scalar/small-matrix state only. It adds no transformer call, sampler step, schedule ownership, persistent per-token gain field, or production hidden-tensor retention. Regional correction remains a separate research mode. Calibration captures scalar moments only, remains debug-only, and reports post-generation persistence failures as warnings.
+## Remaining resource boundary
 
-Automatic hidden-space reports distinguish candidate ranking evidence from the separate decoded/perceptual evidence used for promotion. Research reports do not mutate live settings.
+The preflight is conservative admission control, not an atomic reservation of host or device memory. A real OOM can still occur if system/WSL commit availability changes after preflight, another process allocates concurrently, allocator/backend scratch exceeds the estimate, or an accelerator does not expose usable free-memory telemetry. Those true resource failures remain visible and are not converted into a successful capture status.
 
 ## Validation
 
-The release branch is validated by the repository's pinned four-revision ComfyUI matrix. Each job builds the wheel, runs the native-H3 forecaster smoke test, scoped Ruff, `compileall`, and the full pytest suite. Coverage includes promoted defaults, exact legacy reproduction, controller reset/rollback, schedule and NFE invariants, objective schema-v1 normalization, native-unit diagnostic rendering, bounded sequential cleanup/resources, offline replay transition ownership, regional research summaries, malformed research data, video-only calibration groups, node registration, and independent VIDEO/AUDIO mask passthrough.
+The PR is covered by the repository's pinned four-revision ComfyUI matrix. The matrix builds the wheel, runs the native-H3 forecaster smoke test, scoped Ruff, `compileall`, and the full pytest suite. Focused sequential-capture coverage includes deterministic staging parity across float16/bfloat16/float32/float64 inputs, bounded workspace accounting, preflight rejection before destination allocation, missing-telemetry fallback, duplicate/topology checks before staging, non-fatal recoverable errors, OOM propagation, source ownership, reset/eviction release, completed-triad teardown, and optional CUDA staging.
