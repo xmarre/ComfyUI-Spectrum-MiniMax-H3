@@ -395,6 +395,18 @@ class SpectrumH3Runtime:
             and self._model_profile is not None
         )
 
+    def log_offline_transition(self, event: str, **fields: Any) -> None:
+        """Emit a timestamped replay-transition breadcrumb in debug mode."""
+        if not self.config.debug:
+            return
+        rendered = " ".join(f"{key}={value}" for key, value in fields.items())
+        LOG.warning(
+            "Spectrum H3 offline transition ts=%.6f event=%s%s",
+            time.time(),
+            event,
+            f" {rendered}" if rendered else "",
+        )
+
     def _record_offline_smoother_stats(self) -> None:
         smoother = self._offline_smoother
         if smoother is None:
@@ -779,12 +791,30 @@ class SpectrumH3Runtime:
             raise RuntimeError("offline capture is not active")
         if self._disabled:
             archive.invalidate(self._disable_reason or "base Spectrum disabled during offline first pass")
+        complete_started = time.perf_counter()
+        self.log_offline_transition(
+            "complete_offline_capture_begin",
+            steps=len(archive.steps),
+            anchors=len(archive.anchors),
+            retained_bytes=archive.tensor_bytes,
+        )
         complete = archive.complete(minimum_anchors=self.config.min_fit_points)
         self.stats.offline_archive_bytes = archive.tensor_bytes
         self.stats.offline_estimated_archive_bytes = archive.estimated_tensor_bytes
         if not complete:
+            self.log_offline_transition(
+                "complete_offline_capture_invalid",
+                elapsed_s=f"{time.perf_counter() - complete_started:.6f}",
+                reason=archive.failure_reason,
+            )
             return False
         started = time.perf_counter()
+        self.log_offline_transition(
+            "offline_smoother_construction_begin",
+            anchors=len(archive.anchors),
+            retained_bytes=archive.tensor_bytes,
+            storage=archive.history_storage,
+        )
         try:
             self._offline_smoother = OfflineSmoother(
                 archive,
@@ -792,21 +822,43 @@ class SpectrumH3Runtime:
                 ridge_lambda=self.config.ridge_lambda,
                 blend_weight=self.config.blend_weight,
                 audio_blend_weight=self.config.audio_blend_weight,
+                transition_logger=self.log_offline_transition,
             )
             self._record_offline_smoother_stats()
-        except (RuntimeError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 - completed first pass is the fallback boundary
             archive.invalidate(f"offline smoother construction failed: {exc}")
+            self._offline_smoother = None
+            self.log_offline_transition(
+                "offline_smoother_construction_failed",
+                error_type=type(exc).__name__,
+                reason=exc,
+            )
             return False
         finally:
             elapsed = time.perf_counter() - started
             self._offline_smoother_build_seconds_total += elapsed
             self.stats.offline_smoother_build_seconds += elapsed
+        self.log_offline_transition(
+            "offline_smoother_construction_end",
+            elapsed_s=f"{time.perf_counter() - started:.6f}",
+            history_bytes=self._offline_smoother.history_tensor_bytes,
+        )
+        self.log_offline_transition(
+            "complete_offline_capture_end",
+            elapsed_s=f"{time.perf_counter() - complete_started:.6f}",
+        )
         return True
 
     def begin_offline_replay(self) -> None:
+        self.log_offline_transition("begin_offline_replay_begin")
         if self._offline_archive is None or self._offline_smoother is None:
             raise RuntimeError("offline replay requires a complete first-pass archive")
         self._offline_phase = "replay"
+        self.log_offline_transition(
+            "begin_offline_replay_end",
+            anchors=len(self._offline_archive.anchors),
+            retained_bytes=self._offline_archive.tensor_bytes,
+        )
 
     def release_offline_archive(self) -> None:
         if self._offline_archive is not None:
@@ -1074,10 +1126,33 @@ class SpectrumH3Runtime:
                 f"actual H3 feature shape {tuple(feature.shape)} does not match {call.expected_shape}"
             )
         started = time.perf_counter()
+        feature_bytes = feature.numel() * feature.element_size()
+        self.log_offline_transition(
+            "observe_actual_begin",
+            run_id=run_id,
+            step=step_id,
+            call=call_id,
+            feature_bytes=feature_bytes,
+            source_device=feature.device,
+            archive_retained_bytes=(
+                self._offline_archive.tensor_bytes
+                if self._offline_archive is not None
+                else 0
+            ),
+        )
         try:
             detached = feature.detach()
             capture_storage = self.config.history_storage
-            if (
+            terminal_first_pass = bool(
+                self._offline_phase == "first_pass"
+                and self._run is not None
+                and step.step_id == self._run.total_steps - 1
+            )
+            if terminal_first_pass:
+                # No later causal prediction consumes the terminal anchor, so
+                # materialize it directly on the replay archive's owner.
+                capture_storage = self.config.offline_archive_storage
+            elif (
                 self._offline_phase == "first_pass"
                 and self.config.offline_archive_storage == "vram"
             ):
@@ -1094,6 +1169,15 @@ class SpectrumH3Runtime:
                 archived = detached.to(device="cpu", dtype=feature.dtype, copy=True).contiguous()
         finally:
             self.stats.history_archive_seconds += time.perf_counter() - started
+        self.log_offline_transition(
+            "observe_actual_end",
+            run_id=run_id,
+            step=step_id,
+            call=call_id,
+            elapsed_s=f"{time.perf_counter() - started:.6f}",
+            retained_device=archived.device,
+            retained_bytes=archived.numel() * archived.element_size(),
+        )
         call.observed_actual = True
         step.actual_records.append(_ActualRecord(archived, call.labels))
 
@@ -1948,6 +2032,19 @@ class SpectrumH3Runtime:
 
     def finalize_step(self, run_id: int, step_id: int) -> None:
         step = self._require_step(run_id, step_id)
+        finalization_started = time.perf_counter()
+        terminal_first_pass = bool(
+            self._offline_phase == "first_pass"
+            and self._run is not None
+            and step.step_id == self._run.total_steps - 1
+        )
+        self.log_offline_transition(
+            "finalize_step_begin",
+            run_id=run_id,
+            step=step_id,
+            mode=step.mode,
+            terminal_first_pass=terminal_first_pass,
+        )
         if not step.calls:
             if step.mode == "replay":
                 raise OfflineReplayAbort(
@@ -2043,6 +2140,11 @@ class SpectrumH3Runtime:
                 if self._offline_phase == "first_pass" and self._offline_archive is not None:
                     assert self._history_labels is not None
                     archive_started = time.perf_counter()
+                    self.log_offline_transition(
+                        "record_actual_begin",
+                        step=step.step_id,
+                        feature_bytes=combined.numel() * combined.element_size(),
+                    )
                     try:
                         self._offline_archive.record_actual(
                             step.step_id,
@@ -2056,6 +2158,18 @@ class SpectrumH3Runtime:
                         elapsed = time.perf_counter() - archive_started
                         self.stats.offline_archive_seconds += elapsed
                         self._offline_archive_seconds_total += elapsed
+                    self.log_offline_transition(
+                        "record_actual_end",
+                        step=step.step_id,
+                        elapsed_s=f"{time.perf_counter() - archive_started:.6f}",
+                        anchors=len(self._offline_archive.anchors),
+                        retained_bytes=self._offline_archive.tensor_bytes,
+                        ownership_shared=(
+                            bool(self._offline_archive.anchors)
+                            and self._offline_archive.anchors[-1].feature.data_ptr()
+                            == combined.data_ptr()
+                        ),
+                    )
                 update_started = time.perf_counter()
                 exact_projection_before = (
                     self.forecaster.model_aware_exact_head_projection_seconds
@@ -2064,22 +2178,34 @@ class SpectrumH3Runtime:
                     self.forecaster.model_aware_exact_head_projection_calls
                 )
                 try:
-                    self.forecaster.update(
-                        step.coordinate,
-                        combined,
-                        anchor_id=step.step_id,
-                        take_ownership=True,
-                        evidence_segments=(
-                            self._stream_ranges(step.calls[0])
-                            if self._model_aware_enabled()
-                            else None
-                        ),
-                        exact_head_weights=(
-                            exact_head_weights
-                            if self._model_aware_enabled()
-                            else None
-                        ),
-                    )
+                    if terminal_first_pass:
+                        self.log_offline_transition(
+                            "forecaster_update_skipped",
+                            step=step.step_id,
+                            reason="terminal_offline_anchor_has_no_future_causal_consumer",
+                        )
+                    else:
+                        self.log_offline_transition(
+                            "forecaster_update_begin",
+                            step=step.step_id,
+                            feature_bytes=combined.numel() * combined.element_size(),
+                        )
+                        self.forecaster.update(
+                            step.coordinate,
+                            combined,
+                            anchor_id=step.step_id,
+                            take_ownership=True,
+                            evidence_segments=(
+                                self._stream_ranges(step.calls[0])
+                                if self._model_aware_enabled()
+                                else None
+                            ),
+                            exact_head_weights=(
+                                exact_head_weights
+                                if self._model_aware_enabled()
+                                else None
+                            ),
+                        )
                 except ValueError as exc:
                     self._disable_forecasting(f"actual H3 feature is incompatible with history: {exc}")
                 finally:
@@ -2105,6 +2231,18 @@ class SpectrumH3Runtime:
                         self.forecaster.model_aware_exact_head_workspace_bytes,
                     )
                     self.stats.model_aware_overhead_seconds += exact_projection_elapsed
+                if not terminal_first_pass:
+                    self.log_offline_transition(
+                        "forecaster_update_end",
+                        step=step.step_id,
+                        elapsed_s=f"{time.perf_counter() - update_started:.6f}",
+                        history=self.forecaster.history_length,
+                        ownership_shared=(
+                            bool(self.forecaster._history)
+                            and self.forecaster._history[-1].feature_flat.data_ptr()
+                            == combined.data_ptr()
+                        ),
+                    )
             self._consecutive_forecasts = 0
             self._required_actual_refreshes = max(0, self._required_actual_refreshes - 1)
             if step.consumes_feedback_refresh:
@@ -2144,6 +2282,12 @@ class SpectrumH3Runtime:
         self._last_completed_mode = step.mode
         self._last_completed_step_id = step.step_id
         self._step = None
+        self.log_offline_transition(
+            "finalize_step_end",
+            run_id=run_id,
+            step=step_id,
+            elapsed_s=f"{time.perf_counter() - finalization_started:.6f}",
+        )
 
     def abort_step(self, run_id: int, step_id: int) -> None:
         step = self._require_step(run_id, step_id)
