@@ -963,6 +963,27 @@ def _metric_map(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {row["metric"]: row for row in report["comparisons"]}
 
 
+def _independent_case_bootstrap(values: list[float], *, draws: int = 2000) -> dict[str, Any]:
+    if len(values) < 2:
+        return {
+            "available": False,
+            "reason": "at least two independent complete triads are required",
+        }
+    generator = random.Random(0)
+    estimates = [
+        statistics.fmean(generator.choice(values) for _ in values)
+        for _ in range(draws)
+    ]
+    return {
+        "available": True,
+        "method": "independent_complete_triad_bootstrap",
+        "draws": draws,
+        "confidence_interval_95": [_quantile(estimates, 0.025), _quantile(estimates, 0.975)],
+        "positive_fraction": sum(value > 0.0 for value in estimates) / draws,
+        "random_seed": 0,
+    }
+
+
 def aggregate_objective_reports(reports: list[dict[str, Any]]) -> dict[str, Any]:
     if not reports:
         raise ObjectiveMediaError("at least one objective-media report is required")
@@ -985,6 +1006,7 @@ def aggregate_objective_reports(reports: list[dict[str, Any]]) -> dict[str, Any]
             "ties": sum(abs(value) <= ABSOLUTE_TOLERANCE for value in advantages),
             "worst_regression": min(advantages),
             "per_case": advantages,
+            "independent_case_bootstrap": _independent_case_bootstrap(advantages),
         }
     verdicts = [report["verdict"]["value"] for report in reports]
     return {

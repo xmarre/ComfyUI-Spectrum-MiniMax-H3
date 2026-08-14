@@ -181,7 +181,8 @@ are also required. Computed topology (frames, resolution, FPS, audio rate,
 channels, and length) joins that signature automatically.
 
 Compatible independent triads refresh an aggregate report containing per-seed
-verdicts, mean/median advantages, wins/losses/ties, and worst regressions.
+verdicts, mean/median advantages, wins/losses/ties, worst regressions, and a
+deterministic whole-triad bootstrap interval when at least two cases exist.
 Duplicate benchmark-ID/seed pairs are not counted twice. Incompatible settings
 produce separate groups. No row-randomized cross-validation is performed.
 

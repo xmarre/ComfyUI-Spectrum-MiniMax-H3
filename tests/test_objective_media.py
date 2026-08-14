@@ -324,6 +324,10 @@ def test_persistence_is_report_only_atomic_and_aggregates_complete_triads(tmp_pa
     aggregate = json.loads(persisted_second.aggregate_json_path.read_text(encoding="utf-8"))
     assert aggregate["independent_case_count"] == 2
     assert aggregate["cross_validation"].startswith("none")
+    bootstrap = aggregate["metrics"]["video_ms_ssim"]["independent_case_bootstrap"]
+    assert bootstrap["available"] is True
+    assert bootstrap["method"] == "independent_complete_triad_bootstrap"
+    assert bootstrap["confidence_interval_95"][0] > 0.0
 
 
 def test_persistence_bounds_report_groups_and_removes_matching_aggregates(tmp_path, monkeypatch):
