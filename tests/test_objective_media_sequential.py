@@ -9,9 +9,18 @@ import comfyui_spectrum_h3.objective_media_nodes as nodes
 from comfyui_spectrum_h3.objective_media import ObjectiveMediaError
 
 
-def _video(frames: int = 4, height: int = 8, width: int = 8) -> torch.Tensor:
+def _video(
+    frames: int = 4,
+    height: int = 8,
+    width: int = 8,
+    *,
+    offset: float = 0.0,
+) -> torch.Tensor:
     generator = torch.Generator().manual_seed(123)
-    return torch.rand((frames, height, width, 3), generator=generator)
+    return (
+        torch.rand((frames, height, width, 3), generator=generator) * 0.7
+        + offset
+    ).clamp(0.0, 1.0)
 
 
 def _audio(sample_rate: int = 8000) -> dict[str, object]:
@@ -26,13 +35,20 @@ def _clear_pending():
     nodes.clear_pending_objective_media()
 
 
-def _capture(node, role: str, *, benchmark_id: str = "seq-1", video=None, reset=False):
+def _capture(
+    node,
+    role: str,
+    *,
+    benchmark_id: str = "seq-1",
+    video=None,
+    reset=False,
+):
     return node.capture(
         _video() if video is None else video,
         role,
         24.0,
         benchmark_id,
-        "123",
+        123,
         20,
         "fixture-workflow",
         4,
@@ -46,9 +62,15 @@ def test_sequential_capture_three_runs_auto_evaluates_and_releases(monkeypatch):
 
     def fake_evaluate(reference_video, legacy_video, candidate_video, **kwargs):
         calls.append((reference_video, legacy_video, candidate_video, kwargs))
-        return ("done", "report.json", "report.md", "aggregate.json", "aggregate.md")
+        return (
+            "done",
+            "report.json",
+            "report.md",
+            "aggregate.json",
+            "aggregate.md",
+        )
 
-    monkeypatch.setattr(nodes, "_evaluate_and_persist", fake_evaluate)
+    monkeypatch.setattr(nodes, "_evaluate_and_persist_sequential", fake_evaluate)
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
 
     first = _capture(node, "R - native reference")
@@ -63,11 +85,14 @@ def test_sequential_capture_three_runs_auto_evaluates_and_releases(monkeypatch):
     assert calls[0][3]["seed"] == 123
     assert calls[0][3]["provenance"]["compatibility"]["steps"] == 20
     assert (
-        calls[0][3]["provenance"]["compatibility"]["generation_settings"]["compatibility_tag"]
+        calls[0][3]["provenance"]["compatibility"]["generation_settings"][
+            "compatibility_tag"
+        ]
         == "fixture-workflow"
     )
     assert calls[0][3]["reference_audio"]["waveform"].device.type == "cpu"
     assert calls[0][0].device.type == "cpu"
+    assert calls[0][0].dtype == torch.float16
     assert nodes.pending_objective_media_state()["benchmark_count"] == 0
 
 
@@ -75,18 +100,84 @@ def test_sequential_capture_role_order_is_independent(monkeypatch):
     seen = []
 
     def fake_evaluate(reference_video, legacy_video, candidate_video, **kwargs):
-        seen.append((reference_video.mean().item(), legacy_video.mean().item(), candidate_video.mean().item()))
+        seen.append(
+            (
+                reference_video.float().mean().item(),
+                legacy_video.float().mean().item(),
+                candidate_video.float().mean().item(),
+            )
+        )
         return ("done", "", "", "", "")
 
-    monkeypatch.setattr(nodes, "_evaluate_and_persist", fake_evaluate)
+    monkeypatch.setattr(nodes, "_evaluate_and_persist_sequential", fake_evaluate)
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
     base = _video()
-    node.capture(base + 0.2, "B - candidate", 24.0, "order", "123", 20, "fixture", 4, False, _audio())
-    node.capture(base, "R - native reference", 24.0, "order", "123", 20, "fixture", 4, False, _audio())
-    node.capture(base + 0.1, "A - legacy Spectrum", 24.0, "order", "123", 20, "fixture", 4, False, _audio())
+    node.capture(
+        base + 0.2,
+        "B - candidate",
+        24.0,
+        "order",
+        123,
+        20,
+        "fixture",
+        4,
+        False,
+        _audio(),
+    )
+    node.capture(
+        base,
+        "R - native reference",
+        24.0,
+        "order",
+        123,
+        20,
+        "fixture",
+        4,
+        False,
+        _audio(),
+    )
+    node.capture(
+        base + 0.1,
+        "A - legacy Spectrum",
+        24.0,
+        "order",
+        123,
+        20,
+        "fixture",
+        4,
+        False,
+        _audio(),
+    )
 
     assert len(seen) == 1
     assert seen[0][0] < seen[0][1] < seen[0][2]
+
+
+def test_sequential_capture_retains_bounded_float16_analysis_not_full_media(
+    monkeypatch,
+):
+    monkeypatch.setattr(nodes, "SEQUENTIAL_MAX_ANALYSIS_PIXELS", 64)
+    node = nodes.SpectrumH3ObjectiveSequentialCapture()
+    source = _video(frames=3, height=16, width=16)
+    _capture(node, "R - native reference", video=source)
+
+    pending = nodes._PENDING_CAPTURES["seq-1"]
+    staged = pending["roles"]["R"]["video"]
+    metadata = pending["source_video_metadata"]
+
+    assert staged.device.type == "cpu"
+    assert staged.dtype == torch.float16
+    assert staged.shape[0] == source.shape[0]
+    assert staged.shape[-1] == 3
+    assert staged.shape[1] * staged.shape[2] <= 64
+    assert metadata["height"] == 16
+    assert metadata["width"] == 16
+    assert metadata["analysis_height"] == staged.shape[1]
+    assert metadata["analysis_width"] == staged.shape[2]
+    assert (
+        staged.numel() * staged.element_size()
+        < source.numel() * source.element_size()
+    )
 
 
 def test_duplicate_role_is_rejected_and_reset_before_capture_restarts():
@@ -100,20 +191,20 @@ def test_duplicate_role_is_rejected_and_reset_before_capture_restarts():
     assert state["benchmarks"]["seq-1"]["roles"] == ["A"]
 
 
-def test_incompatible_topology_is_rejected_without_destroying_existing_capture():
+def test_incompatible_source_topology_is_rejected_without_destroying_existing_capture():
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
     _capture(node, "R - native reference")
-    with pytest.raises(ObjectiveMediaError, match="matching decoded video/audio topology"):
+    with pytest.raises(ObjectiveMediaError, match="matching decoded source"):
         _capture(node, "A - legacy Spectrum", video=_video(width=9))
     state = nodes.pending_objective_media_state()
     assert state["benchmarks"]["seq-1"]["roles"] == ["R"]
 
 
-def test_completion_failure_releases_all_raw_media(monkeypatch):
+def test_completion_failure_releases_bounded_analysis_media(monkeypatch):
     def fail(*args, **kwargs):
         raise ObjectiveMediaError("synthetic evaluation failure")
 
-    monkeypatch.setattr(nodes, "_evaluate_and_persist", fail)
+    monkeypatch.setattr(nodes, "_evaluate_and_persist_sequential", fail)
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
     _capture(node, "R - native reference")
     _capture(node, "A - legacy Spectrum")
@@ -134,17 +225,21 @@ def test_pending_benchmark_count_is_bounded_by_eviction(monkeypatch):
 def test_single_capture_over_ram_bound_is_rejected(monkeypatch):
     monkeypatch.setattr(nodes, "MAX_PENDING_BYTES", 1)
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
-    with pytest.raises(ObjectiveMediaError, match="exceeds the sequential capture RAM limit"):
+    with pytest.raises(ObjectiveMediaError, match="exceeds the sequential RAM limit"):
         _capture(node, "R - native reference")
     assert nodes.pending_objective_media_state()["benchmark_count"] == 0
 
 
-def test_capture_is_cpu_only_and_does_not_persist_raw_media(tmp_path, monkeypatch):
+def test_capture_is_cpu_only_and_does_not_persist_raw_media(
+    tmp_path,
+    monkeypatch,
+):
     monkeypatch.chdir(tmp_path)
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
     _capture(node, "R - native reference")
     pending = nodes._PENDING_CAPTURES["seq-1"]["roles"]["R"]
     assert pending["video"].device.type == "cpu"
+    assert pending["video"].dtype == torch.float16
     assert pending["audio"]["waveform"].device.type == "cpu"
     assert list(tmp_path.rglob("*")) == []
 
@@ -183,9 +278,13 @@ def test_default_provenance_is_nonempty_and_node_is_registered():
     assert nodes.SpectrumH3ObjectiveSequentialCapture.OUTPUT_NODE is True
 
 
-def test_sequential_schema_has_no_randomizable_integer_seed_or_json_blob():
+def test_sequential_schema_requires_linked_int_seed_and_has_no_json_blob():
     required = nodes.SpectrumH3ObjectiveSequentialCapture.INPUT_TYPES()["required"]
-    assert required["generation_seed"][0] == "STRING"
+    generation_seed = required["generation_seed"]
+    assert generation_seed[0] == "INT"
+    assert generation_seed[1]["forceInput"] is True
+    assert "default" not in generation_seed[1]
+    assert "control_after_generate" not in generation_seed[1]
     assert "seed" not in required
     assert "provenance_json" not in required
     assert required["compatibility_tag"][0] == "STRING"
@@ -193,7 +292,7 @@ def test_sequential_schema_has_no_randomizable_integer_seed_or_json_blob():
 
 def test_generation_seed_validation_is_strict():
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
-    for invalid in ("not-a-seed", "-1", str(2**64)):
+    for invalid in ("not-a-seed", -1, 2**64):
         with pytest.raises(ObjectiveMediaError, match="generation_seed"):
             node.capture(
                 _video(),
