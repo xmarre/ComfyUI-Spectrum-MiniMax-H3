@@ -585,6 +585,22 @@ def test_capture_does_not_swallow_execution_interrupts(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    "failure",
+    (MemoryError("host OOM"), RuntimeError("accelerator out of memory")),
+)
+def test_capture_does_not_swallow_resource_exhaustion(monkeypatch, failure):
+    def fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(nodes, "_source_topology", fail)
+    with pytest.raises(type(failure), match=str(failure)):
+        _capture(
+            nodes.SpectrumH3ObjectiveSequentialCapture(),
+            "R - native reference",
+        )
+
+
 def test_pending_capture_does_not_retain_source_tensor_objects():
     node = nodes.SpectrumH3ObjectiveSequentialCapture()
     source_video = _video()

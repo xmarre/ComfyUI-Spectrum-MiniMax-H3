@@ -1631,8 +1631,8 @@ class SpectrumH3ObjectiveSequentialCapture:
         "deterministically reduced to a bounded float16 CPU analysis surface "
         "before retention. Full-resolution decoded video is never retained by "
         "the sequential benchmark. The third role automatically evaluates and "
-        "writes reports. Capture failures are returned as status text so they "
-        "do not abort unrelated output nodes."
+        "writes reports. Recoverable capture failures are returned as status "
+        "text so they do not abort unrelated output nodes."
     )
 
     @classmethod
@@ -1668,6 +1668,11 @@ class SpectrumH3ObjectiveSequentialCapture:
                 capture_started=capture_started,
             )
         except Exception as exc:
+            if not isinstance(exc, ObjectiveMediaError) and (
+                isinstance(exc, (MemoryError, torch.cuda.OutOfMemoryError))
+                or "out of memory" in str(exc).lower()
+            ):
+                raise
             benchmark_key = str(benchmark_id).strip() or "<empty>"
             role_key = _ROLE_KEYS.get(str(role), str(role))
             error_text = str(exc).replace("\n", " | ")
