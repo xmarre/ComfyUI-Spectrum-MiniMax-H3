@@ -76,8 +76,10 @@ jobs:
             tests/test_generic_correction_core.py \
             tests/test_generic_correction_evaluator.py \
             tests/test_generic_correction_research.py \
+            tests/test_generic_correction_research_regional_summary.py \
             tests/test_model_aware.py \
             tests/test_objective_media.py \
+            tests/test_objective_media_sequential.py \
             tests/test_runtime.py \
             tests/test_sampling.py \
             tests/conftest.py \
