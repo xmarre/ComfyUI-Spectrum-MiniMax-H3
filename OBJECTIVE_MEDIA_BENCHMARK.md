@@ -13,30 +13,97 @@ The native result is a full-reference target for the acceleration question. It
 is not a claim that the native sample is ground-truth reality. Hidden-feature
 forecast accuracy and decoded-media fidelity remain separate evidence layers.
 
-## Nodes and execution boundary
+## Recommended node: sequential capture
 
-The research category contains:
+For ordinary real testing, use:
 
 ```text
-Spectrum H3 Objective Media Stage
-Spectrum H3 Objective Quality Compare
-Spectrum H3 Objective Quality Compare (Staged)
+Spectrum H3 Objective Media Capture (Sequential - Recommended)
 ```
 
-The direct compare node accepts three decoded `IMAGE` batches and, optionally,
-three decoded `AUDIO` values. Current ComfyUI uses `[frames, H, W, C]` IMAGE
-tensors and AUDIO dictionaries with `waveform: [B, C, samples]` plus an integer
-`sample_rate`.
+Add **one** capture node as a side branch from the same decoded IMAGE/AUDIO that
+already feeds the normal video-save/combine path:
 
-The staged workflow is recommended for a full-resolution triad. Put one media
-stage after each branch's video/audio decoders. A stage moves that branch's
-decoded tensors to CPU immediately and writes nothing to disk. The staged
-compare receives those three CPU objects. This avoids retaining all three
-decoded outputs in VRAM while preserving their decoded tensor values.
+```text
+decoded IMAGE ──┬──> Video Combine / normal save path
+                └──> Objective Media Capture (Sequential)
 
-Neither node enters the Spectrum forecasting path. When unused, the evaluator
-does no work, adds no transformer call, retains no tensor, and changes no model
-output. Evaluation is CPU-only and video is processed in bounded frame chunks.
+decoded AUDIO ──┬──> Video Combine / normal save path
+                └──> Objective Media Capture (Sequential)
+```
+
+The capture node does not replace Video Combine and does not output media for
+Video Combine. It is an objective-measurement side branch only.
+
+Run the normal workflow three times with the same `benchmark_id`, seed, FPS,
+provenance, and generation inputs. Change only the benchmark role and the
+Spectrum configuration appropriate to that role:
+
+```text
+run 1: role = R - native reference
+run 2: role = A - legacy Spectrum
+run 3: role = B - candidate
+```
+
+The order does not matter. Each incomplete role is moved to CPU RAM and retained
+only in the current ComfyUI Python process. When the third compatible role
+arrives, the node automatically calls the same objective evaluator used by the
+one-shot nodes, writes JSON/Markdown reports, prints the summary, and releases
+all raw R/A/B tensors immediately. Raw video/audio is never written to disk.
+
+Incomplete capture memory is bounded to three benchmark IDs and 12 GiB total.
+Old incomplete benchmark IDs may be evicted with a warning to stay inside the
+bound. `Spectrum H3 Objective Media Capture Reset` can release one incomplete
+benchmark or all incomplete captures explicitly. Restarting ComfyUI also clears
+incomplete captures.
+
+A duplicate role for the same benchmark is rejected. Set
+`reset_before_capture=true` on the next capture to restart that triad cleanly.
+R/A/B captures for one benchmark must keep the same FPS, seed,
+`provenance_json`, chunk size, decoded video topology, and audio-presence/channel
+topology.
+
+The capture node is an `OUTPUT_NODE`, so it runs as part of each ordinary queued
+generation. No three-branch generation graph is required.
+
+## One-shot nodes
+
+The research category also retains the original one-shot alternatives:
+
+```text
+Spectrum H3 Objective Media Stage (One-Shot)
+Spectrum H3 Objective Quality Compare (One-Shot)
+Spectrum H3 Objective Quality Compare (Staged One-Shot)
+```
+
+These are for workflows that deliberately produce R, A, and B in the **same
+ComfyUI execution**.
+
+The direct one-shot compare accepts three decoded `IMAGE` batches and,
+optionally, three decoded `AUDIO` values.
+
+The staged one-shot form requires **three separate Media Stage nodes**:
+
+```text
+R IMAGE/AUDIO -> Media Stage R -> reference_media ┐
+A IMAGE/AUDIO -> Media Stage A -> legacy_media    ├-> Quality Compare (Staged One-Shot)
+B IMAGE/AUDIO -> Media Stage B -> candidate_media ┘
+```
+
+A `staged_media` output is only an internal CPU bundle for the staged compare.
+It never connects to Video Combine. The original decoded IMAGE/AUDIO can fan out
+normally to both Video Combine and the research stage.
+
+For normal single-generation workflows where R, A, and B are produced in three
+separate queue executions, use the sequential capture node instead.
+
+Current ComfyUI uses `[frames, H, W, C]` IMAGE tensors and AUDIO dictionaries
+with `waveform: [B, C, samples]` plus an integer `sample_rate`.
+
+Neither the sequential nor one-shot path enters the Spectrum forecasting hot
+path. When unused, the evaluator does no work, adds no transformer call, retains
+no tensor, and changes no model output. Evaluation is CPU-only and video is
+processed in bounded frame chunks.
 
 ## Required same-input protocol
 
@@ -72,10 +139,24 @@ B candidate
   model_aware_replay_generic_correction = false
 ```
 
-The compare node rejects frame-count, resolution, channel-count, and material
+The evaluator rejects frame-count, resolution, channel-count, and material
 audio-duration mismatches. Candidate audio is deterministically resampled to the
 native-reference rate only when sample rates differ. Channel-count mismatches
 are rejected; the core evaluator never silently downmixes.
+
+## Provenance
+
+`provenance_json` records compatibility grouping and the R/A/B role definitions.
+The node now ships with a **valid** default for the current R/A/B controller
+family so the evaluator does not fail merely because placeholder fields are
+empty. The default marks model/precision/decoder details as
+`same-workflow`/`user-unverified-same-workflow`.
+
+For scientifically meaningful aggregation across multiple benchmark IDs/seeds,
+replace those placeholders with the exact model weights, precision, sampler,
+scheduler, conditioning, VAE/decoder, and remaining generation settings. A
+single triad can still be evaluated with the valid default, but its aggregate
+provenance should be treated as user-unverified.
 
 ## VIDEO panel
 
@@ -172,13 +253,8 @@ __cache/spectrum_h3/objective_media/v1/
 Writes are temporary-file + fsync + atomic replace. Raw video and audio are
 never persisted. Retention is bounded to 24 triads per compatibility group and
 24 aggregate groups. Removing the `objective_media/v1` directory safely clears
-all evaluator state.
-
-`provenance_json` is mandatory. Its `compatibility` object must contain model,
-model weights, precision, sampler, scheduler, steps, conditioning, video VAE,
-audio decoder, and remaining generation settings. Non-empty R/A/B role records
-are also required. Computed topology (frames, resolution, FPS, audio rate,
-channels, and length) joins that signature automatically.
+persisted evaluator reports. Incomplete sequential raw captures are process-RAM
+only and are cleared by the reset node or a ComfyUI restart.
 
 Compatible independent triads refresh an aggregate report containing per-seed
 verdicts, mean/median advantages, wins/losses/ties, worst regressions, and a
@@ -188,23 +264,23 @@ produce separate groups. No row-randomized cross-validation is performed.
 
 ## Smallest real three-way workflow
 
-1. Start from one known-good native MiniMax H3 workflow and one ordinary new
-   seed. Keep the same model loader, conditioning, latent/noise construction,
-   sigma shift, sampler, scheduler, steps, VAE decoders, and references for all
-   three branches.
-2. R bypasses Spectrum. A and B each receive their own `Spectrum Apply MiniMax
-   H3` clone configured exactly as listed in the same-input protocol.
-3. Decode video with the same VAE and audio with the same audio VAE on all three
-   branches.
-4. Connect each decoded video/audio pair to one `Spectrum H3 Objective Media
-   Stage` node.
-5. Connect the R, A, and B stage outputs to `Spectrum H3 Objective Quality
-   Compare (Staged)`.
-6. Set FPS to 24, use a unique benchmark ID, enter the seed, and fill one
-   `provenance_json` object. Queue the workflow once.
-7. Read the emitted summary and Markdown path. The sibling JSON contains the
-   bounded per-frame/per-window arrays and block-bootstrap intervals. Repeat
-   with independent seeds; the compatible aggregate refreshes automatically.
+Use one normal generation workflow, not three simultaneous generation branches.
 
-This workflow makes the objective report the first decoded-output gate. Manual
-visual/listening notes remain optional supporting observations.
+1. Branch decoded IMAGE and AUDIO to both the existing Video Combine/save node
+   and one `Spectrum H3 Objective Media Capture (Sequential - Recommended)`.
+2. Set FPS, one unique `benchmark_id`, the fixed seed, and the provenance once.
+3. Run native R with Spectrum bypassed and set capture role to
+   `R - native reference`.
+4. Configure legacy A exactly as above, change only capture role to
+   `A - legacy Spectrum`, and queue again.
+5. Configure candidate B exactly as above, change only capture role to
+   `B - candidate`, and queue again.
+6. On the third captured role, the node automatically emits the objective
+   summary and JSON/Markdown report paths, then releases all raw R/A/B media.
+
+The normal videos remain saved through Video Combine on every run. The research
+capture is only a side branch.
+
+Repeat with independent seeds when another triad is needed; compatible aggregate
+reports refresh automatically. Manual visual/listening notes remain optional
+supporting observations.
