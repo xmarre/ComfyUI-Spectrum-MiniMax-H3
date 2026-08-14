@@ -11,6 +11,25 @@ import torch
 
 from . import model_aware as _model_aware
 from .forecast import HistoryWeightForecaster
+from .generic_correction_calibration import (
+    GenericCalibrationState,
+)
+from .generic_correction_calibration import (
+    create_state as create_calibration_state,
+)
+from .generic_correction_calibration import (
+    emit_block as emit_calibration_block,
+)
+from .generic_correction_controller import GenericCorrectionController
+from .generic_correction_core import (
+    GainApplication,
+    coordinate_transport_scale,
+    limit_gain,
+)
+from .generic_correction_runtime import (
+    _advanced_weight_segments,
+    _exact_anchor_analysis,
+)
 from .model_aware import (
     AnchorEvidence,
     AnchorEvidenceTiming,
@@ -64,13 +83,50 @@ def _compact_head_metric(_weight: Any, _hidden_size: int):
     return None, None, 0
 
 
-def _generic_telemetry(source: CorrectionGainTelemetry) -> CorrectionGainTelemetry:
+def _generic_telemetry(
+    source: CorrectionGainTelemetry,
+    controller: GenericCorrectionController | None = None,
+    *,
+    confidence: float = 1.0,
+) -> CorrectionGainTelemetry:
     """Expose only the surviving generic gain; retired candidate fields stay zero."""
+    raw_gain = float(source.raw_generic_gain)
+    gain = float(source.generic_gain)
+    bound_active = bool(source.generic_bound_active)
+    projection = float(source.residual_projection)
+    if controller is not None:
+        if (
+            controller.mode == "legacy"
+            and controller.limiter == "rational"
+            and math.isclose(controller.limit, 0.25, rel_tol=0.0, abs_tol=1e-12)
+        ):
+            pass
+        elif controller.mode == "legacy":
+            gain = limit_gain(raw_gain, controller.limiter, controller.limit)
+            bound_active = abs(gain - raw_gain) > 1e-12
+        else:
+            application = controller.application(
+                "audio",
+                general_confidence=confidence,
+            )
+            projection = application.raw_gain
+            raw_gain = application.scaled_gain
+            gain = application.bounded_gain
+            bound_active = application.bound_active
     return CorrectionGainTelemetry(
-        residual_projection=float(source.residual_projection),
-        raw_generic_gain=float(source.raw_generic_gain),
-        generic_gain=float(source.generic_gain),
-        generic_bound_active=bool(source.generic_bound_active),
+        residual_projection=projection,
+        raw_generic_gain=raw_gain,
+        generic_gain=gain,
+        generic_bound_active=bound_active,
+    )
+
+
+def _application_telemetry(application: GainApplication) -> CorrectionGainTelemetry:
+    return CorrectionGainTelemetry(
+        residual_projection=application.raw_gain,
+        raw_generic_gain=application.scaled_gain,
+        generic_gain=application.bounded_gain,
+        generic_bound_active=application.bound_active,
     )
 
 
@@ -81,8 +137,31 @@ def _generic_decision(self: ModelAwareController, **kwargs) -> ModelAwareForecas
     decision = _ORIGINAL_DECISION(self, **kwargs)
     if self.mode != "full":
         return decision
-    audio = _generic_telemetry(decision.audio_correction_telemetry)
-    video = _generic_telemetry(decision.video_correction_telemetry)
+    controller = getattr(self, "_generic_correction_controller", None)
+    if isinstance(controller, GenericCorrectionController) and controller.mode != "legacy":
+        audio = _application_telemetry(
+            controller.application(
+                "audio",
+                general_confidence=decision.confidence,
+            )
+        )
+        video = _application_telemetry(
+            controller.application(
+                "video",
+                general_confidence=decision.confidence,
+            )
+        )
+    else:
+        audio = _generic_telemetry(
+            decision.audio_correction_telemetry,
+            controller if isinstance(controller, GenericCorrectionController) else None,
+            confidence=decision.confidence,
+        )
+        video = _generic_telemetry(
+            decision.video_correction_telemetry,
+            controller if isinstance(controller, GenericCorrectionController) else None,
+            confidence=decision.confidence,
+        )
     return replace(
         decision,
         audio_correction_gain=audio.generic_gain,
@@ -225,10 +304,10 @@ def _generic_anchor_evidence(
     step: Any,
     combined: torch.Tensor,
     decision: ModelAwareForecastDecision,
-) -> AnchorEvidence | None:
+) -> tuple[AnchorEvidence | None, dict[str, torch.Tensor]]:
     forecaster = runtime.forecaster
     if forecaster.history_length < 2 or forecaster.feature_shape is None:
-        return None
+        return None, {}
     if tuple(combined.shape) != forecaster.feature_shape:
         raise ValueError("actual feature shape changed during generic correction evidence sampling")
     if len(forecaster._evidence_history) != forecaster.history_length:
@@ -237,6 +316,19 @@ def _generic_anchor_evidence(
     stream_evidence: dict[str, StreamAnchorEvidence] = {}
     weight_fit_seconds = sample_index_seconds = reduction_seconds = 0.0
     scalar_transfer_seconds = 0.0
+    base_weights: dict[str, torch.Tensor] = {}
+    controller = getattr(runtime, "_generic_correction_controller", None)
+    advanced = (
+        isinstance(controller, GenericCorrectionController)
+        and controller.mode != "legacy"
+    )
+    transport_scale = 1.0
+    if advanced and len(forecaster._history) >= 2:
+        transport_scale, _ = coordinate_transport_scale(
+            forecaster._history[-2].coordinate,
+            forecaster._history[-1].coordinate,
+            step.coordinate,
+        )
     for name, start, end in runtime._stream_ranges(step.calls[0]):
         if name == "audio":
             blend = decision.audio_blend_weight
@@ -265,6 +357,7 @@ def _generic_anchor_evidence(
             ridge_lambda=decision.ridge_lambda,
             correction_gain=0.0,
         )
+        base_weights[name] = raw_weights
         weight_fit_seconds += time.perf_counter() - started
         started = time.perf_counter()
         history_samples = [entry[name] for entry in forecaster._evidence_history]
@@ -287,8 +380,9 @@ def _generic_anchor_evidence(
             dot_epsilon
         )
         forecast_ratio = _tensor_rms(residual) / hold_rms
+        applied_delta_gain = float(gain) * transport_scale if advanced else float(gain)
         corrected_ratio = _tensor_rms(
-            actual - (predicted + float(gain) * delta)
+            actual - (predicted + applied_delta_gain * delta)
         ) / hold_rms
         if len(history_samples) >= 3:
             curvature = latest - 2.0 * previous + history_samples[-3]
@@ -346,12 +440,16 @@ def _generic_anchor_evidence(
             subspace_gram_seconds=0.0,
             subspace_solve_seconds=0.0,
         ),
-    )
+    ), base_weights
 
 
 _ORIGINAL_RUNTIME_WEIGHT_SEGMENTS = SpectrumH3Runtime._model_aware_weight_segments
 _ORIGINAL_RUNTIME_START = SpectrumH3Runtime.start_run
+_ORIGINAL_RUNTIME_END = SpectrumH3Runtime.end_run
+_ORIGINAL_RUNTIME_RESTORE = SpectrumH3Runtime.restore_rollback_snapshot
 _ORIGINAL_RUNTIME_DEBUG_SUMMARY = SpectrumH3Runtime.debug_summary
+_ORIGINAL_CONTROLLER_SNAPSHOT = ModelAwareController.snapshot
+_ORIGINAL_CONTROLLER_RESTORE = ModelAwareController.restore
 
 
 def _head_metrics_disabled(
@@ -370,6 +468,19 @@ def _weight_segments(
     *,
     coordinate: float,
 ):
+    controller = getattr(self, "_generic_correction_controller", None)
+    if (
+        isinstance(controller, GenericCorrectionController)
+        and controller.mode != "legacy"
+    ):
+        self._generic_fit_marker = self.forecaster.model_aware_fit_seconds
+        return _advanced_weight_segments(
+            self,
+            call,
+            decision,
+            coordinate=coordinate,
+            controller=controller,
+        )
     fit_before = self.forecaster.model_aware_fit_seconds
     correction_before = self.forecaster.model_aware_correction_seconds
     weighted = []
@@ -441,12 +552,57 @@ def _observe_anchor(
             configured_audio_blend=self.config.audio_blend_weight,
             configured_video_blend=self.config.blend_weight,
         )
-        evidence = (
-            _risk_anchor_evidence(self, step, combined, decision)
-            if mode == "schedule_confidence"
-            else _generic_anchor_evidence(self, step, combined, decision)
-        )
+        base_weights: dict[str, torch.Tensor] = {}
+        legacy_decision = decision
+        if mode == "schedule_confidence":
+            evidence = _risk_anchor_evidence(self, step, combined, decision)
+        else:
+            legacy_decision = _ORIGINAL_DECISION(
+                self.model_aware,
+                forecast_horizon=1.0,
+                history_length=self.forecaster.history_length,
+                configured_degree=self.config.degree,
+                configured_ridge_lambda=self.config.ridge_lambda,
+                configured_audio_blend=self.config.audio_blend_weight,
+                configured_video_blend=self.config.blend_weight,
+            )
+            evidence, base_weights = _generic_anchor_evidence(
+                self,
+                step,
+                combined,
+                decision,
+            )
         if evidence is not None:
+            controller = getattr(self, "_generic_correction_controller", None)
+            calibration = getattr(self, "_generic_correction_calibration", None)
+            exact_required = bool(
+                mode == "full"
+                and self._offline_phase is None
+                and (
+                    (
+                        isinstance(controller, GenericCorrectionController)
+                        and controller.mode != "legacy"
+                    )
+                    or (
+                        isinstance(calibration, GenericCalibrationState)
+                        and calibration.enabled
+                    )
+                )
+            )
+            if exact_required:
+                exact_started = time.perf_counter()
+                _exact_anchor_analysis(
+                    self,
+                    step,
+                    combined,
+                    decision,
+                    legacy_decision,
+                    base_weights,
+                )
+                if isinstance(controller, GenericCorrectionController):
+                    controller.overhead_seconds += (
+                        time.perf_counter() - exact_started
+                    )
             self.model_aware.observe_anchor(evidence, decision)
             self.stats.model_aware_anchor_updates += 1
             self.stats.model_aware_evidence_weight_fit_seconds += (
@@ -499,7 +655,68 @@ def _observe_anchor(
 def _start_run(self: SpectrumH3Runtime, *args, **kwargs):
     run_id = _ORIGINAL_RUNTIME_START(self, *args, **kwargs)
     self.forecaster._generic_correction_capture_mode = self.config.model_aware_mode
+    controller = GenericCorrectionController(
+        mode=self.config.generic_correction_mode,
+        limiter=self.config.generic_correction_limiter,
+        limit=self.config.generic_correction_limit,
+    )
+    self._generic_correction_controller = controller
+    self.model_aware._generic_correction_controller = controller
+    sigmas = args[0] if args else kwargs.get("sigmas")
+    if sigmas is None:
+        raise RuntimeError("generic correction run setup did not receive a sigma schedule")
+    self._generic_correction_calibration = create_calibration_state(
+        self,
+        sigmas,
+        enabled=bool(
+            self.config.debug
+            and self.config.model_aware_mode == "full"
+            and self._offline_phase is None
+        ),
+    )
+    self._generic_fit_marker = 0.0
     return run_id
+
+
+def _end_run(self: SpectrumH3Runtime, run_id: int) -> None:
+    calibration = getattr(self, "_generic_correction_calibration", None)
+    if isinstance(calibration, GenericCalibrationState):
+        try:
+            emit_calibration_block(self, calibration)
+        except (TypeError, ValueError) as exc:
+            calibration.failures += 1
+            LOG.warning("Spectrum H3 generic correction calibration export failed: %s", exc)
+    _ORIGINAL_RUNTIME_END(self, run_id)
+    self._generic_correction_controller = None
+    self._generic_correction_calibration = None
+    self.model_aware._generic_correction_controller = None
+
+
+def _controller_snapshot(self: ModelAwareController) -> dict[str, Any]:
+    state = _ORIGINAL_CONTROLLER_SNAPSHOT(self)
+    controller = getattr(self, "_generic_correction_controller", None)
+    if isinstance(controller, GenericCorrectionController):
+        state["generic_correction_controller"] = controller.snapshot()
+    return state
+
+
+def _controller_restore(self: ModelAwareController, state: dict[str, Any]) -> None:
+    _ORIGINAL_CONTROLLER_RESTORE(self, state)
+    generic_state = state.get("generic_correction_controller")
+    if isinstance(generic_state, dict):
+        self._generic_correction_controller = (
+            GenericCorrectionController.from_snapshot(generic_state)
+        )
+
+
+def _restore_rollback_snapshot(
+    self: SpectrumH3Runtime,
+    snapshot: Any,
+) -> None:
+    _ORIGINAL_RUNTIME_RESTORE(self, snapshot)
+    controller = getattr(self.model_aware, "_generic_correction_controller", None)
+    if isinstance(controller, GenericCorrectionController):
+        self._generic_correction_controller = controller
 
 
 def _remove_summary_field(summary: str, field_pattern: str) -> str:
@@ -521,7 +738,7 @@ def _debug_summary(self: SpectrumH3Runtime) -> str:
     for pattern in _RETIRED_SUMMARY_PATTERNS:
         summary = _remove_summary_field(summary, pattern)
     summary = " ".join(summary.split())
-    return (
+    base = (
         f"{summary} "
         "feature3_model_informed_correction=retired_no_material_gain "
         "feature3_applied_correction=generic_scalar_latest_delta "
@@ -533,6 +750,66 @@ def _debug_summary(self: SpectrumH3Runtime) -> str:
         "feature3_error_evidence_bytes=0 "
         "feature3_error_workspace_bytes=0 "
         "feature3_extra_transformer_nfe=0"
+    )
+    controller = getattr(self, "_generic_correction_controller", None)
+    if not isinstance(controller, GenericCorrectionController):
+        return (
+            f"{base} generic_correction_mode={self.config.generic_correction_mode!r} "
+            f"generic_correction_limiter={self.config.generic_correction_limiter!r} "
+            f"generic_correction_limit={self.config.generic_correction_limit:.6f} "
+            "generic_correction_estimator=legacy_ewma generic_correction_regions=0 "
+            "generic_correction_extra_transformer_nfes=0"
+        )
+    aggregate_count = controller.audio_aggregate.count + controller.video_aggregate.count
+    reliability_sum = (
+        controller.audio_aggregate.reliability_sum
+        + controller.video_aggregate.reliability_sum
+    )
+    reliability_mean = reliability_sum / aggregate_count if aggregate_count else 0.0
+    minima = [
+        item.resolved_reliability_min
+        for item in (controller.audio_aggregate, controller.video_aggregate)
+        if item.count
+    ]
+    maxima = [
+        item.reliability_max
+        for item in (controller.audio_aggregate, controller.video_aggregate)
+        if item.count
+    ]
+    estimator = "legacy_ewma" if controller.mode == "legacy" else "ewls_rls_lambda_0.90"
+    geometry = (
+        "legacy_latest_delta"
+        if controller.mode == "legacy"
+        else "coordinate_transported_latest_delta"
+    )
+    return (
+        f"{base} "
+        f"generic_correction_mode={controller.mode!r} "
+        f"generic_correction_geometry={geometry} "
+        f"generic_correction_estimator={estimator} "
+        f"generic_correction_coordinate_active={controller.coordinate_active_count} "
+        f"generic_correction_coordinate_fallbacks={controller.coordinate_fallback_count} "
+        f"generic_correction_reliability_mean={reliability_mean:.6f} "
+        f"generic_correction_reliability_min={min(minima, default=0.0):.6f} "
+        f"generic_correction_reliability_max={max(maxima, default=0.0):.6f} "
+        f"generic_correction_limiter={controller.limiter!r} "
+        f"generic_correction_limit={controller.limit:.6f} "
+        f"generic_correction_scope={'regional' if controller.mode == 'regional' else 'global'} "
+        f"generic_correction_regions={len(controller.regions)} "
+        f"generic_correction_regional_active={controller.regional_active_count} "
+        f"generic_correction_regional_fallbacks={controller.regional_fallback_count} "
+        f"generic_correction_audio_raw_gain_mean={controller.audio_aggregate.raw_mean:.6f} "
+        f"generic_correction_audio_applied_gain_mean={controller.audio_aggregate.applied_mean:.6f} "
+        f"generic_correction_audio_estimator_support={controller.audio.rls.support:.6f} "
+        f"generic_correction_audio_estimator_energy={controller.audio.rls.c_acc:.6e} "
+        f"generic_correction_audio_estimator_age={controller.audio.rls.effective_age:.6f} "
+        f"generic_correction_video_raw_gain_mean={controller.video_aggregate.raw_mean:.6f} "
+        f"generic_correction_video_applied_gain_mean={controller.video_aggregate.applied_mean:.6f} "
+        f"generic_correction_video_estimator_support={controller.video.rls.support:.6f} "
+        f"generic_correction_video_estimator_energy={controller.video.rls.c_acc:.6e} "
+        f"generic_correction_video_estimator_age={controller.video.rls.effective_age:.6f} "
+        f"generic_correction_overhead_s={controller.overhead_seconds:.6f} "
+        "generic_correction_extra_transformer_nfes=0"
     )
 
 
@@ -560,7 +837,11 @@ def install_generic_residual_correction() -> None:
     SpectrumH3Runtime._model_aware_weight_segments = _weight_segments
     SpectrumH3Runtime._observe_model_aware_anchor = _observe_anchor
     SpectrumH3Runtime.start_run = _start_run
+    SpectrumH3Runtime.end_run = _end_run
+    SpectrumH3Runtime.restore_rollback_snapshot = _restore_rollback_snapshot
     SpectrumH3Runtime.debug_summary = _debug_summary
+    ModelAwareController.snapshot = _controller_snapshot
+    ModelAwareController.restore = _controller_restore
     SpectrumH3Runtime._generic_residual_correction_installed = True
 
 

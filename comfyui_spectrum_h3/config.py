@@ -28,6 +28,9 @@ class SpectrumH3Config:
     model_aware_risk_threshold: float = 0.65
     model_aware_trust_shrinkage: bool = False
     model_aware_replay_generic_correction: bool = False
+    generic_correction_mode: str = "legacy"
+    generic_correction_limiter: str = "rational"
+    generic_correction_limit: float = 0.25
 
     def __post_init__(self) -> None:
         trajectory_modes = {
@@ -149,6 +152,32 @@ class SpectrumH3Config:
         if self.model_aware_trust_shrinkage and self.model_aware_mode != "full":
             raise ValueError(
                 "model_aware_trust_shrinkage requires model_aware_mode='full'"
+            )
+        if self.generic_correction_mode not in {
+            "legacy",
+            "coordinate_rls",
+            "coordinate_rls_reliability",
+            "regional",
+        }:
+            raise ValueError(
+                "generic_correction_mode must be 'legacy', 'coordinate_rls', "
+                "'coordinate_rls_reliability', or 'regional'"
+            )
+        if self.generic_correction_limiter not in {
+            "rational",
+            "hard_clip",
+            "tanh",
+        }:
+            raise ValueError(
+                "generic_correction_limiter must be 'rational', 'hard_clip', or 'tanh'"
+            )
+        if (
+            not math.isfinite(self.generic_correction_limit)
+            or self.generic_correction_limit <= 0.0
+            or self.generic_correction_limit > 1.0
+        ):
+            raise ValueError(
+                "generic_correction_limit must be finite and in (0, 1]"
             )
         if (
             not math.isfinite(self.model_aware_risk_threshold)

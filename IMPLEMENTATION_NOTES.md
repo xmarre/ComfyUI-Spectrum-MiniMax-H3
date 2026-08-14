@@ -95,6 +95,14 @@ The existing controller confidence convention is preserved, and the scalar is pa
 g = g_raw_scaled / (1 + |g_raw_scaled| / 0.25)
 ```
 
+The exact legacy implementation remains selectable and is the default. The
+subsequent generic-scalar research pass adds coordinate-transported/RLS,
+correction-reliability, and topology-proven regional VIDEO paths behind the
+separate `generic_correction_mode` selector. These paths reuse only the causal
+latest-delta direction, add no transformer evaluation, and do not revive retired
+model-specific Feature-3 geometry. Exact scalar calibration and the CPU evaluator
+are described in [GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md).
+
 `full` applies this gain to the latest-delta correction exactly. The retired exact-head and Gram-diagonal candidates no longer alter the applied value:
 
 ```text
@@ -135,7 +143,7 @@ feature3_extra_transformer_nfe=0
 
 ## Generic evidence storage
 
-Feature 2 and the surviving generic scalar correction continue to use the existing deterministic sampled hidden evidence. The sample is bounded and device-local; only reduced scalars are transferred to controller state.
+Feature 2 and the legacy generic scalar correction continue to use the existing deterministic sampled hidden evidence. The advanced RLS/reliability candidates reduce exact full-stream `A/B/C` moments through bounded chunks and retain only scalars. Calibration export is enabled only for debug full single-pass runs and serializes no hidden payload.
 
 Exact-head projected-row history is no longer populated by normal runtime. Full head materialization, exact-head evidence storage, exact-head projection calls, exact-head temporary workspace, and exact-head projection timing are therefore zero in normal `full`.
 
@@ -143,9 +151,13 @@ The regular forecast history still obeys `max_history` and `history_storage`. No
 
 ## Offline smoothing replay
 
-Offline replay remains the standard scalar replay path. Capture records the selected schedule/fitting/blend decisions plus the same surviving generic scalar correction gain. Replay consumes that recorded scalar decision after dynamically inserted anchors.
-
-First-pass `full` and replay therefore use the same correction semantics. No rejected Feature-3 tensor state is archived. Replay remains transformer-free and preserves the existing ER-SDE seeded replay ownership rules.
+Offline replay remains a separate compatibility/audio path. The supported default
+`model_aware_replay_generic_correction=false` does not transplant the causal
+latest-delta scalar onto the different future-bracket replay direction. The
+legacy `true` setting remains available only for regression/scientific
+reproduction. No coordinate/RLS, reliability, regional, or limiter-calibration
+state is archived or applied by replay. Replay remains transformer-free and
+preserves the existing ER-SDE seeded replay ownership rules.
 
 For native `sample_er_sde`, Spectrum still requires the native seeded noise components for replay and does not mutate generator/noise-sampler/solver-derivative state.
 

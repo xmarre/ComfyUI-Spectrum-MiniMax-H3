@@ -217,6 +217,46 @@ class SpectrumApplyMiniMaxH3:
                         ),
                     },
                 ),
+                "generic_correction_mode": (
+                    [
+                        "legacy",
+                        "coordinate_rls",
+                        "coordinate_rls_reliability",
+                        "regional",
+                    ],
+                    {
+                        "default": "legacy",
+                        "tooltip": (
+                            "Advanced full-mode correction controller. Legacy exactly preserves the validated "
+                            "latest-delta EWMA path. The other modes add coordinate transport, recursive "
+                            "least-squares gain estimation, correction-specific reliability, and topology-proven "
+                            "coarse video temporal regions. Experimental modes add no transformer evaluation."
+                        ),
+                    },
+                ),
+                "generic_correction_limiter": (
+                    ["rational", "hard_clip", "tanh"],
+                    {
+                        "default": "rational",
+                        "tooltip": (
+                            "Advanced generic-correction gain limiter. Rational with limit 0.25 is the exact "
+                            "validated baseline. Hard clip and tanh are experimental A/B paths."
+                        ),
+                    },
+                ),
+                "generic_correction_limit": (
+                    "FLOAT",
+                    {
+                        "default": 0.25,
+                        "min": 0.01,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Advanced symmetric gain-limit scale. Keep 0.25 for the validated baseline; "
+                            "alternative values are research-only until real A/B validation."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -249,6 +289,9 @@ class SpectrumApplyMiniMaxH3:
         model_aware_risk_threshold=0.65,
         model_aware_trust_shrinkage=False,
         model_aware_replay_generic_correction=False,
+        generic_correction_mode="legacy",
+        generic_correction_limiter="rational",
+        generic_correction_limit=0.25,
     ):
         if not enabled:
             return (model,)
@@ -297,6 +340,9 @@ class SpectrumApplyMiniMaxH3:
             model_aware_replay_generic_correction=(
                 model_aware_replay_generic_correction
             ),
+            generic_correction_mode=str(generic_correction_mode),
+            generic_correction_limiter=str(generic_correction_limiter),
+            generic_correction_limit=float(generic_correction_limit),
             debug=bool(debug),
         ).validate()
         patched = model.clone()

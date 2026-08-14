@@ -229,6 +229,9 @@ Built-in ComfyUI previews, ComfyUI-bleh Better Previews, VHS Preview, and other 
 | `model_aware_risk_threshold` | `0.65` | Threshold used by model-aware scheduling to convert a risky prospective forecast into an actual evaluation. |
 | `model_aware_trust_shrinkage` | `false` | Research/reproduction switch. The completed perceptual gate did not support promotion. |
 | `model_aware_replay_generic_correction` | `false` | Legacy/research replay transfer of the causal generic correction. Keep disabled for normal use. |
+| `generic_correction_mode` | `legacy` | Advanced `full` controller: exact legacy baseline, coordinate/RLS, coordinate/RLS/reliability, or topology-safe regional VIDEO. New modes are experimental. |
+| `generic_correction_limiter` | `rational` | Generic gain limiter: validated `rational` baseline or experimental `hard_clip`/`tanh`. |
+| `generic_correction_limit` | `0.25` | Symmetric limiter scale. Keep `0.25` for the validated baseline. |
 | `anchor_residual_feedback` | `false` | Experimental video-scored actual-refresh guard. Requires single-pass operation. |
 | `selective_rollback_correction` | `false` | Experimental deterministic-Euler rollback path. Requires single-pass operation. |
 
@@ -315,6 +318,14 @@ g_raw = <r, d> / <d, d>
 
 The gain is confidence-scaled and bounded before it is applied to the latest-delta direction. The correction itself adds no transformer evaluation. The scheduling component can still convert risky forecast steps into actual evaluations.
 
+`generic_correction_mode=legacy`, `generic_correction_limiter=rational`, and
+`generic_correction_limit=0.25` preserve this validated path. The selectable
+coordinate/RLS, correction-reliability, and coarse temporal VIDEO controllers are
+experimental live A/B paths. With `debug=true`, full single-pass runs also emit
+scalar-only exact quadratic calibration blocks for the CPU evaluator. See
+[GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md) for their causal
+contract, topology proof, offline evaluation discipline, and promotion gate.
+
 The earlier model-specific Feature-3 correction families did not provide material improvement and were retired from normal runtime. The experiment record is preserved in [MODEL_AWARE_BENCHMARK.md](MODEL_AWARE_BENCHMARK.md) and [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md).
 
 ### Trust shrinkage and replay calibration research
@@ -323,7 +334,7 @@ The earlier model-specific Feature-3 correction families did not provide materia
 
 `model_aware_replay_generic_correction=false` is also the supported setting. Replay traces rejected transplanting the causal latest-delta scalar onto the different future-bracket replay direction.
 
-The repository retains scalar-only replay calibration export and a CPU evaluator for future research. No affine, disagreement, coordinate, validation-penalty, tree, neural, AutoML, or other additional replay controller is applied at runtime. See [FORECAST_TRUST_BENCHMARK.md](FORECAST_TRUST_BENCHMARK.md).
+The repository retains scalar-only replay calibration export and a CPU evaluator for future replay research. No affine, disagreement, coordinate, validation-penalty, tree, neural, AutoML, or other additional replay controller is applied to replay at runtime. Causal generic-correction experiments remain strictly separate. See [FORECAST_TRUST_BENCHMARK.md](FORECAST_TRUST_BENCHMARK.md) and [GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md).
 
 ## Experimental trajectory controls
 

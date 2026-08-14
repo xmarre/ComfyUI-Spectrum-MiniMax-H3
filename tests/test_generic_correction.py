@@ -8,9 +8,13 @@ import torch
 
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.experiments import OfflineModelAwareDecision
+from comfyui_spectrum_h3.generic_correction_controller import (
+    GenericCorrectionController,
+)
 from comfyui_spectrum_h3.model_aware import (
     ModelAwareController,
     ModelForecastabilityProfile,
+    ProfileLookup,
     clear_model_profile_cache,
     get_model_forecastability_profile,
 )
@@ -157,6 +161,45 @@ def test_full_applied_gain_is_exactly_generic_scalar_gain():
     assert not decision.audio_subspace_telemetry.eligible
     assert not decision.video_subspace_telemetry.eligible
     assert decision.correction_anchor_ids == ()
+
+
+def test_default_legacy_selector_is_numerically_identical_to_unselected_baseline():
+    controller = ModelAwareController("full", risk_threshold=1.0)
+    controller.set_profile(_profile())
+    controller.anchor_count = 3
+    controller.audio_projection_ewma = 0.60
+    controller.video_projection_ewma = -0.35
+    baseline = controller.decision(
+        forecast_horizon=1.25,
+        history_length=5,
+        configured_degree=1,
+        configured_ridge_lambda=0.1,
+        configured_audio_blend=0.0,
+        configured_video_blend=0.5,
+    )
+    controller._generic_correction_controller = GenericCorrectionController(
+        "legacy",
+        "rational",
+        0.25,
+    )
+    selected = controller.decision(
+        forecast_horizon=1.25,
+        history_length=5,
+        configured_degree=1,
+        configured_ridge_lambda=0.1,
+        configured_audio_blend=0.0,
+        configured_video_blend=0.5,
+    )
+    assert selected.audio_correction_gain == pytest.approx(
+        baseline.audio_correction_gain,
+        abs=1e-12,
+    )
+    assert selected.video_correction_gain == pytest.approx(
+        baseline.video_correction_gain,
+        abs=1e-12,
+    )
+    assert selected.audio_correction_telemetry == baseline.audio_correction_telemetry
+    assert selected.video_correction_telemetry == baseline.video_correction_telemetry
 
 
 def test_schedule_confidence_has_no_correction():
@@ -312,3 +355,80 @@ def test_debug_summary_keeps_only_explicit_feature3_retirement_state():
     assert "feature3_direction_evidence_bytes=0" in summary
     assert "feature3_error_evidence_bytes=0" in summary
     assert "feature3_extra_transformer_nfe=0" in summary
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "legacy",
+        "coordinate_rls",
+        "coordinate_rls_reliability",
+        "regional",
+    ],
+)
+def test_native_er_sde_correction_modes_preserve_nfe_and_schedule_counts(mode):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            warmup_steps=2,
+            tail_actual_steps=0,
+            window_size=2.0,
+            bootstrap_first_forecast=False,
+            offline_smoothing_replay=False,
+            model_aware_mode="full",
+            model_aware_risk_threshold=1.0,
+            generic_correction_mode=mode,
+        )
+    )
+    runtime.set_model_profile(ProfileLookup(_profile(), False, 0.0))
+    runtime.start_run(
+        torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0]),
+        "sample_er_sde",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    topology = (
+        ("video_shape", (1, 24, 4, 2, 2)),
+        ("video_padded", (4, 2, 2)),
+        ("audio_shape", (1, 32, 2, 4)),
+        ("hidden_width", 4),
+        ("target_audio_rows", 1),
+        ("target_video_rows", 4),
+        ("patch_size", (1, 2, 2)),
+    )
+    labels = ((0, "positive"),)
+    for timestep in (1.0, 0.8, 0.6, 0.4, 0.2):
+        decision = runtime.begin_step(torch.tensor([timestep]))
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=topology,
+            labels=labels,
+            expected_shape=(1, 5, 4),
+        )
+        if actual:
+            runtime.observe_actual(
+                decision["run_id"],
+                decision["step_id"],
+                call_id,
+                torch.full((1, 5, 4), float(decision["step_id"])),
+            )
+        else:
+            assert runtime.predict(
+                decision["run_id"],
+                decision["step_id"],
+                call_id,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            ) is not None
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+    counts = (
+        runtime.stats.actual_steps,
+        runtime.stats.forecast_steps,
+        runtime.stats.actual_transformer_calls,
+        runtime.stats.adaptive_extra_nfes,
+    )
+    assert counts == (3, 2, 3, 0)
+    runtime.end_run(runtime.active_run_id)

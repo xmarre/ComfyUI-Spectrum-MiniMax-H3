@@ -71,6 +71,9 @@ def test_preliminary_scheduler_defaults():
     assert config.offline_archive_storage == "system_ram"
     assert config.model_aware_mode == "off"
     assert config.model_aware_risk_threshold == 0.65
+    assert config.generic_correction_mode == "legacy"
+    assert config.generic_correction_limiter == "rational"
+    assert config.generic_correction_limit == 0.25
     assert required["degree"][1]["default"] == 1
     assert required["warmup_steps"][1]["default"] == 1
     assert required["tail_actual_steps"][1]["default"] == 1
@@ -99,11 +102,41 @@ def test_preliminary_scheduler_defaults():
     ]
     assert optional["model_aware_mode"][1]["default"] == "off"
     assert apply_parameters["model_aware_mode"].default == "off"
+    assert optional["generic_correction_mode"][0] == [
+        "legacy",
+        "coordinate_rls",
+        "coordinate_rls_reliability",
+        "regional",
+    ]
+    assert optional["generic_correction_mode"][1]["default"] == "legacy"
+    assert apply_parameters["generic_correction_mode"].default == "legacy"
+    assert optional["generic_correction_limiter"][1]["default"] == "rational"
+    assert apply_parameters["generic_correction_limiter"].default == "rational"
+    assert optional["generic_correction_limit"][1]["default"] == 0.25
+    assert apply_parameters["generic_correction_limit"].default == 0.25
     for name in ("anchor_residual_feedback", "selective_rollback_correction"):
         assert getattr(config, name) is False
         assert optional[name][0] == "BOOLEAN"
         assert optional[name][1]["default"] is False
         assert apply_parameters[name].default is False
+
+
+@pytest.mark.parametrize("value", ["", "rls", "REGIONAL", None])
+def test_generic_correction_mode_rejects_unknown_values(value):
+    with pytest.raises(ValueError, match="generic_correction_mode"):
+        SpectrumH3Config(generic_correction_mode=value).validate()
+
+
+@pytest.mark.parametrize("value", ["", "clip", "softsign", None])
+def test_generic_correction_limiter_rejects_unknown_values(value):
+    with pytest.raises(ValueError, match="generic_correction_limiter"):
+        SpectrumH3Config(generic_correction_limiter=value).validate()
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1, 1.1, float("nan"), float("inf")])
+def test_generic_correction_limit_requires_positive_finite_unit_range(value):
+    with pytest.raises(ValueError, match="generic_correction_limit"):
+        SpectrumH3Config(generic_correction_limit=value).validate()
 
 
 @pytest.mark.parametrize(

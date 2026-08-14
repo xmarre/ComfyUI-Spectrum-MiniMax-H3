@@ -232,3 +232,24 @@ Verify:
 - no correctness or ER-SDE replay regression.
 
 If that mechanical gate passes, PR #39 is scientifically finished.
+
+## Subsequent generic-scalar research pass
+
+PR #39's negative conclusion remains in force for model-informed direction
+families. A later research pass does not reopen K=2, transformed directions,
+previous-error directions, output-head geometry, or replay transfer. It builds a
+predeclared controller family around the retained generic causal latest delta:
+
+- exact legacy behavior remains the default;
+- signed sampler-coordinate transport is separately scorable;
+- exponentially weighted least-squares estimates scalar magnitude from accumulated
+  `B=<r,d>` and `C=<d,d>` support;
+- correction-specific reliability attenuates only the generic correction;
+- topology-proven coarse temporal VIDEO regions remain local latest-delta scalars;
+- rational, hard-clip, and tanh limiters are evaluated from exact quadratic moments;
+- a CPU evaluator enforces whole-run separation and reports hidden-space results
+  without promoting a perceptual claim.
+
+All candidate paths add zero transformer NFEs. Their implementation and validation
+contract are documented in [GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md).
+No new candidate is the production default pending real A/B generations.
