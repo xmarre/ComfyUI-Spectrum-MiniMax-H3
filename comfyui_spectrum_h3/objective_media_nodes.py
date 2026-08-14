@@ -643,11 +643,11 @@ __all__ = [
     "MAX_PENDING_BYTES",
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
+    "SpectrumH3ObjectiveCaptureReset",
     "SpectrumH3ObjectiveMediaStage",
     "SpectrumH3ObjectiveQualityCompare",
-    "SpectrumH3ObjectiveStagedQualityCompare",
     "SpectrumH3ObjectiveSequentialCapture",
-    "SpectrumH3ObjectiveCaptureReset",
+    "SpectrumH3ObjectiveStagedQualityCompare",
     "clear_pending_objective_media",
     "pending_objective_media_state",
 ]
