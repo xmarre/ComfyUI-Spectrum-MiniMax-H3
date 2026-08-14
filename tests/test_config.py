@@ -71,9 +71,10 @@ def test_preliminary_scheduler_defaults():
     assert config.offline_archive_storage == "system_ram"
     assert config.model_aware_mode == "off"
     assert config.model_aware_risk_threshold == 0.65
-    assert config.generic_correction_mode == "legacy"
-    assert config.generic_correction_limiter == "rational"
-    assert config.generic_correction_limit == 0.25
+    assert config.generic_correction_mode == "coordinate_rls"
+    assert config.generic_correction_attenuation == "no_attenuation"
+    assert config.generic_correction_limiter == "hard_clip"
+    assert config.generic_correction_limit == 0.40
     assert required["degree"][1]["default"] == 1
     assert required["warmup_steps"][1]["default"] == 1
     assert required["tail_actual_steps"][1]["default"] == 1
@@ -108,12 +109,12 @@ def test_preliminary_scheduler_defaults():
         "coordinate_rls_reliability",
         "regional",
     ]
-    assert optional["generic_correction_mode"][1]["default"] == "legacy"
-    assert apply_parameters["generic_correction_mode"].default == "legacy"
-    assert optional["generic_correction_limiter"][1]["default"] == "rational"
-    assert apply_parameters["generic_correction_limiter"].default == "rational"
-    assert optional["generic_correction_limit"][1]["default"] == 0.25
-    assert apply_parameters["generic_correction_limit"].default == 0.25
+    assert optional["generic_correction_mode"][1]["default"] == "coordinate_rls"
+    assert apply_parameters["generic_correction_mode"].default == "coordinate_rls"
+    assert optional["generic_correction_limiter"][1]["default"] == "hard_clip"
+    assert apply_parameters["generic_correction_limiter"].default == "hard_clip"
+    assert optional["generic_correction_limit"][1]["default"] == 0.40
+    assert apply_parameters["generic_correction_limit"].default == 0.40
     for name in ("anchor_residual_feedback", "selective_rollback_correction"):
         assert getattr(config, name) is False
         assert optional[name][0] == "BOOLEAN"
@@ -346,13 +347,16 @@ def test_apply_normalizes_reported_warmup_conflict(monkeypatch, caplog):
     assert captured["config"].bootstrap_first_forecast is False
     assert captured["config"].audio_blend_weight == 0.25
     assert captured["config"].offline_archive_storage == "vram"
-    assert captured["config"].generic_correction_attenuation == "mode_default"
+    assert captured["config"].generic_correction_mode == "coordinate_rls"
+    assert captured["config"].generic_correction_attenuation == "no_attenuation"
+    assert captured["config"].generic_correction_limiter == "hard_clip"
+    assert captured["config"].generic_correction_limit == 0.40
     assert "Disabling bootstrap_first_forecast" in caplog.text
 
 
 def test_saved_workflow_default_adds_no_public_rls_lambda_control():
     optional = SpectrumApplyMiniMaxH3.INPUT_TYPES()["optional"]
-    assert optional["generic_correction_attenuation"][1]["default"] == "mode_default"
+    assert optional["generic_correction_attenuation"][1]["default"] == "no_attenuation"
     keys = list(optional)
     assert keys.index("generic_correction_attenuation") > keys.index(
         "generic_correction_limit"

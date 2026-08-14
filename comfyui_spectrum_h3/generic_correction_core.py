@@ -25,7 +25,7 @@ EPSILON = 1.0e-12
 
 
 def resolve_attenuation_policy(mode: str, attenuation: str) -> str:
-    """Resolve the policy actually applied by an experimental live mode."""
+    """Resolve the attenuation policy actually applied by a live mode."""
     if attenuation not in GENERIC_CORRECTION_ATTENUATIONS:
         raise ValueError(f"unknown generic correction attenuation {attenuation!r}")
     if mode not in GENERIC_CORRECTION_MODES:

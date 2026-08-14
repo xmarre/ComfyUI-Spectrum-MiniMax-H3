@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from comfyui_spectrum_h3 import objective_media as objective_media_module
+from comfyui_spectrum_h3 import objective_media_nodes as objective_nodes_module
 from comfyui_spectrum_h3.objective_media import (
     ObjectiveMediaError,
     aggregate_objective_reports,
@@ -363,6 +367,128 @@ def test_aggregate_rejects_incompatible_or_duplicate_cases():
         aggregate_objective_reports([first, duplicate])
     with pytest.raises(ObjectiveMediaError, match="incompatible"):
         aggregate_objective_reports([first, incompatible])
+
+
+def test_metric_aware_reporting_uses_correlation_points_and_db_deltas():
+    rows = [
+        objective_media_module._comparison_row(
+            "video_ms_ssim", 0.9500, 0.95321, higher_is_better=True
+        ),
+        objective_media_module._comparison_row(
+            "video_psnr_db", 14.730, 14.786, higher_is_better=True
+        ),
+        objective_media_module._comparison_row(
+            "video_temporal_derivative_error",
+            0.1000,
+            0.098029,
+            higher_is_better=False,
+        ),
+        objective_media_module._comparison_row(
+            "video_motion_weighted_detail_error",
+            0.0500,
+            0.049991,
+            higher_is_better=False,
+        ),
+        objective_media_module._comparison_row(
+            "video_worst_frame_ms_ssim", 0.9000, 0.896076, higher_is_better=True
+        ),
+        objective_media_module._comparison_row(
+            "audio_mrstft_log_magnitude_error",
+            0.0531789,
+            0.0501190,
+            higher_is_better=False,
+        ),
+        objective_media_module._comparison_row(
+            "audio_normalized_correlation",
+            0.0709787979722023,
+            0.05183333158493042,
+            higher_is_better=True,
+        ),
+        objective_media_module._comparison_row(
+            "audio_si_sdr_db",
+            -22.955676907500695,
+            -25.69615685113841,
+            higher_is_better=True,
+        ),
+        objective_media_module._comparison_row(
+            "audio_worst_window_spectral_error",
+            0.1000,
+            0.097524,
+            higher_is_better=False,
+        ),
+        objective_media_module._comparison_row(
+            "audio_absolute_bounded_lag_ms", 0.0, 0.0, higher_is_better=False
+        ),
+    ]
+    verdict = objective_media_module._verdict(rows, audio_present=True)
+    assert verdict["value"] == "candidate_favored"
+    by_name = {row["metric"]: row for row in rows}
+    assert by_name["audio_normalized_correlation"][
+        "absolute_candidate_delta"
+    ] == pytest.approx(-0.0191454664)
+    assert by_name["audio_si_sdr_db"]["absolute_candidate_delta"] == pytest.approx(
+        -2.7404799436
+    )
+    assert by_name["video_psnr_db"]["absolute_candidate_delta"] == pytest.approx(
+        0.056
+    )
+    assert by_name["audio_normalized_correlation"]["metric_role"] == "diagnostic"
+    assert by_name["audio_si_sdr_db"]["metric_role"] == "diagnostic"
+    assert by_name["video_psnr_db"]["metric_role"] == "diagnostic"
+
+    report = {
+        "benchmark_id": "seed-3-like",
+        "seed": 3,
+        "group_id": "fixture",
+        "verdict": verdict,
+        "comparisons": rows,
+    }
+    markdown = objective_media_module._report_markdown(report)
+    assert "-0.01915 correlation points" in markdown
+    assert "-2.740 dB" in markdown
+    assert "+0.056 dB" in markdown
+    assert "diagnostic only" in markdown
+    assert "-26.974%" not in markdown
+    assert "-10.665%" not in markdown
+    summary = objective_nodes_module._summary_from_report(
+        report,
+        SimpleNamespace(group_id="fixture", run_count=3, markdown_path="report.md"),
+    )
+    assert "normalized-correlation diagnostic delta=-0.01915 points" in summary
+    assert "SI-SDR diagnostic delta=-2.740 dB" in summary
+    assert "PSNR diagnostic delta=+0.056 dB" in summary
+    assert "-26.974%" not in summary
+    assert "-10.665%" not in summary
+
+
+def test_existing_v1_rows_are_normalized_and_rendered_without_regeneration(tmp_path):
+    video = _video()
+    audio = _audio()
+    current = _evaluate(
+        video,
+        video.roll(1, 0),
+        video,
+        reference_audio=audio,
+        legacy_audio={"waveform": audio["waveform"].roll(10, -1), "sample_rate": 8000},
+        candidate_audio=audio,
+        benchmark_id="existing-v1",
+        seed=9,
+    )
+    stored_v1 = copy.deepcopy(current)
+    for row in stored_v1["comparisons"]:
+        row.pop("absolute_candidate_delta")
+        row.pop("metric_role")
+        row.pop("display")
+
+    aggregate = aggregate_objective_reports([stored_v1])
+    assert "mean_absolute_candidate_delta" in aggregate["metrics"]["video_psnr_db"]
+    persisted = persist_objective_report(stored_v1, root=tmp_path)
+    raw = json.loads(persisted.json_path.read_text(encoding="utf-8"))
+    assert "absolute_candidate_delta" not in raw["comparisons"][0]
+    markdown = persisted.markdown_path.read_text(encoding="utf-8")
+    assert "diagnostic only" in markdown
+    refreshed = json.loads(persisted.aggregate_json_path.read_text(encoding="utf-8"))
+    assert "mean_absolute_candidate_delta" in refreshed["metrics"]["audio_si_sdr_db"]
 
 
 def test_node_registration_and_optional_audio_schema():

@@ -45,6 +45,47 @@ REQUIRED_COMPATIBILITY_FIELDS = frozenset(
     }
 )
 
+_COMPARISON_METADATA = {
+    "video_ms_ssim": ("verdict_primary", "score_points", "relative_and_absolute"),
+    "video_psnr_db": ("diagnostic", "dB", "absolute_delta"),
+    "video_temporal_derivative_error": (
+        "verdict_primary",
+        "error_units",
+        "relative_and_absolute",
+    ),
+    "video_motion_weighted_detail_error": (
+        "verdict_primary",
+        "error_units",
+        "relative_and_absolute",
+    ),
+    "video_worst_frame_ms_ssim": (
+        "verdict_guardrail",
+        "score_points",
+        "relative_and_absolute",
+    ),
+    "audio_mrstft_log_magnitude_error": (
+        "verdict_primary",
+        "error_units",
+        "relative_and_absolute",
+    ),
+    "audio_normalized_correlation": (
+        "diagnostic",
+        "correlation_points",
+        "absolute_delta",
+    ),
+    "audio_si_sdr_db": ("diagnostic", "dB", "absolute_delta"),
+    "audio_worst_window_spectral_error": (
+        "verdict_guardrail",
+        "error_units",
+        "relative_and_absolute",
+    ),
+    "audio_absolute_bounded_lag_ms": (
+        "verdict_guardrail",
+        "ms",
+        "absolute_delta",
+    ),
+}
+
 
 class ObjectiveMediaError(ValueError):
     pass
@@ -634,6 +675,18 @@ def _relative_advantage(legacy: float, candidate: float, *, higher_is_better: bo
     return ((candidate - legacy) if higher_is_better else (legacy - candidate)) / denominator
 
 
+def _format_delta_value(delta: float, unit: str) -> str:
+    if unit == "dB":
+        return f"{delta:+.3f} dB"
+    if unit == "ms":
+        return f"{delta:+.3f} ms"
+    if unit == "correlation_points":
+        return f"{delta:+.5f} correlation points"
+    if unit == "score_points":
+        return f"{delta:+.6f} score points"
+    return f"{delta:+.6g}"
+
+
 def _comparison_row(
     name: str,
     legacy: float,
@@ -648,14 +701,91 @@ def _comparison_row(
         winner = "candidate"
     else:
         winner = "legacy"
+    role, display_unit, display_kind = _COMPARISON_METADATA[name]
+    absolute_delta = candidate - legacy
     return {
         "metric": name,
         "direction": "higher_is_better" if higher_is_better else "lower_is_better",
         "legacy": legacy,
         "candidate": candidate,
+        "absolute_candidate_delta": absolute_delta,
         "candidate_relative_advantage": advantage,
+        "metric_role": role,
+        "display": {
+            "kind": display_kind,
+            "unit": display_unit,
+            "candidate_delta": absolute_delta,
+            "headline": _format_delta_value(absolute_delta, display_unit),
+        },
         "winner": winner,
     }
+
+
+def _normalize_comparison_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Add current display metadata to an existing schema-v1 comparison row."""
+    name = str(row["metric"])
+    legacy = float(row["legacy"])
+    candidate = float(row["candidate"])
+    direction = str(row["direction"])
+    if direction not in {"higher_is_better", "lower_is_better"}:
+        raise ObjectiveMediaError(f"objective comparison {name!r} has an invalid direction")
+    if not all(math.isfinite(value) for value in (legacy, candidate)):
+        raise ObjectiveMediaError(f"objective comparison {name!r} contains non-finite values")
+    role, display_unit, display_kind = _COMPARISON_METADATA.get(
+        name,
+        ("diagnostic", "metric_units", "absolute_delta"),
+    )
+    normalized = dict(row)
+    normalized["legacy"] = legacy
+    normalized["candidate"] = candidate
+    normalized["absolute_candidate_delta"] = candidate - legacy
+    normalized.setdefault(
+        "candidate_relative_advantage",
+        _relative_advantage(
+            legacy,
+            candidate,
+            higher_is_better=direction == "higher_is_better",
+        ),
+    )
+    normalized["candidate_relative_advantage"] = float(
+        normalized["candidate_relative_advantage"]
+    )
+    if not math.isfinite(normalized["candidate_relative_advantage"]):
+        raise ObjectiveMediaError(
+            f"objective comparison {name!r} has a non-finite relative advantage"
+        )
+    normalized["metric_role"] = role
+    normalized["display"] = {
+        "kind": display_kind,
+        "unit": display_unit,
+        "candidate_delta": candidate - legacy,
+        "headline": _format_delta_value(candidate - legacy, display_unit),
+    }
+    if "winner" not in normalized:
+        advantage = normalized["candidate_relative_advantage"]
+        normalized["winner"] = (
+            "tie"
+            if math.isclose(
+                legacy,
+                candidate,
+                rel_tol=0.0,
+                abs_tol=ABSOLUTE_TOLERANCE,
+            )
+            else ("candidate" if advantage > 0.0 else "legacy")
+        )
+    return normalized
+
+
+def _display_delta(row: dict[str, Any]) -> str:
+    normalized = _normalize_comparison_row(row)
+    return str(normalized["display"]["headline"])
+
+
+def _display_decision_fraction(row: dict[str, Any]) -> str:
+    normalized = _normalize_comparison_row(row)
+    if normalized["metric_role"] == "diagnostic":
+        return "diagnostic only"
+    return f"{normalized['candidate_relative_advantage']:+.3%}"
 
 
 def _paired_comparisons(video: dict[str, Any], audio: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -968,7 +1098,10 @@ def _trim_report_groups(root: Path, keep: int) -> None:
 
 
 def _metric_map(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    return {row["metric"]: row for row in report["comparisons"]}
+    return {
+        row["metric"]: _normalize_comparison_row(row)
+        for row in report["comparisons"]
+    }
 
 
 def _independent_case_bootstrap(values: list[float], *, draws: int = 2000) -> dict[str, Any]:
@@ -1006,14 +1139,25 @@ def aggregate_objective_reports(reports: list[dict[str, Any]]) -> dict[str, Any]
     for metric_name in metric_names:
         rows = [_metric_map(report)[metric_name] for report in reports]
         advantages = [float(row["candidate_relative_advantage"]) for row in rows]
+        absolute_deltas = [float(row["absolute_candidate_delta"]) for row in rows]
+        first = rows[0]
         aggregate_metrics[metric_name] = {
+            "direction": first["direction"],
+            "metric_role": first["metric_role"],
+            "display": {
+                "kind": first["display"]["kind"],
+                "unit": first["display"]["unit"],
+            },
             "mean_candidate_relative_advantage": statistics.fmean(advantages),
             "median_candidate_relative_advantage": statistics.median(advantages),
+            "mean_absolute_candidate_delta": statistics.fmean(absolute_deltas),
+            "median_absolute_candidate_delta": statistics.median(absolute_deltas),
             "wins": sum(value > ABSOLUTE_TOLERANCE for value in advantages),
             "losses": sum(value < -ABSOLUTE_TOLERANCE for value in advantages),
             "ties": sum(abs(value) <= ABSOLUTE_TOLERANCE for value in advantages),
             "worst_regression": min(advantages),
             "per_case": advantages,
+            "per_case_absolute_candidate_delta": absolute_deltas,
             "independent_case_bootstrap": _independent_case_bootstrap(advantages),
         }
     verdicts = [report["verdict"]["value"] for report in reports]
@@ -1045,13 +1189,15 @@ def _report_markdown(report: dict[str, Any]) -> str:
         "",
         "## Pairwise panel",
         "",
-        "| Metric | Direction | Legacy | Candidate | Candidate advantage | Winner |",
-        "|---|---:|---:|---:|---:|---|",
+        "| Metric | Role | Direction | Legacy | Candidate | Human delta | Decision-relative | Winner |",
+        "|---|---|---:|---:|---:|---:|---:|---|",
     ]
     for row in report["comparisons"]:
+        row = _normalize_comparison_row(row)
         lines.append(
-            f"| {row['metric']} | {row['direction']} | {row['legacy']:.8g} | "
-            f"{row['candidate']:.8g} | {row['candidate_relative_advantage']:+.3%} | {row['winner']} |"
+            f"| {row['metric']} | {row['metric_role']} | {row['direction']} | "
+            f"{row['legacy']:.8g} | {row['candidate']:.8g} | {_display_delta(row)} | "
+            f"{_display_decision_fraction(row)} | {row['winner']} |"
         )
     lines.extend(
         (
@@ -1083,14 +1229,39 @@ def _aggregate_markdown(report: dict[str, Any]) -> str:
         f"- Independent triads: **{report['independent_case_count']}**",
         f"- Verdict counts: `{json.dumps(report['verdict_counts'], sort_keys=True)}`",
         "",
-        "| Metric | Mean candidate advantage | Median | Wins | Losses | Ties | Worst regression |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Metric | Role | Mean human delta | Median human delta | Decision-relative mean / median / worst | Wins | Losses | Ties |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     for name, metric in report["metrics"].items():
+        display_row = {
+            "metric": name,
+            "legacy": 0.0,
+            "candidate": metric["mean_absolute_candidate_delta"],
+            "direction": metric["direction"],
+            "candidate_relative_advantage": metric[
+                "mean_candidate_relative_advantage"
+            ],
+        }
+        median_row = {
+            **display_row,
+            "candidate": metric["median_absolute_candidate_delta"],
+            "candidate_relative_advantage": metric[
+                "median_candidate_relative_advantage"
+            ],
+        }
+        decision_summary = (
+            "diagnostic only"
+            if metric["metric_role"] == "diagnostic"
+            else (
+                f"{metric['mean_candidate_relative_advantage']:+.3%} / "
+                f"{metric['median_candidate_relative_advantage']:+.3%} / "
+                f"{metric['worst_regression']:+.3%}"
+            )
+        )
         lines.append(
-            f"| {name} | {metric['mean_candidate_relative_advantage']:+.3%} | "
-            f"{metric['median_candidate_relative_advantage']:+.3%} | {metric['wins']} | "
-            f"{metric['losses']} | {metric['ties']} | {metric['worst_regression']:+.3%} |"
+            f"| {name} | {metric['metric_role']} | {_display_delta(display_row)} | "
+            f"{_display_delta(median_row)} | {decision_summary} | {metric['wins']} | "
+            f"{metric['losses']} | {metric['ties']} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -1124,13 +1295,25 @@ def persist_objective_report(
                 or not isinstance(value.get("comparisons"), list)
             ):
                 continue
-        except (OSError, json.JSONDecodeError, TypeError):
+            _metric_map(value)
+        except (
+            KeyError,
+            ObjectiveMediaError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
             continue
         identity = (value.get("benchmark_id"), value.get("seed"))
         if identity in seen:
             continue
         seen.add(identity)
         loaded.append(value)
+        # Existing schema-v1 JSON remains authoritative and unchanged. Refresh
+        # its human report through the additive metric-aware renderer so old
+        # completed R/A/B evidence does not require regeneration.
+        _atomic_write_text(path.with_suffix(".md"), _report_markdown(value))
     aggregate = aggregate_objective_reports(loaded)
     aggregate_directory = root / "aggregates"
     aggregate_json_path = aggregate_directory / f"{group_id}.json"

@@ -89,26 +89,30 @@ The generic scalar projection is:
 g_raw = <r, d> / <d, d>
 ```
 
-The existing controller confidence convention is preserved, and the scalar is passed through the existing rational 0.25 trust region. In the controller's existing scalar notation this is equivalent to the bounded generic gain:
+The explicit legacy controller preserves its historical confidence convention and
+rational 0.25 trust region. In that scalar notation the legacy gain is:
 
 ```text
 g = g_raw_scaled / (1 + |g_raw_scaled| / 0.25)
 ```
 
-The exact legacy implementation remains selectable and is the default. The
-subsequent generic-scalar research pass adds coordinate-transported/RLS,
-correction-reliability, and topology-proven regional VIDEO paths behind the
-separate `generic_correction_mode` selector. These paths reuse only the causal
-latest-delta direction, add no transformer evaluation, and do not revive retired
-model-specific Feature-3 geometry. Exact scalar calibration and the shared CPU evaluator
-are described in [GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md).
+The exact legacy implementation remains selectable as
+`legacy + mode_default + rational + 0.25`. The validated full-mode default is
+`coordinate_rls + no_attenuation + hard_clip + 0.40`, with canonical RLS lambda
+`0.90`. It was promoted after three-run whole-run hidden-space generalization and
+three controlled decoded-media native-reference triads. The hidden-space gain is
+not a perceptual-quality percentage. The promoted path reuses only the causal
+latest-delta direction, adds no transformer evaluation, and does not revive
+retired model-specific Feature-3 geometry. Correction-reliability and
+topology-proven regional VIDEO remain research paths. Exact scalar calibration
+and the shared CPU evaluator are described in
+[GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md).
 
 The orthogonal `generic_correction_attenuation` selector defaults to
-`mode_default`, preserving all previous mode numerics and saved workflows. It
-also allows exact live reproduction of the evaluator's four attenuation
-families without multiplying mode names. The canonical RLS forgetting factor
-remains `0.90`; equivalent clipped candidates are reported as ties rather than
-promoting the first sorted lambda.
+`no_attenuation` for the promoted coordinate/RLS controller. `mode_default`
+continues to preserve explicit legacy numerics and the prior semantics of each
+other selectable mode. The canonical RLS forgetting factor remains `0.90`;
+equivalent clipped candidates are reported as ties.
 
 `full` applies this gain to the latest-delta correction exactly. The retired exact-head and Gram-diagonal candidates no longer alter the applied value:
 

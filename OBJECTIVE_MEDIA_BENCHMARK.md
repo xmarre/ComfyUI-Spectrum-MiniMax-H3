@@ -10,6 +10,24 @@ B = accelerated correction candidate
 
 The benchmark operates on decoded IMAGE/AUDIO before video encoding or audio muxing. Native H3 is the full-reference target for the acceleration-preservation question.
 
+## PR #51 validation result
+
+The predeclared candidate was evaluated on three independent controlled triads
+using native MiniMax H3, ER-SDE, 20 steps, 512x768, 192 frames, 24 fps, eight
+seconds, and stereo 32 kHz audio. Results were two `candidate_favored`, one
+`mixed_or_inconclusive`, and zero `legacy_favored` verdicts. VIDEO MS-SSIM,
+PSNR, and temporal fidelity favored the candidate on all three seeds. Motion
+detail favored it on two seeds and legacy on one; the small worst-frame losses
+remained well inside the declared guardrail.
+
+Audio MR-STFT was generally candidate-favored. One seed had weaker raw
+correlation and SI-SDR diagnostics with zero detected bounded lag. Those
+phase-sensitive diagnostics were not part of the predeclared verdict gate and
+did not produce a repeatable perceptual regression. This evidence supports the
+generic-correction default for the tested full-mode ER-SDE setup. It does not
+establish the same ranking for other samplers, step counts, resolutions,
+prompts, LoRAs, or acceleration schedules.
+
 ## Recommended workflow
 
 Use:
@@ -126,6 +144,14 @@ aggregate_markdown_path
 ```
 
 Only JSON/Markdown metrics and metadata are persisted. Raw media is never persisted.
+
+Comparison rows retain raw legacy/candidate values, absolute candidate delta,
+metric direction, metric role, and the existing decision-relative fraction.
+Human reports use correlation-point deltas for normalized correlation, dB deltas
+for PSNR/SI-SDR, and millisecond deltas for bounded lag. These three diagnostics
+are visibly separated from verdict primary and guardrail rows. Existing v1 JSON
+reports remain valid; the additive fields are derived while loading/rendering,
+so completed triads do not need to be regenerated.
 
 ## One-shot full-media alternatives
 

@@ -62,6 +62,7 @@ _RETIRED_SUMMARY_FIELDS = (
     "model_aware_model_comparison_metric",
     "model_aware_head_metric_available",
     "model_aware_subspace_bound",
+    "model_aware_correction_bound",
     "model_corrected_ratio_mean",
     "model_aware_exact_head_evidence_bytes",
 )

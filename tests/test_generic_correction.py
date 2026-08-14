@@ -165,7 +165,7 @@ def test_full_applied_gain_is_exactly_generic_scalar_gain():
     assert decision.correction_anchor_ids == ()
 
 
-def test_default_legacy_selector_is_numerically_identical_to_unselected_baseline():
+def test_explicit_legacy_selector_is_numerically_identical_to_original_baseline():
     controller = ModelAwareController("full", risk_threshold=1.0)
     controller.set_profile(_profile())
     controller.anchor_count = 3
@@ -179,10 +179,17 @@ def test_default_legacy_selector_is_numerically_identical_to_unselected_baseline
         configured_audio_blend=0.0,
         configured_video_blend=0.5,
     )
+    legacy = SpectrumH3Config(
+        generic_correction_mode="legacy",
+        generic_correction_attenuation="mode_default",
+        generic_correction_limiter="rational",
+        generic_correction_limit=0.25,
+    ).validate()
     controller._generic_correction_controller = GenericCorrectionController(
-        "legacy",
-        "rational",
-        0.25,
+        legacy.generic_correction_mode,
+        legacy.generic_correction_limiter,
+        legacy.generic_correction_limit,
+        attenuation=legacy.generic_correction_attenuation,
     )
     selected = controller.decision(
         forecast_horizon=1.25,
@@ -285,7 +292,9 @@ def test_debug_summary_exposes_only_live_generic_correction_telemetry():
         "model_aware_correction_metric="
         "generic_latest_delta_hidden_residual_projection"
     ) in summary
-    assert "model_aware_correction_bound=rational_softsign_0.25" in summary
+    assert "model_aware_correction_bound=" not in summary
+    assert "generic_correction_limiter='hard_clip'" in summary
+    assert "generic_correction_limit=0.400000" in summary
     assert "generic_corrected_ratio_mean=" in summary
     assert "model_aware_audio_generic_corrected_ratio_mean=" in summary
     assert "model_aware_video_generic_corrected_ratio_mean=" in summary
@@ -531,6 +540,8 @@ def test_native_er_sde_correction_modes_preserve_nfe_and_schedule_counts(
         ("patch_size", (1, 2, 2)),
     )
     labels = ((0, "positive"),)
+    actual_step_ids = []
+    forecast_step_ids = []
     for timestep in (1.0, 0.8, 0.6, 0.4, 0.2):
         decision = runtime.begin_step(torch.tensor([timestep]))
         call_id, actual = runtime.begin_model_call(
@@ -541,6 +552,7 @@ def test_native_er_sde_correction_modes_preserve_nfe_and_schedule_counts(
             expected_shape=(1, 5, 4),
         )
         if actual:
+            actual_step_ids.append(decision["step_id"])
             runtime.observe_actual(
                 decision["run_id"],
                 decision["step_id"],
@@ -548,6 +560,7 @@ def test_native_er_sde_correction_modes_preserve_nfe_and_schedule_counts(
                 torch.full((1, 5, 4), float(decision["step_id"])),
             )
         else:
+            forecast_step_ids.append(decision["step_id"])
             assert runtime.predict(
                 decision["run_id"],
                 decision["step_id"],
@@ -563,4 +576,85 @@ def test_native_er_sde_correction_modes_preserve_nfe_and_schedule_counts(
         runtime.stats.adaptive_extra_nfes,
     )
     assert counts == (3, 2, 3, 0)
+    assert actual_step_ids == [0, 1, 3]
+    assert forecast_step_ids == [2, 4]
     runtime.end_run(runtime.active_run_id)
+
+
+def test_promoted_controller_starts_fresh_per_run_and_retains_scalar_state_only():
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            model_aware_mode="full",
+            offline_smoothing_replay=False,
+        )
+    )
+    first_run = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_er_sde",
+        supported_sampler=True,
+    )
+    first = runtime._generic_correction_controller
+    assert isinstance(first, GenericCorrectionController)
+    assert (first.mode, first.attenuation, first.limiter, first.limit) == (
+        "coordinate_rls",
+        "no_attenuation",
+        "hard_clip",
+        0.40,
+    )
+    first.audio.rls.update(0.5, 1.0)
+    snapshot = first.snapshot()
+
+    def contains_tensor(value):
+        if torch.is_tensor(value):
+            return True
+        if isinstance(value, dict):
+            return any(contains_tensor(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(contains_tensor(item) for item in value)
+        return False
+
+    assert not contains_tensor(snapshot)
+    assert snapshot["region_ids"] == ()
+    assert snapshot["regions"] == []
+    runtime.end_run(first_run)
+
+    second_run = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_er_sde",
+        supported_sampler=True,
+    )
+    second = runtime._generic_correction_controller
+    assert isinstance(second, GenericCorrectionController)
+    assert second is not first
+    assert second.audio.rls.observations == 0
+    assert second.audio.rls.gain == 0.0
+    runtime.end_run(second_run)
+
+
+def test_promoted_controller_state_rolls_back_with_runtime_snapshot():
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            model_aware_mode="full",
+            offline_smoothing_replay=False,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_er_sde",
+        supported_sampler=True,
+    )
+    snapshot = runtime.create_rollback_snapshot()
+    controller = runtime._generic_correction_controller
+    assert isinstance(controller, GenericCorrectionController)
+    controller.audio.rls.update(0.5, 1.0)
+    controller.audio_aggregate.count = 1
+
+    runtime.restore_rollback_snapshot(snapshot)
+
+    restored = runtime._generic_correction_controller
+    assert isinstance(restored, GenericCorrectionController)
+    assert restored is runtime.model_aware._generic_correction_controller
+    assert restored.audio.rls.observations == 0
+    assert restored.audio.rls.gain == 0.0
+    assert restored.audio_aggregate.count == 0
+    runtime.end_run(run_id)

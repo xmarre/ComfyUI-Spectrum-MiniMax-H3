@@ -28,10 +28,10 @@ offline_smoothing_replay = true
 model_aware_mode = off
 model_aware_trust_shrinkage = false
 model_aware_replay_generic_correction = false
-generic_correction_mode = legacy
-generic_correction_attenuation = mode_default
-generic_correction_limiter = rational
-generic_correction_limit = 0.25
+generic_correction_mode = coordinate_rls
+generic_correction_attenuation = no_attenuation
+generic_correction_limiter = hard_clip
+generic_correction_limit = 0.40
 anchor_residual_feedback = false
 selective_rollback_correction = false
 ```
@@ -66,6 +66,13 @@ offline_smoothing_replay = false
 In the tested 20-step run, `full` kept the same 11-actual / 9-forecast schedule as `schedule_confidence`, reduced the measured hidden forecast error, and removed a recurring false eye-motion artifact. Earlier same-seed ER-SDE testing also found a pronunciation case that improved with `full`.
 
 This recommendation is scoped to the tested native ER-SDE setup. No equivalent quality ranking has been established for Euler, RES/RES CFG++, Turbo/LightX2V, or other samplers. The global defaults therefore remain `model_aware_mode=off` and `offline_smoothing_replay=true`.
+
+When the opt-in `model_aware_mode=full` causal path is active, its validated
+generic-correction defaults are `coordinate_rls + no_attenuation + hard_clip +
+0.40` with canonical RLS lambda `0.90`. This promotion is supported by three
+independent whole-run hidden-space groups and three controlled decoded-media
+ER-SDE triads. The explicit `legacy + mode_default + rational + 0.25`
+configuration remains available for exact reproduction.
 
 ### Speed-up / few-step LoRAs
 
@@ -168,9 +175,11 @@ Restart ComfyUI. The node appears under:
 
 ```text
 sampling/spectrum -> Spectrum Apply MiniMax H3
-sampling/spectrum/research -> Spectrum H3 Objective Media Stage
-sampling/spectrum/research -> Spectrum H3 Objective Quality Compare
-sampling/spectrum/research -> Spectrum H3 Objective Quality Compare (Staged)
+sampling/spectrum/research -> Spectrum H3 Objective Media Capture (Sequential - Bounded)
+sampling/spectrum/research -> Spectrum H3 Objective Media Capture Reset
+sampling/spectrum/research -> Spectrum H3 Objective Media Stage (One-Shot / Full Media)
+sampling/spectrum/research -> Spectrum H3 Objective Quality Compare (One-Shot / Full Media)
+sampling/spectrum/research -> Spectrum H3 Objective Quality Compare (Staged One-Shot / Full Media)
 ```
 
 The node adds no third-party Python dependency. It uses PyTorch and ComfyUI modules already present in a normal ComfyUI installation.
@@ -242,10 +251,10 @@ Built-in ComfyUI previews, ComfyUI-bleh Better Previews, VHS Preview, and other 
 | `model_aware_risk_threshold` | `0.65` | Threshold used by model-aware scheduling to convert a risky prospective forecast into an actual evaluation. |
 | `model_aware_trust_shrinkage` | `false` | Research/reproduction switch. The completed perceptual gate did not support promotion. |
 | `model_aware_replay_generic_correction` | `false` | Legacy/research replay transfer of the causal generic correction. Keep disabled for normal use. |
-| `generic_correction_mode` | `legacy` | Advanced `full` controller: exact legacy baseline, coordinate/RLS, coordinate/RLS/reliability, or topology-safe regional VIDEO. New modes are experimental. |
-| `generic_correction_attenuation` | `mode_default` | Orthogonal advanced attenuation policy. `mode_default` preserves every existing mode exactly; explicit policies reproduce evaluator candidates. |
-| `generic_correction_limiter` | `rational` | Generic gain limiter: validated `rational` baseline or experimental `hard_clip`/`tanh`. |
-| `generic_correction_limit` | `0.25` | Symmetric limiter scale. Keep `0.25` for the validated baseline. |
+| `generic_correction_mode` | `coordinate_rls` | Validated `full` controller using signed coordinate transport and scalar RLS. `legacy` preserves the previous exact path; reliability/regional modes remain research choices. |
+| `generic_correction_attenuation` | `no_attenuation` | Validated coordinate/RLS policy. Use `mode_default` with explicit legacy mode for exact previous behavior. |
+| `generic_correction_limiter` | `hard_clip` | Validated generic gain limiter at `0.40`; `rational` remains available for the legacy reproduction configuration. |
+| `generic_correction_limit` | `0.40` | Validated symmetric gain bound for coordinate/RLS. The exact legacy configuration uses `0.25`. |
 | `anchor_residual_feedback` | `false` | Experimental video-scored actual-refresh guard. Requires single-pass operation. |
 | `selective_rollback_correction` | `false` | Experimental deterministic-Euler rollback path. Requires single-pass operation. |
 
@@ -332,20 +341,30 @@ g_raw = <r, d> / <d, d>
 
 The gain is confidence-scaled and bounded before it is applied to the latest-delta direction. The correction itself adds no transformer evaluation. The scheduling component can still convert risky forecast steps into actual evaluations.
 
-`generic_correction_mode=legacy`, `generic_correction_attenuation=mode_default`,
-`generic_correction_limiter=rational`, and
-`generic_correction_limit=0.25` preserve this validated path. The selectable
-coordinate/RLS, correction-reliability, and coarse temporal VIDEO controllers are
-experimental live A/B paths. With `debug=true`, full single-pass runs also emit
+`generic_correction_mode=coordinate_rls`,
+`generic_correction_attenuation=no_attenuation`,
+`generic_correction_limiter=hard_clip`, and `generic_correction_limit=0.40`
+form the validated full-mode controller. Three independent hidden-space groups
+selected this exact family with about 15.78% lower normalized hidden error than
+exact legacy, 48/0 target wins/losses, and no worst regression. Three controlled
+native ER-SDE decoded-media triads then produced two candidate-favored verdicts,
+one mixed verdict, and no legacy-favored verdict. The hidden-space percentage is
+not a perceptual-quality percentage. Evidence is scoped to native H3, ER-SDE,
+20 steps, 512x768, 192 frames, 24 fps, and three seeds.
+
+Explicit `legacy + mode_default + rational + 0.25` remains numerically
+reproducible. Correction-reliability and coarse temporal VIDEO controllers remain
+research paths. With `debug=true`, full single-pass runs also emit
 scalar-only exact quadratic calibration blocks for the shared CPU evaluator.
 When `offline_smoothing_replay=false`, Spectrum automatically persists each
 completed compatible block, rejects repeated traces/seeds, evaluates its compatible
-whole-run group, prints a concise console recommendation, and refreshes detailed
+whole-run group, prints a concise hidden-space ranking, and refreshes detailed
 Markdown and JSON reports. No log capture or manual evaluator command is required.
-Recommendations include the exact attenuation policy and are emitted only when
+Rankings include the exact attenuation policy and are emitted only when
 the selected offline candidate is reproducible by live settings. Numerically
 equivalent RLS candidates are reported as a tie; the canonical live `lambda=0.90`
-is retained instead of exposing a new lambda control without evidence.
+is retained. Research reports state the separately validated runtime default and
+never edit live settings automatically.
 See
 [GENERIC_CORRECTION_RESEARCH.md](GENERIC_CORRECTION_RESEARCH.md) for their causal
 contract, topology proof, offline evaluation discipline, and promotion gate.

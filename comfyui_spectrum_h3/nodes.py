@@ -231,35 +231,35 @@ class SpectrumApplyMiniMaxH3:
                         "regional",
                     ],
                     {
-                        "default": "legacy",
+                        "default": "coordinate_rls",
                         "tooltip": (
-                            "Advanced full-mode correction controller. Legacy exactly preserves the validated "
-                            "latest-delta EWMA path. The other modes add coordinate transport, recursive "
-                            "least-squares gain estimation, correction-specific reliability, and topology-proven "
-                            "coarse video temporal regions. Experimental modes add no transformer evaluation."
+                            "Full-mode correction controller. coordinate_rls is the validated default from "
+                            "three-run hidden-space and decoded-media ER-SDE evidence. Legacy retains the exact "
+                            "previous EWMA path for reproduction. Regional mode remains experimental. No mode "
+                            "adds a transformer evaluation."
                         ),
                     },
                 ),
                 "generic_correction_limiter": (
                     ["rational", "hard_clip", "tanh"],
                     {
-                        "default": "rational",
+                        "default": "hard_clip",
                         "tooltip": (
-                            "Advanced generic-correction gain limiter. Rational with limit 0.25 is the exact "
-                            "validated baseline. Hard clip and tanh are experimental A/B paths."
+                            "Generic-correction gain limiter. hard_clip with limit 0.40 is the validated "
+                            "full-mode default. rational with 0.25 remains the exact legacy reproduction setting."
                         ),
                     },
                 ),
                 "generic_correction_limit": (
                     "FLOAT",
                     {
-                        "default": 0.25,
+                        "default": 0.40,
                         "min": 0.01,
                         "max": 1.0,
                         "step": 0.01,
                         "tooltip": (
-                            "Advanced symmetric gain-limit scale. Keep 0.25 for the validated baseline; "
-                            "alternative values are research-only until real A/B validation."
+                            "Symmetric gain-limit scale. 0.40 is validated with coordinate_rls/hard_clip; "
+                            "use 0.25 with legacy/rational/mode_default for the previous exact baseline."
                         ),
                     },
                 ),
@@ -274,11 +274,11 @@ class SpectrumApplyMiniMaxH3:
                         "combined_conservative",
                     ],
                     {
-                        "default": "mode_default",
+                        "default": "no_attenuation",
                         "tooltip": (
-                            "Advanced experimental attenuation policy. mode_default exactly preserves each "
-                            "existing mode. Explicit policies reproduce evaluator candidates without changing "
-                            "legacy production defaults or adding a transformer evaluation."
+                            "Full-mode attenuation policy. no_attenuation is the validated coordinate_rls "
+                            "default. mode_default with legacy exactly preserves the previous correction path. "
+                            "This setting adds no transformer evaluation."
                         ),
                     },
                 ),
@@ -314,10 +314,10 @@ class SpectrumApplyMiniMaxH3:
         model_aware_risk_threshold=0.65,
         model_aware_trust_shrinkage=False,
         model_aware_replay_generic_correction=False,
-        generic_correction_mode="legacy",
-        generic_correction_limiter="rational",
-        generic_correction_limit=0.25,
-        generic_correction_attenuation="mode_default",
+        generic_correction_mode="coordinate_rls",
+        generic_correction_limiter="hard_clip",
+        generic_correction_limit=0.40,
+        generic_correction_attenuation="no_attenuation",
     ):
         if not enabled:
             return (model,)

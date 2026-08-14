@@ -74,4 +74,4 @@ def test_console_summary_handles_regional_candidate_without_synthetic_key_lookup
     )
     assert f"regional::{CANDIDATE}" in summary
     assert "exact live" in summary
-    assert "Recommended live perceptual A/B candidate" in summary
+    assert "Hidden-space ranking" in summary

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import sys
@@ -123,13 +124,20 @@ def test_automatic_progression_reports_and_console(tmp_path, count, validation):
     assert "AUDIO" in result.console_summary
     assert "generic_correction_mode=" in result.console_summary
     assert "generic_correction_attenuation=" in result.console_summary
-    assert "production/default promotion: unchanged (legacy)" in result.console_summary
+    assert "Runtime status: coordinate_rls + no_attenuation + hard_clip + 0.40" in result.console_summary
+    assert "Legacy reproduction: legacy + mode_default + rational + 0.25" in result.console_summary
     machine = json.loads(result.json_report_path.read_text(encoding="utf-8"))
     assert len(machine["analysis"]["candidate_ranking"]) == 144
-    assert machine["production_default"]["generic_correction_mode"] == "legacy"
+    assert machine["production_default"]["generic_correction_mode"] == "coordinate_rls"
+    assert machine["production_default"]["generic_correction_attenuation"] == "no_attenuation"
+    assert machine["production_default"]["generic_correction_limiter"] == "hard_clip"
+    assert machine["production_default"]["generic_correction_limit"] == 0.40
+    assert machine["production_default"]["hidden_space_alone_triggered_promotion"] is False
+    assert machine["legacy_reproduction"]["generic_correction_mode"] == "legacy"
     markdown = result.markdown_report_path.read_text(encoding="utf-8")
     assert "Complete global candidate ranking" in markdown
-    assert "Hidden-space results identify candidates for perceptual A/B only" in markdown
+    assert "Hidden-space results rank scalar reconstruction candidates" in markdown
+    assert "Promotion used separate three-seed decoded-media" in markdown
 
 
 def test_duplicate_trace_and_seed_identity_do_not_add_evidence(tmp_path):
@@ -252,6 +260,19 @@ def test_duplicate_rerun_is_deterministic(tmp_path):
     second = research.persist_and_analyze(block, root=tmp_path)
     assert second.json_report_path.read_bytes() == before
     assert second.report == first.report
+
+
+def test_research_reporting_never_mutates_live_configuration_input(tmp_path):
+    block = _block("immutable", seed=23)
+    original = copy.deepcopy(block)
+
+    result = research.persist_and_analyze(block, root=tmp_path)
+
+    assert block == original
+    assert block["config"]["generic_correction_mode"] == "legacy"
+    assert result.report["production_default"]["generic_correction_mode"] == (
+        "coordinate_rls"
+    )
 
 
 def test_cli_and_runtime_import_the_same_evaluator_implementation():

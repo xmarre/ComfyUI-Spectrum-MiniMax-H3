@@ -415,15 +415,21 @@ def _summary_from_report(report: dict[str, Any], persisted) -> str:
             "temporal advantage="
             f"{rows['video_temporal_derivative_error']['candidate_relative_advantage']:+.3%}; "
             "motion-detail advantage="
-            f"{rows['video_motion_weighted_detail_error']['candidate_relative_advantage']:+.3%}"
+            f"{rows['video_motion_weighted_detail_error']['candidate_relative_advantage']:+.3%}; "
+            "PSNR diagnostic delta="
+            f"{rows['video_psnr_db']['absolute_candidate_delta']:+.3f} dB"
         ),
     ]
     if "audio_mrstft_log_magnitude_error" in rows:
         summary_lines.append(
             "AUDIO: MR-STFT advantage="
             f"{rows['audio_mrstft_log_magnitude_error']['candidate_relative_advantage']:+.3%}; "
-            "correlation advantage="
-            f"{rows['audio_normalized_correlation']['candidate_relative_advantage']:+.3%}"
+            "normalized-correlation diagnostic delta="
+            f"{rows['audio_normalized_correlation']['absolute_candidate_delta']:+.5f} points; "
+            "SI-SDR diagnostic delta="
+            f"{rows['audio_si_sdr_db']['absolute_candidate_delta']:+.3f} dB; "
+            "bounded-lag diagnostic delta="
+            f"{rows['audio_absolute_bounded_lag_ms']['absolute_candidate_delta']:+.3f} ms"
         )
     summary_lines.append(f"report={persisted.markdown_path}")
     return "\n".join(summary_lines)

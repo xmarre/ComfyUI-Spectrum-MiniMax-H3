@@ -9,9 +9,17 @@ direction d = latest_exact - previous_exact
 candidate   = predicted + g*d
 ```
 
-The current validated production baseline remains `generic_correction_mode=legacy`.
-The additional modes are live experimental paths and exact offline-scoring targets.
-They have not yet been perceptually validated.
+The validated generic-correction default used by the opt-in
+`model_aware_mode=full` path is:
+
+```text
+coordinate_rls + no_attenuation + hard_clip + 0.40
+canonical RLS lambda = 0.90
+```
+
+The global `model_aware_mode` default remains `off`. The exact
+`legacy + mode_default + rational + 0.25` path remains selectable for
+reproduction and ablation.
 
 ## Evidence and claim boundary
 
@@ -25,33 +33,56 @@ audio: 1.777636 -> 1.670690   (~6.02% hidden-error reduction)
 video: 1.313055 -> 1.250087   (~4.80% hidden-error reduction)
 ```
 
-The same test cycle included a recurring false eye-motion artifact that was absent
-with `full`, plus an earlier native ER-SDE pronunciation case improved by `full`.
-Those results motivate better scalar estimation along the latest-delta direction.
-The percentages are hidden-feature error reductions for particular traces. They
-are not perceptual-quality percentages and do not establish results for Euler,
-RES/RES CFG++, Turbo/LightX2V, or other samplers.
+The final hidden-space validation contains three independent runs in each of two
+compatible live-trajectory groups. Both groups select the exact promoted family:
+
+```text
+group A: +15.7788% vs exact legacy, 48 wins / 0 losses, worst regression 0
+group B: +15.7757% vs exact legacy, 48 wins / 0 losses, worst regression 0
+```
+
+Whole-run leave-one-out generalization is used; target rows are never randomized
+across folds. The percentages are normalized hidden-feature error reductions,
+not perceptual-quality percentages.
+
+Separate decoded-media validation used three independent native-reference R/A/B
+triads with native H3, ER-SDE, 20 steps, 512x768, 192 frames, eight seconds, and
+24 fps. Verdicts were two candidate-favored, one mixed, and zero legacy-favored.
+Broad VIDEO MS-SSIM, PSNR, and temporal metrics favored the candidate on all
+three seeds. Audio spectral evidence was generally candidate-favored; one seed
+showed weaker phase-sensitive correlation/SI-SDR diagnostics with zero detected
+bounded lag. Supporting manual comparisons found no repeatable candidate audio
+regression and a small candidate advantage in rapid fine motion.
+
+This evidence does not establish results for Euler, RES/RES CFG++,
+Turbo/LightX2V, other step counts, resolutions, prompts, or LoRAs.
 
 ## Live modes
 
 | `generic_correction_mode` | Geometry and controller | Status |
 |---|---|---|
-| `legacy` | Untransported latest delta, existing projection EWMA, existing general-confidence/horizon scaling | Validated baseline and default |
-| `coordinate_rls` | Signed coordinate-transported latest delta, exponentially weighted least-squares scalar, general-confidence scaling | Experimental |
+| `legacy` | Untransported latest delta, existing projection EWMA, existing general-confidence/horizon scaling | Exact reproduction/ablation path |
+| `coordinate_rls` | Signed coordinate-transported latest delta with exponentially weighted least-squares scalar | Validated default with `no_attenuation + hard_clip + 0.40` |
 | `coordinate_rls_reliability` | Coordinate/RLS plus correction-specific reliability | Experimental |
 | `regional` | Audio global; VIDEO split into four topology-proven temporal bands with regularized regional RLS/reliability gains | Experimental; global fallback when topology is unproven |
 
 All modes retain the same sampler schedule. They add no transformer evaluation.
 
-The default limiter is the legacy rational soft bound:
+The validated coordinate/RLS default uses a hard bound:
+
+```text
+bounded(g, 0.40) = clamp(g, -0.40, 0.40)
+```
+
+The exact legacy reproduction configuration uses the previous rational soft
+bound:
 
 ```text
 bounded(g, L) = g / (1 + abs(g)/L)
 L = 0.25
 ```
 
-`hard_clip` and `tanh`, along with an advanced limit control, are available for
-controlled A/B generation. No alternative limiter is promoted by this PR.
+`tanh` and other mode/attenuation combinations remain controlled research paths.
 
 ## Coordinate transport
 
@@ -107,11 +138,12 @@ age, raw gain, scaled gain, and applied gain.
 
 ## Orthogonal attenuation policy
 
-`generic_correction_attenuation=mode_default` is saved-workflow compatible and
-preserves the former numerical behavior: `coordinate_rls` uses general forecast
+`generic_correction_attenuation=no_attenuation` is the validated coordinate/RLS
+default. `mode_default` remains saved-workflow compatible and preserves each
+mode's former numerical behavior: `coordinate_rls` uses general forecast
 confidence, while `coordinate_rls_reliability` and `regional` use combined
-general-confidence and correction-reliability attenuation. Advanced runs can
-instead select `no_attenuation`, `general_confidence`,
+general-confidence and correction-reliability attenuation. Research runs can
+select `general_confidence`,
 `correction_reliability`, or `combined_conservative` explicitly. Reports record
 both the requested selector and the resolved policy actually used.
 
@@ -207,10 +239,11 @@ to clear the research state safely; Spectrum recreates it on the next eligible r
 
 Every new compatible independent run immediately refreshes its group report and
 prints the validation level, compact VIDEO/AUDIO rankings, baseline context, and
-strongest live configuration for a later manual perceptual A/B. One run is labeled
-development-only, two runs preliminary whole-run leave-one-out, and three or more
-whole-run leave-one-out generalization. Settings and defaults are never changed
-automatically.
+strongest live-reproducible hidden-space configuration. Reports distinguish that
+ranking from the repository's separately decoded/perceptually validated runtime
+default. One run is labeled development-only, two runs preliminary whole-run
+leave-one-out, and three or more whole-run leave-one-out generalization. Research
+machinery never changes live settings automatically.
 
 Compatibility includes source schema, package/source provenance, the full sampler
 schedule fingerprint, sampler name, step count, topology fingerprint, and the
@@ -276,7 +309,7 @@ compatibility/audio path, and its transformer-free second pass is unchanged.
 
 ## Promotion gate
 
-The new modes remain experimental until independent real generations establish:
+The PR #51 promotion gate required:
 
 - identical actual/forecast step IDs and transformer-call counts;
 - `model_aware_extra_nfes=0`;
@@ -284,4 +317,20 @@ The new modes remain experimental until independent real generations establish:
 - perceptual non-regression across the chosen audio/video comparisons;
 - acceptable correction overhead and memory behavior.
 
-No hidden-space result alone promotes a new default.
+The gate passed for the exact `coordinate_rls + no_attenuation + hard_clip +
+0.40` family:
+
+- controlled 20-step ER-SDE legacy/candidate runs preserved 11 actual steps,
+  9 forecasts, 11 transformer calls, zero extra model-aware NFEs, and zero
+  fallbacks;
+- two independent three-run hidden-space groups selected the same candidate with
+  about 15.78% improvement, 48/0 target wins/losses, and no worst regression;
+- three decoded-media triads produced 2 candidate-favored / 1 mixed / 0
+  legacy-favored verdicts, with supporting perceptual non-regression;
+- observed candidate and legacy sampler wall times were approximately 174.66 s
+  and 174.78 s in the same session;
+- runtime inspection confirms scalar/small bounded controller state, no persistent
+  per-token gain field, debug-only scalar calibration, and no schedule/NFE owner.
+
+Hidden-space evidence identified the candidate. Separate decoded-media and
+perceptual evidence closed the promotion gate.

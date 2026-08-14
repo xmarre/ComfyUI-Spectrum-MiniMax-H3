@@ -29,6 +29,14 @@ MAX_REPORT_GROUPS = 24
 MAX_QUARANTINED_FILES = 16
 TOP_CONSOLE_CANDIDATES = 3
 
+VALIDATED_RUNTIME_DEFAULT = {
+    "generic_correction_mode": "coordinate_rls",
+    "generic_correction_attenuation": "no_attenuation",
+    "generic_correction_limiter": "hard_clip",
+    "generic_correction_limit": 0.40,
+    "rls_lambda": 0.90,
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ResearchResult:
@@ -203,9 +211,10 @@ def _recommendation(group: dict[str, Any]) -> dict[str, Any]:
         "evidence_strength": label,
         "ready_for_perceptual_ab": run_count >= 2,
         "interpretation": (
-            "hidden-space candidate for a manual perceptual A/B; production default remains legacy"
+            "hidden-space ranking generalizes across whole held-out runs; runtime promotion "
+            "depends on separately collected decoded-media and perceptual evidence"
             if run_count >= 2
-            else "development candidate only; collect another independent run before perceptual A/B"
+            else "development hidden-space candidate only; no runtime conclusion"
         ),
     }
 
@@ -227,11 +236,19 @@ def _research_report(
         "validation_label": validation_label,
         "hidden_space_recommendation": _recommendation(group),
         "production_default": {
+            **VALIDATED_RUNTIME_DEFAULT,
+            "scope": "generic correction used when model_aware_mode='full'",
+            "promotion_status": (
+                "validated in PR #51 using separate three-seed decoded-media and "
+                "supporting perceptual evidence"
+            ),
+            "hidden_space_alone_triggered_promotion": False,
+        },
+        "legacy_reproduction": {
             "generic_correction_mode": "legacy",
             "generic_correction_attenuation": "mode_default",
             "generic_correction_limiter": "rational",
             "generic_correction_limit": 0.25,
-            "promotion_status": "unchanged; perceptual validation required",
         },
         "analysis": group,
     }
@@ -315,7 +332,7 @@ def render_console_summary(
             _format_metric(metrics) if metrics["targets"] else "unavailable in this calibration schema"
         )
     recommendation = report["hidden_space_recommendation"]
-    lines.extend(("", "Recommended live perceptual A/B candidate:"))
+    lines.extend(("", "Hidden-space ranking:"))
     if recommendation.get("available"):
         lines.extend(
             (
@@ -332,7 +349,12 @@ def render_console_summary(
         lines.append(f"- unavailable: {recommendation['reason']}")
     lines.extend(
         (
-            "- production/default promotion: unchanged (legacy)",
+            (
+                "Runtime status: coordinate_rls + no_attenuation + hard_clip + 0.40 "
+                "is the validated full-mode generic-correction default; promotion used "
+                "separate decoded-media/perceptual evidence"
+            ),
+            "Legacy reproduction: legacy + mode_default + rational + 0.25",
             f"detailed Markdown report: {markdown_path}",
             f"machine-readable JSON report: {json_path}",
         )
@@ -359,10 +381,15 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         f"- Compatibility group: `{report['compatibility_group_id']}`",
         f"- Compatible independent runs: {report['compatible_independent_runs']}",
         f"- Validation level: **{report['validation_label']}**",
-        "- Hidden-space results identify candidates for perceptual A/B only.",
-        "- Production/default status: `legacy` remains unchanged.",
+        "- Hidden-space results rank scalar reconstruction candidates; they are not perceptual-quality percentages.",
+        (
+            "- Runtime status: `coordinate_rls + no_attenuation + hard_clip + 0.40` "
+            "is the validated generic-correction default for `model_aware_mode=full`."
+        ),
+        "- Promotion used separate three-seed decoded-media and supporting perceptual validation.",
+        "- Legacy reproduction remains `legacy + mode_default + rational + 0.25`.",
         "",
-        "## Recommended live perceptual A/B candidate",
+        "## Hidden-space ranking",
         "",
     ]
     if recommendation.get("available"):

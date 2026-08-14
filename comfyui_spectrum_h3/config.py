@@ -28,10 +28,10 @@ class SpectrumH3Config:
     model_aware_risk_threshold: float = 0.65
     model_aware_trust_shrinkage: bool = False
     model_aware_replay_generic_correction: bool = False
-    generic_correction_mode: str = "legacy"
-    generic_correction_limiter: str = "rational"
-    generic_correction_limit: float = 0.25
-    generic_correction_attenuation: str = "mode_default"
+    generic_correction_mode: str = "coordinate_rls"
+    generic_correction_limiter: str = "hard_clip"
+    generic_correction_limit: float = 0.40
+    generic_correction_attenuation: str = "no_attenuation"
 
     def __post_init__(self) -> None:
         trajectory_modes = {
