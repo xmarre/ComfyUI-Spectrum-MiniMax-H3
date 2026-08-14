@@ -127,8 +127,8 @@ A role is favored only when:
 
 1. at least one primary metric improves by 1% or more;
 2. no primary metric regresses by more than 2%;
-3. worst-frame MS-SSIM and, when present, worst-window spectral error do not
-   regress by more than 5%.
+3. worst-frame MS-SSIM and, when present, worst-window spectral error and
+   absolute bounded lag do not regress by more than 5%.
 
 The result is `candidate_favored`, `legacy_favored`, or
 `mixed_or_inconclusive`. All raw metrics remain visible. Similarity metrics are

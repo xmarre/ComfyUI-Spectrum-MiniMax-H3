@@ -274,6 +274,9 @@ def test_bounded_alignment_reports_lag_without_changing_primary_metrics():
     assert abs(legacy["bounded_alignment_diagnostic"]["lag_ms"]) <= 20.0
     assert legacy["bounded_alignment_diagnostic"]["primary_metrics_use_alignment"] is False
     assert legacy["mrstft_log_magnitude_error"]["value"] > 0.0
+    lag_row = _rows(report)["audio_absolute_bounded_lag_ms"]
+    assert lag_row["legacy"] > lag_row["candidate"]
+    assert lag_row["winner"] == "candidate"
 
 
 def test_bounded_alignment_cannot_erase_a_larger_timing_error():

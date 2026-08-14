@@ -697,6 +697,12 @@ def _paired_comparisons(video: dict[str, Any], audio: dict[str, Any] | None) -> 
                     candidate_audio["windowed_spectral_error"]["worst_value"],
                     higher_is_better=False,
                 ),
+                _comparison_row(
+                    "audio_absolute_bounded_lag_ms",
+                    abs(legacy_audio["bounded_alignment_diagnostic"]["lag_ms"]),
+                    abs(candidate_audio["bounded_alignment_diagnostic"]["lag_ms"]),
+                    higher_is_better=False,
+                ),
             )
         )
     return rows
@@ -712,7 +718,9 @@ def _verdict(comparisons: list[dict[str, Any]], *, audio_present: bool) -> dict[
     guardrail_names = ["video_worst_frame_ms_ssim"]
     if audio_present:
         primary_names.append("audio_mrstft_log_magnitude_error")
-        guardrail_names.append("audio_worst_window_spectral_error")
+        guardrail_names.extend(
+            ("audio_worst_window_spectral_error", "audio_absolute_bounded_lag_ms")
+        )
 
     def decide(role: str) -> bool:
         sign = 1.0 if role == "candidate" else -1.0
