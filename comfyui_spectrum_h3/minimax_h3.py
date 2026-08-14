@@ -436,6 +436,20 @@ def diffusion_model_wrapper(
             minimax_payload=minimax_payload,
             **kwargs,
         )
+    if kwargs.get("denoise_mask") is not None or kwargs.get("audio_denoise_mask") is not None:
+        runtime.fallback_current_step(
+            int(run_id),
+            int(step_id),
+            "per-token denoise masks require native MiniMax H3 evaluation",
+        )
+        return executor(
+            x,
+            timestep,
+            context,
+            options,
+            minimax_payload=minimax_payload,
+            **kwargs,
+        )
     if not isinstance(x, (list, tuple)) or len(x) != 2:
         runtime.fallback_current_step(int(run_id), int(step_id), "native H3 input is not a video/audio latent pair")
         return executor(x, timestep, context, options, minimax_payload=minimax_payload, **kwargs)

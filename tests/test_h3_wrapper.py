@@ -95,6 +95,44 @@ def test_non_native_diffusion_call_records_a_native_passthrough_fallback():
     runtime.end_run(run_id)
 
 
+@pytest.mark.parametrize("mask_key", ["denoise_mask", "audio_denoise_mask"])
+def test_per_token_denoise_masks_force_native_passthrough(mask_key):
+    runtime = SpectrumH3Runtime(SpectrumH3Config(degree=1, max_history=4))
+    run_id = runtime.start_run(torch.tensor([1.0, 0.5, 0.0]), "sample_euler", supported_sampler=True)
+    decision = runtime.begin_step(torch.tensor([1.0]))
+    calls = []
+
+    class Executor:
+        class_obj = _native_shaped_fake()
+
+        def __call__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return "native-masked-output"
+
+    mask = object()
+    options = {
+        RUNTIME_KEY: runtime,
+        RUN_ID_KEY: decision["run_id"],
+        STEP_ID_KEY: decision["step_id"],
+    }
+    result = diffusion_model_wrapper(
+        Executor(),
+        object(),
+        torch.tensor([1000.0]),
+        object(),
+        options,
+        **{mask_key: mask},
+    )
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert result == "native-masked-output"
+    assert len(calls) == 1
+    assert calls[0][1][mask_key] is mask
+    assert runtime.stats.actual_steps == 1
+    assert "per-token denoise masks require native" in runtime.disabled_reason
+    runtime.end_run(run_id)
+
+
 def test_forecast_sanitization_clamps_and_replaces_nonfinite_values():
     source = torch.tensor([float("nan"), float("inf"), -float("inf"), 1e20, 2.0])
     sanitized, event = _sanitize_prediction(source, torch.float16)
