@@ -931,6 +931,34 @@ def _trim_paths(paths: Iterable[Path], keep: int) -> None:
             pass
 
 
+def _trim_report_groups(root: Path, keep: int) -> None:
+    runs_directory = root / "runs"
+    if not runs_directory.exists():
+        return
+
+    def order(path: Path) -> tuple[int, str]:
+        modified = 0
+        try:
+            for child in path.iterdir():
+                try:
+                    modified = max(modified, child.stat().st_mtime_ns)
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return modified, path.name
+
+    groups = sorted((path for path in runs_directory.iterdir() if path.is_dir()), key=order)
+    aggregate_directory = root / "aggregates"
+    for directory in groups[: max(0, len(groups) - keep)]:
+        shutil.rmtree(directory, ignore_errors=True)
+        for suffix in (".json", ".md"):
+            try:
+                (aggregate_directory / f"{directory.name}{suffix}").unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _metric_map(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {row["metric"]: row for row in report["comparisons"]}
 
@@ -1079,6 +1107,7 @@ def persist_objective_report(
     aggregate_markdown_path = aggregate_directory / f"{group_id}.md"
     _atomic_write_text(aggregate_json_path, json.dumps(aggregate, indent=2, sort_keys=True, allow_nan=False) + "\n")
     _atomic_write_text(aggregate_markdown_path, _aggregate_markdown(aggregate))
+    _trim_report_groups(root, MAX_REPORT_GROUPS)
     _trim_paths(list(aggregate_directory.glob("*.json")), MAX_REPORT_GROUPS)
     _trim_paths(list(aggregate_directory.glob("*.md")), MAX_REPORT_GROUPS)
     return PersistedObjectiveReport(

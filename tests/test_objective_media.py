@@ -48,6 +48,7 @@ def _evaluate(
     candidate_audio=None,
     benchmark_id: str = "case-a",
     seed: int = 1,
+    settings_tag: str = "fixture",
 ):
     provenance = {
         "compatibility": {
@@ -60,7 +61,7 @@ def _evaluate(
             "conditioning": "fixture",
             "video_vae": "fixture",
             "audio_decoder": "fixture",
-            "generation_settings": {"resolution_family": "fixture"},
+            "generation_settings": {"resolution_family": settings_tag},
         },
         "R": {"spectrum": "bypassed"},
         "A": {"generic_correction_mode": "legacy"},
@@ -323,6 +324,27 @@ def test_persistence_is_report_only_atomic_and_aggregates_complete_triads(tmp_pa
     aggregate = json.loads(persisted_second.aggregate_json_path.read_text(encoding="utf-8"))
     assert aggregate["independent_case_count"] == 2
     assert aggregate["cross_validation"].startswith("none")
+
+
+def test_persistence_bounds_report_groups_and_removes_matching_aggregates(tmp_path, monkeypatch):
+    reference = _video()
+    monkeypatch.setattr("comfyui_spectrum_h3.objective_media.MAX_REPORT_GROUPS", 2)
+    persisted = []
+    for index in range(3):
+        report = _evaluate(
+            reference,
+            reference,
+            reference,
+            benchmark_id=f"group-{index}",
+            seed=index,
+            settings_tag=f"settings-{index}",
+        )
+        persisted.append(persist_objective_report(report, root=tmp_path))
+    run_groups = sorted(path.name for path in (tmp_path / "runs").iterdir())
+    aggregate_groups = sorted(path.stem for path in (tmp_path / "aggregates").glob("*.json"))
+    assert len(run_groups) == 2
+    assert aggregate_groups == run_groups
+    assert not persisted[0].json_path.exists()
 
 
 def test_aggregate_rejects_incompatible_or_duplicate_cases():
