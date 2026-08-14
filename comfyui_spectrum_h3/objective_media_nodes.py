@@ -20,6 +20,24 @@ OBJECTIVE_MEDIA_TYPE = "SPECTRUM_H3_OBJECTIVE_MEDIA"
 MAX_PENDING_BENCHMARKS = 3
 MAX_PENDING_BYTES = 12 * 1024**3
 
+_ROLE_PROVENANCE = {
+    "R": {"spectrum": "bypassed", "role": "native_full_compute_reference"},
+    "A": {
+        "spectrum": "enabled",
+        "generic_correction_mode": "legacy",
+        "generic_correction_attenuation": "mode_default",
+        "generic_correction_limiter": "rational",
+        "generic_correction_limit": 0.25,
+    },
+    "B": {
+        "spectrum": "enabled",
+        "generic_correction_mode": "coordinate_rls",
+        "generic_correction_attenuation": "no_attenuation",
+        "generic_correction_limiter": "hard_clip",
+        "generic_correction_limit": 0.40,
+    },
+}
+
 DEFAULT_PROVENANCE_JSON = json.dumps(
     {
         "compatibility": {
@@ -36,21 +54,7 @@ DEFAULT_PROVENANCE_JSON = json.dumps(
                 "provenance_status": "user-unverified-same-workflow",
             },
         },
-        "R": {"spectrum": "bypassed", "role": "native_full_compute_reference"},
-        "A": {
-            "spectrum": "enabled",
-            "generic_correction_mode": "legacy",
-            "generic_correction_attenuation": "mode_default",
-            "generic_correction_limiter": "rational",
-            "generic_correction_limit": 0.25,
-        },
-        "B": {
-            "spectrum": "enabled",
-            "generic_correction_mode": "coordinate_rls",
-            "generic_correction_attenuation": "no_attenuation",
-            "generic_correction_limiter": "hard_clip",
-            "generic_correction_limit": 0.40,
-        },
+        **_ROLE_PROVENANCE,
     },
     separators=(",", ":"),
 )
@@ -85,6 +89,45 @@ def _parse_provenance(provenance_json: str) -> dict[str, Any]:
 
 def _canonical_provenance(provenance: dict[str, Any]) -> str:
     return json.dumps(provenance, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _parse_generation_seed(value: Any) -> int:
+    text = str(value).strip()
+    try:
+        seed = int(text, 10)
+    except ValueError as exc:
+        raise ObjectiveMediaError("generation_seed must be a decimal integer") from exc
+    if seed < 0 or seed > 0xFFFFFFFFFFFFFFFF:
+        raise ObjectiveMediaError("generation_seed must be in the unsigned 64-bit range")
+    return seed
+
+
+def _sequential_provenance(compatibility_tag: str, steps: int) -> dict[str, Any]:
+    tag = str(compatibility_tag).strip()
+    if not tag:
+        raise ObjectiveMediaError("compatibility_tag must be non-empty")
+    resolved_steps = int(steps)
+    if resolved_steps < 1:
+        raise ObjectiveMediaError("steps must be positive")
+    asserted = f"user-asserted:{tag}"
+    return {
+        "compatibility": {
+            "model": "MiniMax-H3",
+            "model_weights": asserted,
+            "precision": asserted,
+            "sampler": "er_sde",
+            "scheduler": asserted,
+            "steps": resolved_steps,
+            "conditioning": asserted,
+            "video_vae": asserted,
+            "audio_decoder": asserted,
+            "generation_settings": {
+                "compatibility_tag": tag,
+                "provenance_status": "user-asserted-same-workflow",
+            },
+        },
+        **_ROLE_PROVENANCE,
+    }
 
 
 def _stage_media(video: Any, audio: Any = None) -> dict[str, Any]:
@@ -438,8 +481,28 @@ class SpectrumH3ObjectiveSequentialCapture:
                 ),
                 "fps": direct["fps"],
                 "benchmark_id": direct["benchmark_id"],
-                "seed": direct["seed"],
-                "provenance_json": direct["provenance_json"],
+                "generation_seed": (
+                    "STRING",
+                    {
+                        "default": "0",
+                        "tooltip": (
+                            "The actual generation seed, copied once and kept identical for R/A/B. This is a STRING "
+                            "deliberately so ComfyUI does not attach seed 'control after generate' randomization."
+                        ),
+                    },
+                ),
+                "steps": ("INT", {"default": 20, "min": 1, "max": 1000, "step": 1}),
+                "compatibility_tag": (
+                    "STRING",
+                    {
+                        "default": "minimax-h3-er-sde-current-workflow",
+                        "tooltip": (
+                            "Short user assertion identifying the unchanged model/precision/scheduler/conditioning/"
+                            "decoder setup. Keep it identical across R/A/B and compatible seeds; change it when those "
+                            "generation settings change."
+                        ),
+                    },
+                ),
                 "frame_chunk_size": direct["frame_chunk_size"],
                 "reset_before_capture": (
                     "BOOLEAN",
@@ -473,8 +536,9 @@ class SpectrumH3ObjectiveSequentialCapture:
         role,
         fps,
         benchmark_id,
-        seed,
-        provenance_json,
+        generation_seed,
+        steps,
+        compatibility_tag,
         frame_chunk_size,
         reset_before_capture=False,
         audio=None,
@@ -485,13 +549,13 @@ class SpectrumH3ObjectiveSequentialCapture:
         role_key = _ROLE_KEYS.get(str(role))
         if role_key is None:
             raise ObjectiveMediaError(f"unknown objective-media role: {role}")
-        provenance = _parse_provenance(provenance_json)
+        seed_value = _parse_generation_seed(generation_seed)
+        provenance = _sequential_provenance(compatibility_tag, int(steps))
         canonical_provenance = _canonical_provenance(provenance)
         staged = _stage_media(video, audio)
         staged_bytes = _media_nbytes(staged)
         topology = _media_topology(staged)
         fps_value = float(fps)
-        seed_value = int(seed)
         chunk_value = int(frame_chunk_size)
 
         completed: dict[str, Any] | None = None
@@ -500,6 +564,28 @@ class SpectrumH3ObjectiveSequentialCapture:
             if bool(reset_before_capture):
                 _PENDING_CAPTURES.pop(benchmark_key, None)
             existing = _PENDING_CAPTURES.get(benchmark_key)
+            if existing is not None:
+                if role_key in existing["roles"]:
+                    raise ObjectiveMediaError(
+                        f"benchmark {benchmark_key!r} already contains role {role_key}; "
+                        "set reset_before_capture=true to restart the triad"
+                    )
+                if existing["fps"] != fps_value:
+                    raise ObjectiveMediaError("R/A/B captures for one benchmark must use identical fps")
+                if existing["seed"] != seed_value:
+                    raise ObjectiveMediaError("R/A/B captures for one benchmark must use identical generation_seed")
+                if existing["canonical_provenance"] != canonical_provenance:
+                    raise ObjectiveMediaError(
+                        "R/A/B captures for one benchmark must use identical steps and compatibility_tag"
+                    )
+                if existing["frame_chunk_size"] != chunk_value:
+                    raise ObjectiveMediaError(
+                        "R/A/B captures for one benchmark must use identical frame_chunk_size"
+                    )
+                if existing["topology"] != topology:
+                    raise ObjectiveMediaError(
+                        "R/A/B captures for one benchmark must have matching decoded video/audio topology"
+                    )
             creating = existing is None
             evicted = _evict_for_capture_locked(
                 benchmark_key,
@@ -518,28 +604,6 @@ class SpectrumH3ObjectiveSequentialCapture:
                     "bytes": 0,
                 }
                 _PENDING_CAPTURES[benchmark_key] = existing
-            else:
-                if role_key in existing["roles"]:
-                    raise ObjectiveMediaError(
-                        f"benchmark {benchmark_key!r} already contains role {role_key}; "
-                        "set reset_before_capture=true to restart the triad"
-                    )
-                if existing["fps"] != fps_value:
-                    raise ObjectiveMediaError("R/A/B captures for one benchmark must use identical fps")
-                if existing["seed"] != seed_value:
-                    raise ObjectiveMediaError("R/A/B captures for one benchmark must use identical seed")
-                if existing["canonical_provenance"] != canonical_provenance:
-                    raise ObjectiveMediaError(
-                        "R/A/B captures for one benchmark must use identical provenance_json"
-                    )
-                if existing["frame_chunk_size"] != chunk_value:
-                    raise ObjectiveMediaError(
-                        "R/A/B captures for one benchmark must use identical frame_chunk_size"
-                    )
-                if existing["topology"] != topology:
-                    raise ObjectiveMediaError(
-                        "R/A/B captures for one benchmark must have matching decoded video/audio topology"
-                    )
             existing["roles"][role_key] = staged
             existing["bytes"] = int(existing["bytes"]) + staged_bytes
             _PENDING_CAPTURES.move_to_end(benchmark_key)
