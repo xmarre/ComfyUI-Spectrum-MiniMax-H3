@@ -250,16 +250,24 @@ def _format_metric(metrics: dict[str, Any]) -> str:
 def _stream_candidates(
     group: dict[str, Any],
     stream: str,
-) -> list[tuple[str, dict[str, Any]]]:
+) -> list[tuple[str, dict[str, Any], dict[str, Any]]]:
     metric_name = "audio" if stream == "audio" else "video_global"
     entries = [
-        (candidate, report[metric_name])
+        (
+            candidate,
+            report[metric_name],
+            live_configuration_for_candidate(candidate, scope="global"),
+        )
         for candidate, report in group["candidates"].items()
         if report[metric_name]["targets"] > 0
     ]
     if stream == "video" and group["regional_candidate_ranking"]:
         entries.extend(
-            (f"regional::{candidate}", group["candidates"][candidate]["video_regional"])
+            (
+                f"regional::{candidate}",
+                group["candidates"][candidate]["video_regional"],
+                live_configuration_for_candidate(candidate, scope="regional"),
+            )
             for candidate in group["regional_candidate_ranking"]
             if group["candidates"][candidate]["video_regional"]["targets"] > 0
         )
@@ -289,10 +297,8 @@ def render_console_summary(
         candidates = _stream_candidates(group, stream)
         if not candidates:
             lines.append("no scoreable targets")
-        for candidate, metrics in candidates[:TOP_CONSOLE_CANDIDATES]:
-            live = group["candidates"][candidate]["live_configuration"][
-                "live_reproducible"
-            ]
+        for candidate, metrics, live_configuration in candidates[:TOP_CONSOLE_CANDIDATES]:
+            live = bool(live_configuration["live_reproducible"])
             lines.append(
                 f"- {candidate} ({'exact live' if live else 'offline-only'}): "
                 f"{_format_metric(metrics)}"
