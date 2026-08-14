@@ -168,9 +168,18 @@ Restart ComfyUI. The node appears under:
 
 ```text
 sampling/spectrum -> Spectrum Apply MiniMax H3
+sampling/spectrum/research -> Spectrum H3 Objective Media Stage
+sampling/spectrum/research -> Spectrum H3 Objective Quality Compare
+sampling/spectrum/research -> Spectrum H3 Objective Quality Compare (Staged)
 ```
 
 The node adds no third-party Python dependency. It uses PyTorch and ComfyUI modules already present in a normal ComfyUI installation.
+
+The research-only objective nodes compare decoded native, legacy-Spectrum, and
+candidate outputs with structural, temporal, motion-detail, and audio metrics.
+They persist reports only and do nothing when unused. See
+[OBJECTIVE_MEDIA_BENCHMARK.md](OBJECTIVE_MEDIA_BENCHMARK.md) for the exact
+three-way workflow, metric definitions, provenance grouping, and verdict rule.
 
 ### Updating a Git install
 
@@ -409,7 +418,7 @@ The replay archive is independent from `max_history`. Choosing `offline_archive_
 
 ## Validation and limits
 
-The repository's CI exercises the reviewed MiniMax H3 contract across multiple pinned ComfyUI revisions. Coverage includes forced-actual native equivalence, transformer-free forecast execution, sampler recognition and safety guards, split/reordered conditional labels, audio/video row segmentation, replay storage and callbacks, ER-SDE seeded replay, model-aware profile lifetime, generic correction, and replay-calibration tooling.
+The repository's CI exercises the reviewed MiniMax H3 contract across multiple pinned ComfyUI revisions. Coverage includes forced-actual native equivalence, transformer-free forecast execution, sampler recognition and safety guards, split/reordered conditional labels, audio/video row segmentation, replay storage and callbacks, ER-SDE seeded replay, model-aware profile lifetime, generic correction, decoded-media objective metrics, and replay-calibration tooling.
 
 Real-checkpoint validation remains essential for quality claims. Current evidence includes exact-seed MiniMax H3 runs across Euler and native ER-SDE, reference-conditioned audio investigations, replay A/B tests, Turbo/LightX2V experiments, and community AMD/ROCm testing. These results cover specific configurations and do not establish universal fidelity.
 
@@ -418,6 +427,7 @@ For the detailed current implementation contract, see:
 - [IMPLEMENTATION_NOTES.md](IMPLEMENTATION_NOTES.md)
 - [MODEL_AWARE_BENCHMARK.md](MODEL_AWARE_BENCHMARK.md)
 - [FORECAST_TRUST_BENCHMARK.md](FORECAST_TRUST_BENCHMARK.md)
+- [OBJECTIVE_MEDIA_BENCHMARK.md](OBJECTIVE_MEDIA_BENCHMARK.md)
 - [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ## Tests

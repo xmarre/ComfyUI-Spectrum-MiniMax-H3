@@ -4,6 +4,12 @@ import logging
 
 from .config import SpectrumH3Config
 from .minimax_h3 import install_h3_wrapper, require_native_minimax_h3
+from .objective_media_nodes import (
+    NODE_CLASS_MAPPINGS as OBJECTIVE_NODE_CLASS_MAPPINGS,
+)
+from .objective_media_nodes import (
+    NODE_DISPLAY_NAME_MAPPINGS as OBJECTIVE_NODE_DISPLAY_NAME_MAPPINGS,
+)
 from .runtime import SpectrumH3Runtime
 from .sampling import install_sampler_wrappers
 
@@ -374,8 +380,14 @@ class SpectrumApplyMiniMaxH3:
         return (patched,)
 
 
-NODE_CLASS_MAPPINGS = {"SpectrumApplyMiniMaxH3": SpectrumApplyMiniMaxH3}
-NODE_DISPLAY_NAME_MAPPINGS = {"SpectrumApplyMiniMaxH3": "Spectrum Apply MiniMax H3"}
+NODE_CLASS_MAPPINGS = {
+    "SpectrumApplyMiniMaxH3": SpectrumApplyMiniMaxH3,
+    **OBJECTIVE_NODE_CLASS_MAPPINGS,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "SpectrumApplyMiniMaxH3": "Spectrum Apply MiniMax H3",
+    **OBJECTIVE_NODE_DISPLAY_NAME_MAPPINGS,
+}
 
 __all__ = [
     "NODE_CLASS_MAPPINGS",

@@ -210,3 +210,17 @@ Final model-aware runtime must preserve:
 - no Feature-3 correction work in `schedule` or `schedule_confidence`.
 
 The final real mechanical gate described in `MODEL_AWARE_BENCHMARK.md` is intended to verify these invariants and measure the simplified `full` overhead. It is not a new Feature-3 discovery experiment.
+
+## Decoded-media evidence layer
+
+`objective_media.py` is a standalone CPU evaluator for decoded ComfyUI IMAGE and
+AUDIO values. Its node wrappers are independent of the model wrapper and sampler
+runtime. Direct and CPU-staged triad paths share the same evaluator; the staged
+path moves each decoded branch out of VRAM before the comparison. The evaluator
+persists bounded atomic JSON/Markdown reports and never persists raw media.
+
+The decoded-media compatibility signature combines declared model/sampler/
+decoder provenance with computed frame, resolution, FPS, and audio topology.
+Independent complete triads are aggregated; hidden-feature calibration remains
+a separate evidence layer. See
+[OBJECTIVE_MEDIA_BENCHMARK.md](OBJECTIVE_MEDIA_BENCHMARK.md).

@@ -64,6 +64,8 @@ jobs:
             comfyui_spectrum_h3/generic_correction_runtime.py \
             comfyui_spectrum_h3/generic_correction_topology.py \
             comfyui_spectrum_h3/experiments.py \
+            comfyui_spectrum_h3/objective_media.py \
+            comfyui_spectrum_h3/objective_media_nodes.py \
             comfyui_spectrum_h3/nodes.py \
             comfyui_spectrum_h3/runtime.py \
             comfyui_spectrum_h3/sampling.py \
@@ -75,6 +77,7 @@ jobs:
             tests/test_generic_correction_evaluator.py \
             tests/test_generic_correction_research.py \
             tests/test_model_aware.py \
+            tests/test_objective_media.py \
             tests/test_runtime.py \
             tests/test_sampling.py \
             tests/conftest.py \
