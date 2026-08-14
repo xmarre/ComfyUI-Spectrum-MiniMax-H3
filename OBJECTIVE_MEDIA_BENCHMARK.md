@@ -21,24 +21,32 @@ For ordinary testing, use only:
 Spectrum H3 Objective Media Capture (Sequential - Recommended)
 ```
 
-Add one capture node as a side branch from the same decoded outputs that already
-feed the normal video-save/combine path:
+The capture node is a measurement side branch. The existing Video Combine keeps
+receiving both decoded IMAGE and decoded AUDIO exactly as before. Fan those same
+two outputs out to the capture node as well, and feed the capture node from the
+same fixed INT seed output that already drives generation:
 
 ```text
-decoded IMAGE ──┬──> Video Combine / normal save path
-                └──> Objective Media Capture (Sequential - Recommended)
+fixed seed INT ──────┬────> generation workflow seed input(s)
+                     └────> Objective Media Capture [generation_seed]
 
-decoded AUDIO ──┬──> Video Combine / normal save path
-                └──> Objective Media Capture (Sequential - Recommended)
+                     ┌────> Video Combine [images]
+decoded IMAGE ───────┤
+                     └────> Objective Media Capture [video]
+
+                     ┌────> Video Combine [audio]
+decoded AUDIO ───────┤
+                     └────> Objective Media Capture [audio]
 ```
 
-The capture node does not replace Video Combine and does not output media for
-Video Combine. It is a measurement side branch only.
+`Video Combine [images]` and `Video Combine [audio]` above are the two input
+sockets of the **same existing Video Combine node**. The capture node does not
+replace Video Combine and does not output media for Video Combine.
 
-Run the same normal workflow three times. Keep `benchmark_id`,
-`generation_seed`, FPS, steps, `compatibility_tag`, prompt, model, resolution,
-decoders, and all other non-Spectrum generation settings unchanged. Change the
-capture role and Spectrum configuration for each run:
+Run the same normal workflow three times. Keep `benchmark_id`, the linked fixed
+seed, FPS, steps, `compatibility_tag`, prompt, model, resolution, decoders, and
+all other non-Spectrum generation settings unchanged. Change the capture role
+and Spectrum configuration for each run:
 
 ```text
 run 1: role = R - native reference
@@ -60,9 +68,9 @@ generation. No three-branch generation graph is required.
 - `role`: `R - native reference`, `A - legacy Spectrum`, or `B - candidate`.
 - `fps`: actual output FPS; keep fixed across the triad.
 - `benchmark_id`: one unique identifier for the triad; keep fixed across R/A/B.
-- `generation_seed`: the actual generation seed as a decimal **STRING**. It is
-  deliberately not an INT seed widget, so ComfyUI does not attach the
-  seed `control after generate` randomizer to this benchmark metadata field.
+- `generation_seed`: required **INT connection**. Connect the exact same fixed
+  seed output that drives the generation workflow. The benchmark node owns no
+  separate seed value and exposes no `control_after_generate` randomizer.
 - `steps`: native sampler step count, normally 20 for the current ER-SDE gate.
 - `compatibility_tag`: short user assertion identifying the unchanged
   model/weights/precision/scheduler/conditioning/VAE/audio-decoder setup. Keep it
@@ -190,7 +198,7 @@ AUDIO when present: multi-resolution STFT error
 
 A role is favored only when at least one primary improves by 1% or more, no
 primary regresses by more than 2%, and the worst-frame/worst-window/lag
-Guardrails do not regress by more than 5%. The verdict is
+guardrails do not regress by more than 5%. The verdict is
 `candidate_favored`, `legacy_favored`, or `mixed_or_inconclusive` and all raw
 metrics remain visible.
 
