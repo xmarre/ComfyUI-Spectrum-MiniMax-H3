@@ -967,6 +967,7 @@ def _stage_media_sequential(
                 del work
             else:
                 resized = work
+                del work
             del source_chunk
             _capture_log(
                 "chunk_resize_end",

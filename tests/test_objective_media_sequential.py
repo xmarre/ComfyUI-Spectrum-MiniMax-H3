@@ -348,9 +348,13 @@ def test_sequential_staging_is_bounded_deterministic_and_dtype_independent(
     assert first["audio"]["waveform"].data_ptr() != audio["waveform"].data_ptr()
 
 
-def test_sequential_staging_matches_previous_numeric_transform(monkeypatch):
+@pytest.mark.parametrize(
+    "dtype",
+    (torch.float16, torch.bfloat16, torch.float32, torch.float64),
+)
+def test_sequential_staging_matches_previous_numeric_transform(monkeypatch, dtype):
     monkeypatch.setattr(nodes, "SEQUENTIAL_MAX_ANALYSIS_PIXELS", 64)
-    source = _video(frames=5, height=17, width=19)
+    source = _video(frames=5, height=17, width=19).to(dtype=dtype)
     target_height, target_width = nodes._bounded_analysis_size(17, 19)
     expected = torch.empty((5, target_height, target_width, 3), dtype=torch.float16)
     for start in range(0, 5, nodes.SEQUENTIAL_STAGE_CHUNK_FRAMES):
