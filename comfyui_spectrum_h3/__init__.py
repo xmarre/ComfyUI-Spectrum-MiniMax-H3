@@ -4,6 +4,7 @@ from .forecast import HistoryWeightForecaster
 from .generic_correction import install_generic_residual_correction
 from .minimax_h3 import locate_minimax_h3_inner, require_native_minimax_h3
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .postrun_safety import install_postrun_safety
 from .replay_calibration import install_replay_calibration
 from .replay_calibration_provenance import install_replay_calibration_provenance
 from .replay_calibration_validation import install_replay_calibration_validation
@@ -17,6 +18,7 @@ from .runtime import SpectrumH3Runtime
 from .trust_probe import install_forecast_trust_probe
 
 install_generic_residual_correction()
+install_postrun_safety()
 install_forecast_trust_probe()
 install_replay_native_trust_shadow()
 install_replay_component_decomposition()
