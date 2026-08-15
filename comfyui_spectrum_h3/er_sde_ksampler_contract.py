@@ -127,6 +127,13 @@ def _attribute_path(node: ast.AST) -> tuple[str, ...] | None:
     return tuple(reversed(parts))
 
 
+def _root_name(node: ast.AST) -> str | None:
+    current = node
+    while isinstance(current, (ast.Attribute, ast.Subscript)):
+        current = current.value
+    return current.id if isinstance(current, ast.Name) else None
+
+
 def _subscript(node: ast.AST, name: str, key: str | int) -> bool:
     if not isinstance(node, ast.Subscript) or not _name(node.value, name):
         return False
@@ -189,11 +196,235 @@ def _contract_failure(
     return KSamplerSampleContract(False, failure, provenance)
 
 
+def _contains_loaded_name(node: ast.AST, names: set[str]) -> bool:
+    return any(
+        isinstance(item, ast.Name)
+        and isinstance(item.ctx, ast.Load)
+        and item.id in names
+        for item in ast.walk(node)
+    )
+
+
+def _resolve_variadic_passthrough_target(
+    function: Callable[..., Any],
+    function_node: ast.FunctionDef,
+) -> tuple[Callable[..., Any] | None, str | None, bool]:
+    """Resolve the audited TiledDiffusion-style *args/**kwargs KSAMPLER shim."""
+    try:
+        signature = inspect.signature(function, follow_wrapped=False)
+    except (TypeError, ValueError) as exc:
+        return None, f"signature inspection failed: {exc}", False
+    parameters = list(signature.parameters.values())
+    if not (
+        len(parameters) == 2
+        and parameters[0].kind is parameters[0].VAR_POSITIONAL
+        and parameters[1].kind is parameters[1].VAR_KEYWORD
+    ):
+        return None, None, False
+
+    vararg_name = parameters[0].name
+    varkw_name = parameters[1].name
+    if function_node.name != "KSAMPLER_sample":
+        return None, "variadic KSAMPLER.sample wrapper is not a reviewed passthrough form", True
+    if any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        and node is not function_node
+        for node in ast.walk(function_node)
+    ):
+        return None, "variadic KSAMPLER.sample wrapper defines nested callables", True
+
+    returns = [node for node in function_node.body if isinstance(node, ast.Return)]
+    if len(returns) != 1 or not isinstance(returns[0].value, ast.Call):
+        return None, "variadic KSAMPLER.sample wrapper must have one direct passthrough return", True
+    delegate_call = returns[0].value
+    if not isinstance(delegate_call.func, ast.Name):
+        return None, "variadic KSAMPLER.sample wrapper delegate is not a local alias", True
+    alias_name = delegate_call.func.id
+    if not (
+        len(delegate_call.args) == 1
+        and isinstance(delegate_call.args[0], ast.Starred)
+        and _name(delegate_call.args[0].value, vararg_name)
+        and len(delegate_call.keywords) == 1
+        and delegate_call.keywords[0].arg is None
+        and _name(delegate_call.keywords[0].value, varkw_name)
+    ):
+        return None, "variadic KSAMPLER.sample wrapper does not forward *args/**kwargs unchanged", True
+
+    alias_assignments = [
+        node
+        for node in function_node.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and _name(node.targets[0], alias_name)
+    ]
+    if (
+        len(alias_assignments) != 1
+        or not isinstance(alias_assignments[0].value, ast.Attribute)
+        or alias_assignments[0].value.attr != "KSAMPLER_sample"
+    ):
+        return None, "variadic KSAMPLER.sample wrapper original-method ownership is unproven", True
+    alias_assignment = alias_assignments[0]
+    state_root = _root_name(alias_assignment.value)
+    if state_root is None:
+        return None, "variadic KSAMPLER.sample wrapper state owner cannot be identified", True
+    target = _resolve_global(function, alias_assignment.value)
+    if not inspect.isfunction(target):
+        return None, "variadic KSAMPLER.sample wrapper target is not a plain function", True
+    if target is function:
+        return None, "variadic KSAMPLER.sample wrapper delegates to itself", True
+
+    alias_stores = [
+        node
+        for node in ast.walk(function_node)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Store)
+        and node.id == alias_name
+    ]
+    if len(alias_stores) != 1:
+        return None, "variadic KSAMPLER.sample wrapper delegate alias is reassigned", True
+
+    input_names = {vararg_name, varkw_name}
+    for node in ast.walk(function_node):
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Store)
+            and node.id in input_names
+        ):
+            return None, "variadic KSAMPLER.sample wrapper reassigns its argument containers", True
+        if (
+            isinstance(node, (ast.Attribute, ast.Subscript))
+            and isinstance(getattr(node, "ctx", None), ast.Store)
+            and _root_name(node) in input_names
+        ):
+            return None, "variadic KSAMPLER.sample wrapper mutates its argument containers", True
+
+    extra_args_reads = [
+        node
+        for node in ast.walk(function_node)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and _name(node.targets[0], "extra_args")
+        and isinstance(node.value, ast.IfExp)
+        and isinstance(node.value.test, ast.Compare)
+        and isinstance(node.value.test.left, ast.Constant)
+        and node.value.test.left.value == "extra_args"
+        and len(node.value.test.ops) == 1
+        and isinstance(node.value.test.ops[0], ast.In)
+        and len(node.value.test.comparators) == 1
+        and _name(node.value.test.comparators[0], varkw_name)
+        and _subscript(node.value.body, varkw_name, "extra_args")
+        and _subscript(node.value.orelse, vararg_name, 3)
+    ]
+    model_options_reads = [
+        node
+        for node in ast.walk(function_node)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and _name(node.targets[0], "model_options")
+        and _subscript(node.value, "extra_args", "model_options")
+    ]
+    if len(extra_args_reads) != 1 or len(model_options_reads) != 1:
+        return None, "variadic KSAMPLER.sample wrapper does not recover native extra_args/model_options", True
+
+    pop_calls = [
+        node
+        for node in ast.walk(function_node)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and _name(node.func.value, "model_options")
+        and node.func.attr == "pop"
+    ]
+    if not (
+        len(pop_calls) == 1
+        and len(pop_calls[0].args) == 2
+        and isinstance(pop_calls[0].args[0], ast.Constant)
+        and pop_calls[0].args[0].value == "sigmas"
+        and isinstance(pop_calls[0].args[1], ast.Constant)
+        and pop_calls[0].args[1].value is None
+        and not pop_calls[0].keywords
+    ):
+        return None, "variadic KSAMPLER.sample wrapper model_options mutation is not the reviewed TiledDiffusion sigmas handoff", True
+    pop_call = pop_calls[0]
+    guarded_branches = [
+        node
+        for node in function_node.body
+        if isinstance(node, ast.If)
+        and pop_call in set(ast.walk(ast.Module(body=node.body, type_ignores=[])))
+        and any(
+            isinstance(item, ast.Constant) and item.value == "tiled_diffusion"
+            for item in ast.walk(node.test)
+        )
+        and any(
+            isinstance(item, ast.Name) and item.id == "model_options"
+            for item in ast.walk(node.test)
+        )
+    ]
+    if len(guarded_branches) != 1:
+        return None, "variadic KSAMPLER.sample wrapper sigmas handoff is not guarded by tiled_diffusion model state", True
+
+    tainted_names = {
+        vararg_name,
+        varkw_name,
+        "extra_args",
+        "model_options",
+        "sigmas_",
+        "sigmas_all",
+        "sigmas",
+    }
+    allowed_calls = {delegate_call, pop_call}
+    for call in [node for node in ast.walk(function_node) if isinstance(node, ast.Call)]:
+        if call in allowed_calls:
+            continue
+        if (
+            isinstance(call.func, ast.Name)
+            and call.func.id == "_delattr"
+            and len(call.args) == 2
+            and _name(call.args[0], state_root)
+            and not call.keywords
+        ):
+            continue
+        receiver = call.func.value if isinstance(call.func, ast.Attribute) else None
+        if receiver is not None and _root_name(receiver) in tainted_names:
+            return None, "variadic KSAMPLER.sample wrapper performs an unreviewed call on sampler inputs", True
+        if any(_contains_loaded_name(argument, tainted_names) for argument in call.args) or any(
+            _contains_loaded_name(keyword.value, tainted_names) for keyword in call.keywords
+        ):
+            return None, "variadic KSAMPLER.sample wrapper exposes sampler inputs to an unreviewed call", True
+
+    for node in ast.walk(function_node):
+        if (
+            isinstance(node, (ast.Attribute, ast.Subscript))
+            and isinstance(getattr(node, "ctx", None), ast.Store)
+            and _root_name(node) != state_root
+        ):
+            return None, "variadic KSAMPLER.sample wrapper mutates state outside its reviewed bookkeeping owner", True
+
+    expansions = [
+        node
+        for node in ast.walk(function_node)
+        if (
+            isinstance(node, ast.Starred)
+            and _name(node.value, vararg_name)
+        )
+        or (
+            isinstance(node, ast.keyword)
+            and node.arg is None
+            and _name(node.value, varkw_name)
+        )
+    ]
+    expected_expansions = {delegate_call.args[0], delegate_call.keywords[0]}
+    if set(expansions) != expected_expansions:
+        return None, "variadic KSAMPLER.sample wrapper forwards argument containers more than once", True
+
+    return target, None, True
+
+
 def validate_ksampler_sample(
     function: Callable[..., Any],
     *,
     expected_adapter: type,
     expected_reference_digest: str,
+    _visited: frozenset[int] | None = None,
 ) -> KSamplerSampleContract:
     """Prove only the native adapter flow required by ER-SDE compensation."""
     function_node, source_error = _function_source_node(function)
@@ -208,6 +439,12 @@ def validate_ksampler_sample(
             "KSAMPLER.sample is not a plain function descriptor",
             provenance,
         )
+    visited = set(_visited or ())
+    if id(function) in visited:
+        return _contract_failure("KSAMPLER.sample wrapper chain contains a cycle", provenance)
+    if len(visited) >= 4:
+        return _contract_failure("KSAMPLER.sample wrapper chain exceeds reviewed depth", provenance)
+    visited.add(id(function))
     if function_node is None:
         return _contract_failure(
             "source is unavailable, so adapter semantics cannot be proven",
@@ -220,6 +457,28 @@ def validate_ksampler_sample(
             "KSAMPLER.sample decorators have unproven runtime semantics",
             provenance,
         )
+
+    passthrough_target, passthrough_failure, variadic_wrapper = (
+        _resolve_variadic_passthrough_target(function, function_node)
+    )
+    if variadic_wrapper:
+        if passthrough_failure is not None or passthrough_target is None:
+            return _contract_failure(
+                passthrough_failure or "variadic KSAMPLER.sample wrapper target is unavailable",
+                provenance,
+            )
+        wrapped_contract = validate_ksampler_sample(
+            passthrough_target,
+            expected_adapter=expected_adapter,
+            expected_reference_digest=expected_reference_digest,
+            _visited=frozenset(visited),
+        )
+        if not wrapped_contract.accepted:
+            return _contract_failure(
+                f"variadic KSAMPLER.sample wrapper target rejected: {wrapped_contract.failure}",
+                provenance,
+            )
+        return KSamplerSampleContract(True, None, provenance)
 
     try:
         signature = inspect.signature(function, follow_wrapped=False)
