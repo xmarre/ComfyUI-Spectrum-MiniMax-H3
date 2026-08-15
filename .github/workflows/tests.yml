@@ -89,6 +89,7 @@ jobs:
             tests/test_runtime.py \
             tests/test_sampler_contract.py \
             tests/test_sampling.py \
+            tests/test_tiled_diffusion_ksampler_contract.py \
             tests/conftest.py \
             tools/analyze_generic_correction.py \
             --ignore N999,I001,C408,UP035
