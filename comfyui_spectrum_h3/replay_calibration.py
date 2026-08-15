@@ -22,7 +22,7 @@ _SOURCE_SCHEMA_REVISION = "pr45-replay-calibration-v1"
 _LOG_PREFIX = "SPECTRUM_REPLAY_CALIBRATION_JSON="
 _ARCHIVE_STATE_ATTR = "_spectrum_replay_calibration_state"
 _PACKAGE_NAME = "comfyui-spectrum-minimax-h3"
-_FALLBACK_PACKAGE_VERSION = "0.2.10"
+_FALLBACK_PACKAGE_VERSION = "0.2.11"
 _PARITY_TOLERANCE = 2e-5
 _MAX_SERIALIZED_BYTES = 96 * 1024
 _FIXED_WEIGHTS = (0.0, 0.25, 0.50, 0.75, 1.0)
@@ -244,7 +244,6 @@ def _calibration_row(
     if torch.any(effective_blends <= 0):
         raise RuntimeError("replay calibration received nonpositive video blend")
 
-    # Predictor/deployable values are frozen before the withheld target is read.
     predictors = _predictor_snapshot(
         record=record,
         candidates=candidates,
@@ -258,8 +257,6 @@ def _calibration_row(
         raise RuntimeError("replay calibration bracket has duplicate coordinates")
     bracket_fraction = (float(record.coordinate) - float(left.coordinate)) / spacing
 
-    # Post-target scoring starts here. None of these values may feed a deployable
-    # predictor or a production replay path.
     actual = samples[target_index]
     e = (candidates.local - actual).to(torch.float32)
     d = (candidates.spectral - candidates.local).to(torch.float32)
