@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from types import SimpleNamespace
 from typing import Any
 
 from . import generic_correction as _generic
