@@ -206,6 +206,16 @@ That is 11 actual evaluations and 9 forecasts. Fallbacks, model-aware scheduling
 
 The shipping full-mode generic controller uses signed coordinate transport with scalar RLS and a hard `±0.40` gain bound. More experimental reliability/regional controller options remain available for research/reproduction but are not the production default.
 
+## Deterministic external activation patches
+
+Spectrum can consume a versioned, pure-data compatibility contract from recognized MiniMax H3 patches that deterministically modify transformer activations. The first supported producer is the MiniMax H3 node in ComfyUI-DiffAid-Patches. A valid descriptor participates in the model-aware structural profile and its canonical fingerprint is part of the profile cache key, so patched and unpatched models cannot alias the same cached profile. Recognized runtime activation modulation is reported separately from LoRA/model-parameter patches.
+
+For a nonzero external patch with a partial hard sigma window (`sigma_ramp=0`), Spectrum compares the exact normalized-sigma active/inactive state supplied by the producer against the last successfully completed solver step. If the current call is the first call in a new hard modulation regime and it was scheduled as a forecast, Spectrum promotes that **current step** to one actual H3 evaluation so the forecast history immediately receives an anchor from the new regime. The state is committed only after successful step finalization; abort/retry/rollback do not advance it early. Multiple contracts crossing on the same step still require only one actual evaluation.
+
+A full `[0,1]` window has no interior transition and adds no compatibility NFE. Smooth `sigma_ramp>0` modulation remains continuous and does not force refreshes solely because its gain changes. The hard-boundary guard remains active when `model_aware_mode=off` because it is a forecast-correctness rule rather than an optional scheduling heuristic.
+
+This mechanism is independent of the native ER-SDE stochastic-state compensation described above. Diff-Aid is deterministic activation modulation; Spectrum does not reuse ER-SDE stochastic compensation for it. Spectrum also does **not** post-hoc multiply or otherwise scale the forecasted `[audio | video]` target feature to imitate Diff-Aid. The external modulation occurs before selected transformer blocks and is transformed nonlinearly by the remaining network, so the compatible action at a declared discontinuity is to acquire a real anchor.
+
 ## Offline smoothing replay
 
 With `offline_smoothing_replay=true`, Spectrum performs two sampler passes:
@@ -292,16 +302,18 @@ Enable `debug=true` before reporting a sampler problem. Useful messages include:
 
 ```text
 Spectrum H3 run start ...
+Spectrum H3 external patch profile provider=... instance=... kind=... strength=... blocks=... final_block=... sigma_window=... sigma_ramp=...
 Spectrum H3 step ... decision=actual|forecast ...
+Spectrum H3 external patch transition step=... transitions=... action=force_actual|already_actual
 Spectrum H3 ER-SDE stochastic tracking active ...
 Spectrum H3 ER-SDE dense anchor ...
 Spectrum H3 ER-SDE dense output ...
-Spectrum H3 run summary ...
+Spectrum H3 run summary ... external_patch_transitions=... external_patch_forced_actuals=... external_patch_contract_failures=...
 Spectrum H3 teardown transition ...
 Spectrum H3 run teardown ...
 ```
 
-If Spectrum encounters an unreviewed sampler/wrapper contract it should log the reason and run native rather than silently applying an unsafe approximation.
+If Spectrum encounters an unreviewed sampler/wrapper contract it should log the reason and run native rather than silently applying an unsafe approximation. Malformed declared external compatibility metadata that could affect forecast correctness likewise fails safe to all-actual sampling for that run rather than aborting an otherwise valid generation.
 
 For bug reports, include:
 
