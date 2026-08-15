@@ -20,7 +20,7 @@ class ERSDETrackingError(RuntimeError):
     """The reviewed ER-SDE stochastic-state contract could not be maintained."""
 
 
-class ERSDEDenseOutputError(RuntimeError):
+class ERSDEDenseOutputError(ERSDETrackingError):
     """The causal ER-SDE solver-space dense-output contract could not be maintained."""
 
 
@@ -50,7 +50,7 @@ class ERSDEDenseOutputPrediction:
     value: torch.Tensor
     mode: str
     anchor_steps: tuple[int, ...]
-    alpha: float
+    alpha: float | torch.Tensor
 
 
 def function_node_ast_digest(
@@ -113,7 +113,7 @@ class ERSDEStochasticTracker:
         self._scaler_calls = 0
         self._noise_calls = 0
         self._pending: _PendingIncrement | None = None
-        self._solver_coordinates: dict[int, float] = {}
+        self._solver_coordinates: dict[int, torch.Tensor] = {}
         self._denoised_anchors: list[_DenoisedAnchor] = []
 
     @property
@@ -144,29 +144,26 @@ class ERSDEStochasticTracker:
         return result
 
     @staticmethod
-    def _scalar_coordinate(value: torch.Tensor, *, label: str) -> float:
+    def _coordinate_tensor(value: torch.Tensor, *, label: str) -> torch.Tensor:
         if not torch.is_tensor(value) or value.numel() != 1:
             raise ERSDETrackingError(f"ER-SDE {label} is not a scalar tensor")
-        coordinate = float(value.detach().item())
-        if not math.isfinite(coordinate) or coordinate <= 0.0:
-            raise ERSDETrackingError(
-                f"ER-SDE {label} must be a positive finite solver coordinate"
-            )
-        return coordinate
+        return value.detach().clone()
 
-    def _record_solver_coordinate(self, step_id: int, coordinate: float) -> None:
+    def _record_solver_coordinate(
+        self,
+        step_id: int,
+        coordinate: torch.Tensor,
+    ) -> None:
         existing = self._solver_coordinates.get(int(step_id))
-        if existing is not None and not math.isclose(
-            existing,
-            coordinate,
-            rel_tol=1e-6,
-            abs_tol=1e-9,
+        if existing is None:
+            self._solver_coordinates[int(step_id)] = coordinate
+            return
+        if self.debug and not bool(
+            torch.isclose(existing, coordinate, rtol=1e-6, atol=1e-9).item()
         ):
             raise ERSDETrackingError(
-                "ER-SDE solver coordinate changed for step "
-                f"{step_id}: {existing:.9g} != {coordinate:.9g}"
+                f"ER-SDE solver coordinate changed for step {step_id}"
             )
-        self._solver_coordinates[int(step_id)] = float(coordinate)
 
     def noise_sampler(
         self,
@@ -193,11 +190,11 @@ class ERSDEStochasticTracker:
         target_step_id = source_step_id + 1
         self._record_solver_coordinate(
             source_step_id,
-            self._scalar_coordinate(er_lambda_s, label="er_lambda_s"),
+            self._coordinate_tensor(er_lambda_s, label="er_lambda_s"),
         )
         self._record_solver_coordinate(
             target_step_id,
-            self._scalar_coordinate(er_lambda_t, label="er_lambda_t"),
+            self._coordinate_tensor(er_lambda_t, label="er_lambda_t"),
         )
 
         r = scaled_t / scaled_s
@@ -455,38 +452,34 @@ class ERSDEStochasticTracker:
             )
         denominator = latest_coordinate - previous_coordinate
         advance = target_coordinate - latest_coordinate
-        scale = max(abs(previous_coordinate), abs(latest_coordinate), 1.0)
-        # A constant extension is the bounded first-order fallback whenever the
-        # two-anchor lambda extrapolation is not trustworthy. It stays inside the
-        # exact actual-denoised manifold and cannot reintroduce x-sigma*v noise.
-        if abs(denominator) <= 1e-12 * scale or denominator * advance < 0.0:
-            predicted = latest.value.clone(memory_format=torch.contiguous_format)
-            return ERSDEDenseOutputPrediction(
-                value=predicted,
-                mode="latest_actual_hold_coordinate_guard",
-                anchor_steps=(latest.step_id,),
-                alpha=0.0,
-            )
         alpha = advance / denominator
-        # The target is one solver step ahead. Do not extrapolate farther in lambda
-        # than the complete interval represented by the two exact actual anchors.
-        if alpha < -1e-6 or alpha > 1.0 + 1e-6:
-            predicted = latest.value.clone(memory_format=torch.contiguous_format)
-            return ERSDEDenseOutputPrediction(
-                value=predicted,
-                mode="latest_actual_hold_extrapolation_guard",
-                anchor_steps=(latest.step_id,),
-                alpha=0.0,
-            )
-        alpha = float(max(0.0, min(1.0, alpha)))
-        predicted = torch.lerp(latest.value, previous.value, -alpha)
-        if not bool(torch.isfinite(predicted).all().item()):
-            raise ERSDEDenseOutputError("ER-SDE dense-output prediction is nonfinite")
+        scale = torch.maximum(
+            torch.maximum(previous_coordinate.abs(), latest_coordinate.abs()),
+            torch.ones_like(latest_coordinate),
+        )
+        # Build the trust guard entirely on-device. Invalid or overlong
+        # extrapolation becomes weight zero, i.e. a latest-actual hold, without a
+        # CUDA synchronization in the non-debug hot path.
+        valid = (
+            torch.isfinite(alpha)
+            & torch.isfinite(denominator)
+            & (denominator.abs() > 1e-12 * scale)
+            & (denominator * advance >= 0.0)
+            & (alpha >= -1e-6)
+            & (alpha <= 1.0 + 1e-6)
+        )
+        bounded_alpha = alpha.clamp(0.0, 1.0)
+        weight = torch.where(valid, bounded_alpha, torch.zeros_like(bounded_alpha))
+        weight = weight.to(device=latest.value.device, dtype=latest.value.dtype)
+        predicted = torch.lerp(latest.value, previous.value, -weight)
+        mode = "lambda_bounded_extrapolation"
+        if self.debug and not bool(valid.item()):
+            mode = "latest_actual_hold_extrapolation_guard"
         return ERSDEDenseOutputPrediction(
             value=predicted,
-            mode="lambda_linear_extrapolation",
+            mode=mode,
             anchor_steps=(previous.step_id, latest.step_id),
-            alpha=alpha,
+            alpha=weight,
         )
 
     def clear(self) -> None:
@@ -547,6 +540,11 @@ class ERSDEStochasticTracker:
         raw_rms = self._rms(raw_denoised)
         dense_rms = self._rms(dense)
         q_rms = self._rms(increment)
+        alpha = (
+            float(prediction.alpha.detach().item())
+            if torch.is_tensor(prediction.alpha)
+            else float(prediction.alpha)
+        )
         LOG.warning(
             "Spectrum H3 ER-SDE dense output step=%s mode=%s anchor_steps=%s "
             "alpha=%.8f q_pending=true q_rms=%.8f raw_denoised_rms=%.8f "
@@ -555,7 +553,7 @@ class ERSDEStochasticTracker:
             descriptor.step_id,
             prediction.mode,
             prediction.anchor_steps,
-            prediction.alpha,
+            alpha,
             q_rms,
             raw_rms,
             dense_rms,
