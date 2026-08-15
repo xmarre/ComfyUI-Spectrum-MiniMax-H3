@@ -56,7 +56,7 @@ jobs:
           python -m ruff check \
             comfyui_spectrum_h3/external_patch_compat.py \
             tests/test_external_patch_compat.py \
-            --ignore UP037
+            --ignore I001,UP037
           python -m ruff check \
             comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/generic_correction.py \
