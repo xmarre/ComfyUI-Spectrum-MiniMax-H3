@@ -74,6 +74,7 @@ jobs:
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
             tests/test_config.py \
+            tests/test_er_sde_solver_dense_output.py \
             tests/test_er_sde_stochastic_compensation.py \
             tests/test_generic_correction.py \
             tests/test_generic_correction_calibration.py \
