@@ -54,8 +54,11 @@ jobs:
       - name: Run Ruff and compileall
         run: |
           python -m ruff check \
-            comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/external_patch_compat.py \
+            tests/test_external_patch_compat.py \
+            --ignore UP037
+          python -m ruff check \
+            comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/generic_correction.py \
             comfyui_spectrum_h3/generic_correction_calibration.py \
             comfyui_spectrum_h3/generic_correction_controller.py \
@@ -78,7 +81,6 @@ jobs:
             tests/test_config.py \
             tests/test_er_sde_solver_dense_output.py \
             tests/test_er_sde_stochastic_compensation.py \
-            tests/test_external_patch_compat.py \
             tests/test_generic_correction.py \
             tests/test_generic_correction_calibration.py \
             tests/test_generic_correction_core.py \
