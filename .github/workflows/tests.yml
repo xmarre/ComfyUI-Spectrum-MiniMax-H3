@@ -70,6 +70,7 @@ jobs:
             comfyui_spectrum_h3/objective_media_bounded.py \
             comfyui_spectrum_h3/objective_media_nodes.py \
             comfyui_spectrum_h3/nodes.py \
+            comfyui_spectrum_h3/postrun_safety.py \
             comfyui_spectrum_h3/runtime.py \
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
@@ -87,6 +88,7 @@ jobs:
             tests/test_objective_media_bounded.py \
             tests/test_objective_media_seed_link.py \
             tests/test_objective_media_sequential.py \
+            tests/test_postrun_safety.py \
             tests/test_runtime.py \
             tests/test_sampler_contract.py \
             tests/test_sampling.py \
