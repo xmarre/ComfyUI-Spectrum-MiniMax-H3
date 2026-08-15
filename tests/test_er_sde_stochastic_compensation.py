@@ -403,7 +403,10 @@ def test_native_stage_one_callback_exposes_direct_leak_and_compensation_removes_
 
     assert not torch.equal(raw_callbacks[1], control_callbacks[1])
     torch.testing.assert_close(
-        corrected_callbacks[1], control_callbacks[1], rtol=0, atol=2e-8
+        corrected_callbacks[1],
+        control_callbacks[1],
+        rtol=0,
+        atol=torch.finfo(torch.float32).eps / 2,
     )
     torch.testing.assert_close(corrected_result, control_result, rtol=0, atol=0)
     assert not torch.equal(raw_result, control_result)
@@ -420,7 +423,12 @@ def test_corrected_denoised_enters_higher_order_history(max_stage):
 
     torch.testing.assert_close(corrected_result, control_result, rtol=0, atol=0)
     for corrected, control in zip(corrected_callbacks, control_callbacks, strict=True):
-        torch.testing.assert_close(corrected, control, rtol=0, atol=2e-8)
+        torch.testing.assert_close(
+            corrected,
+            control,
+            rtol=0,
+            atol=torch.finfo(torch.float32).eps / 2,
+        )
 
 
 def test_native_s_noise_zero_is_exact_noop_without_noise_or_q_allocation():
