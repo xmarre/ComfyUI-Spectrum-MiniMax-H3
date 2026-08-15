@@ -16,6 +16,7 @@ from .experiments import (
     measure_stream_residual,
     tensor_all_finite,
 )
+from .er_sde_stochastic import ERSDEStepDescriptor
 from .forecast import ForecasterSnapshot, HistoryWeightForecaster
 from .model_aware import (
     ModelAwareController,
@@ -1066,6 +1067,40 @@ class SpectrumH3Runtime:
         if self._offline_phase == "first_pass" and self._offline_archive is not None:
             self._offline_archive.invalidate(reason)
         return newly_disabled
+
+    def disable_forecasting_for_run(self, reason: str) -> bool:
+        """Fail closed before a solver step when a sampler contract is unproven."""
+        if self._run is None or self._step is not None:
+            raise RuntimeError(
+                "forecasting can only be disabled between steps of an active run"
+            )
+        return self._disable_forecasting(reason)
+
+    def describe_current_er_sde_step(
+        self,
+        run_id: int,
+        step_id: int,
+    ) -> ERSDEStepDescriptor:
+        """Classify the active result before ER-SDE consumes it."""
+        step = self._require_step(run_id, step_id)
+        replay_source_actual = None
+        if step.mode == "replay":
+            archive = self._offline_archive
+            if archive is None or step.step_id >= len(archive.steps):
+                raise OfflineReplayAbort(
+                    "offline replay source classification is unavailable"
+                )
+            replay_source_actual = bool(archive.steps[step.step_id].actual)
+        requires_compensation = step.mode == "forecast" or (
+            step.mode == "replay" and replay_source_actual is False
+        )
+        return ERSDEStepDescriptor(
+            run_id=int(run_id),
+            step_id=step.step_id,
+            mode=step.mode,
+            replay_source_actual=replay_source_actual,
+            requires_compensation=requires_compensation,
+        )
 
     def _fallback_or_retry(self, step: _StepState, reason: str) -> None:
         if step.mode == "replay":

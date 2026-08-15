@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+from comfyui_spectrum_h3.sampling import (
+    ER_SDE_DEFAULT_NOISE_SAMPLER_DIGEST,
+    ER_SDE_KSAMPLER_SAMPLE_DIGEST,
+    ER_SDE_NATIVE_FUNCTION_DIGEST,
+)
 
 RES_VARIANTS = (
     "sample_res_multistep",
@@ -43,7 +50,7 @@ def _compile_native_sampling_function(name: str, globals_: dict):
     function.decorator_list = []
     module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
     namespace = dict(globals_)
-    exec(compile(module, f"<native {name}>", "exec"), namespace)
+    exec(compile(module, f"<native {name}>", "exec"), namespace)  # noqa: S102
     return namespace[name]
 
 
@@ -61,6 +68,14 @@ def _loaded_names(node: ast.AST) -> set[str]:
         for item in ast.walk(node)
         if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load)
     }
+
+
+def _ast_digest(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    normalized = copy.deepcopy(node)
+    normalized.decorator_list = []
+    return hashlib.sha256(
+        ast.dump(normalized, include_attributes=False).encode("utf-8")
+    ).hexdigest()
 
 
 def _delegates_to_ancestral_res(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -170,6 +185,28 @@ def test_native_er_sde_makes_one_model_call_per_outer_solver_iteration():
     assert len(loops) == 1
     assert len(_named_calls(loops[0], "model")) == 1
     assert len(_named_calls(function, "model")) == 1
+
+
+def test_native_er_sde_runtime_sources_match_reviewed_compensation_contract():
+    functions = _native_sampling_functions()
+    assert _ast_digest(functions["sample_er_sde"]) == ER_SDE_NATIVE_FUNCTION_DIGEST
+    assert (
+        _ast_digest(functions["default_noise_sampler"])
+        == ER_SDE_DEFAULT_NOISE_SAMPLER_DIGEST
+    )
+
+    samplers_tree = _native_tree("comfy/samplers.py")
+    ksampler = next(
+        node
+        for node in samplers_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "KSAMPLER"
+    )
+    sample_method = next(
+        node
+        for node in ksampler.body
+        if isinstance(node, ast.FunctionDef) and node.name == "sample"
+    )
+    assert _ast_digest(sample_method) == ER_SDE_KSAMPLER_SAMPLE_DIGEST
 
 
 def test_native_er_sde_stages_reuse_only_solver_local_denoised_history():

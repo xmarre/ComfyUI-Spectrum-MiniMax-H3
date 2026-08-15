@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import sys
 import time
@@ -8,6 +9,12 @@ from typing import Any
 
 import torch
 
+from .er_sde_stochastic import (
+    ERSDEStochasticTracker,
+    ERSDETrackingError,
+    function_ast_digest,
+    native_default_er_sde_noise_scaler,
+)
 from .model_aware import get_model_forecastability_profile
 from .rollback import run_selective_rollback_euler
 from .runtime import ForecastRetryActual, OfflineReplayAbort, SpectrumH3Runtime
@@ -21,6 +28,7 @@ STEP_ID_KEY = "spectrum_h3_step_id"
 COORDINATE_KEY = "spectrum_h3_coordinate"
 ACTUAL_KEY = "spectrum_h3_actual"
 REASON_KEY = "spectrum_h3_reason"
+ER_SDE_TRACKER_KEY = "spectrum_h3_er_sde_stochastic_tracker"
 WRAPPER_KEY = "spectrum_minimax_h3"
 KJ_PREVIEW_WRAPPER_KEY = "kj_preview_override"
 
@@ -48,6 +56,18 @@ ER_SDE_NATIVE_SCALER_FREEVARS = {
     "SamplerER_SDE.execute.<locals>.reverse_time_sde_noise_scaler": ("eta",),
     "SamplerER_SDE.execute.<locals>.ode_noise_scaler": (),
 }
+ER_SDE_NATIVE_FUNCTION_DIGEST = (
+    "55b76bd3a76d44fbd363de39f2ab3ea672c78de9f001f47168b47ec6ff6d2447"
+)
+ER_SDE_DEFAULT_NOISE_SAMPLER_DIGEST = (
+    "11cfe81f36f0b43e96c12eff32a4f074f35227a53ca116e837bf268b6383f9ad"
+)
+ER_SDE_KSAMPLER_SAMPLE_DIGEST = (
+    "cacf00387fb2b9d0e076c68e0bd3f75d104801aa8d34239115b3208153ed8dac"
+)
+ER_SDE_TRACKED_OPTIONS = frozenset(
+    {"s_noise", "noise_sampler", "noise_scaler", "max_stage"}
+)
 
 
 @dataclass(slots=True)
@@ -116,6 +136,79 @@ def sampler_supports_seeded_replay(sampler: Any) -> bool:
     if options.get("noise_sampler") is not None:
         return False
     return _er_sde_noise_scaler_supports_replay(options.get("noise_scaler"))
+
+
+def _er_sde_tracking_contract(sampler: Any) -> tuple[bool, str | None]:
+    """Accept only the native solver/wrapper semantics reviewed by this project."""
+    import comfy.k_diffusion.sampling as native_sampling
+    import comfy.samplers
+
+    function = getattr(sampler, "sampler_function", None)
+    if function is not native_sampling.sample_er_sde:
+        return False, "sampler function is not native ComfyUI sample_er_sde"
+    if function_ast_digest(function) != ER_SDE_NATIVE_FUNCTION_DIGEST:
+        return False, "native sample_er_sde implementation is not a reviewed revision"
+    if type(sampler) is not comfy.samplers.KSAMPLER:
+        return False, "ER-SDE sampler object is not native ComfyUI KSAMPLER"
+    if (
+        function_ast_digest(type(sampler).sample)
+        != ER_SDE_KSAMPLER_SAMPLE_DIGEST
+    ):
+        return False, "native KSAMPLER.sample implementation is not a reviewed revision"
+    if (
+        function_ast_digest(native_sampling.default_noise_sampler)
+        != ER_SDE_DEFAULT_NOISE_SAMPLER_DIGEST
+    ):
+        return False, "native default_noise_sampler implementation is not a reviewed revision"
+
+    options = getattr(sampler, "extra_options", {}) or {}
+    if not isinstance(options, dict):
+        return False, "ER-SDE sampler options are not a dictionary"
+    unknown = set(options) - ER_SDE_TRACKED_OPTIONS
+    if unknown:
+        return False, f"ER-SDE sampler has unreviewed options: {sorted(unknown)}"
+    try:
+        s_noise = float(options.get("s_noise", 1.0))
+    except (TypeError, ValueError):
+        return False, "ER-SDE s_noise is not numeric"
+    if not torch.isfinite(torch.tensor(s_noise)) or s_noise < 0.0:
+        return False, "ER-SDE s_noise must be finite and nonnegative"
+    max_stage = options.get("max_stage", 3)
+    if isinstance(max_stage, bool) or not isinstance(max_stage, int) or not 1 <= max_stage <= 3:
+        return False, "ER-SDE max_stage must be an integer in [1, 3]"
+    if s_noise > 0.0:
+        if options.get("noise_sampler") is not None:
+            return False, "custom ER-SDE noise_sampler provenance is unreviewed"
+        if not _er_sde_noise_scaler_supports_replay(options.get("noise_scaler")):
+            return False, "custom ER-SDE noise_scaler provenance is unreviewed"
+    return True, None
+
+
+def _native_er_sde_preflight_reason(
+    sampler: Any,
+    model_options: dict[str, Any] | None,
+) -> str | None:
+    """Resolve native ER-SDE failures before Spectrum starts retaining state."""
+    function = getattr(sampler, "sampler_function", None)
+    if getattr(function, "__module__", None) != "comfy.k_diffusion.sampling":
+        return None
+    supported, reason = _er_sde_tracking_contract(sampler)
+    if not supported:
+        return reason or "native ER-SDE compensation contract is unproven"
+    options = getattr(sampler, "extra_options", {}) or {}
+    if float(options.get("s_noise", 1.0)) == 0.0:
+        return None
+
+    import comfy.patcher_extension
+
+    wrappers = comfy.patcher_extension.get_all_wrappers(
+        comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE,
+        model_options or {},
+        is_model_options=True,
+    )
+    if len(wrappers) != 1 or wrappers[0] is not sampler_sample_wrapper:
+        return "another SAMPLER_SAMPLE wrapper makes ER-SDE ordering unproven"
+    return None
 
 
 def max_consecutive_forecasts(sampler: Any) -> int | None:
@@ -240,6 +333,28 @@ def outer_sample_wrapper(
 
     runtime = binding.runtime
     name = sampler_name(sampler)
+    if name in ER_SDE_SAMPLERS:
+        preflight_reason = _native_er_sde_preflight_reason(
+            sampler,
+            getattr(guider, "model_options", None),
+        )
+        if preflight_reason is not None:
+            LOG.warning(
+                "Spectrum H3 disabled for this ER-SDE run; running the untouched "
+                "native sampler because stochastic compensation is unavailable: %s",
+                preflight_reason,
+            )
+            return executor(
+                noise,
+                latent_image,
+                sampler,
+                sigmas,
+                denoise_mask,
+                callback,
+                disable_pbar,
+                seed,
+                latent_shapes=latent_shapes,
+            )
     profile_eligible = sampler_is_supported(sampler) and (
         not runtime.config.offline_smoothing_replay
         or sampler_supports_seeded_replay(sampler)
@@ -579,6 +694,40 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
         patched = copy_model_options_with_step(model_options, runtime, attempt_decision)
         return executor(x, timestep, patched, seed)
 
+    def consume_er_sde_increment(
+        result: torch.Tensor,
+        attempt_decision: dict[str, Any],
+    ) -> torch.Tensor:
+        transformer_options = (model_options or {}).get("transformer_options") or {}
+        tracker = transformer_options.get(ER_SDE_TRACKER_KEY)
+        if not isinstance(tracker, ERSDEStochasticTracker):
+            return result
+        descriptor = None
+        try:
+            descriptor = runtime.describe_current_er_sde_step(
+                int(attempt_decision["run_id"]),
+                int(attempt_decision["step_id"]),
+            )
+            return tracker.consume(result, descriptor)
+        except ERSDETrackingError as exc:
+            tracker.clear()
+            if descriptor is not None and descriptor.mode == "replay":
+                raise OfflineReplayAbort(
+                    f"ER-SDE stochastic-state compensation failed during replay: {exc}"
+                ) from exc
+            if not bool(attempt_decision["actual"]):
+                raise ForecastRetryActual(
+                    f"ER-SDE stochastic-state compensation failed: {exc}"
+                ) from exc
+            if runtime.config.debug:
+                LOG.warning(
+                    "Spectrum H3 ER-SDE tracker discarded on state-aware actual "
+                    "step=%s reason=%s",
+                    attempt_decision["step_id"],
+                    exc,
+                )
+            return result
+
     try:
         try:
             result = execute_attempt(decision)
@@ -587,6 +736,7 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 run_id=decision["run_id"],
                 step=decision["step_id"],
             )
+            result = consume_er_sde_increment(result, decision)
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
         except ForecastRetryActual as retry:
@@ -610,12 +760,150 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 step=decision["step_id"],
                 retry=True,
             )
+            result = consume_er_sde_increment(result, retry_decision)
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
     except BaseException:
         if runtime.active_step_id == decision["step_id"]:
             runtime.abort_step(decision["run_id"], decision["step_id"])
         raise
+
+
+def _run_tracked_er_sde(
+    executor,
+    runtime: SpectrumH3Runtime,
+    model_wrap,
+    sigmas,
+    extra_args,
+    callback,
+    noise,
+    latent_image,
+    denoise_mask,
+    disable_pbar,
+):
+    supported, reason = _er_sde_tracking_contract(executor.class_obj)
+    if len(executor.wrappers) != 1:
+        supported = False
+        reason = "another SAMPLER_SAMPLE wrapper makes ER-SDE ordering unproven"
+    if not supported:
+        assert reason is not None
+        runtime.disable_forecasting_for_run(reason)
+        LOG.warning(
+            "Spectrum H3 disabled for this ER-SDE run; preserving native all-actual "
+            "sampling because stochastic compensation is unavailable: %s",
+            reason,
+        )
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+
+    sampler = executor.class_obj
+    options = dict(getattr(sampler, "extra_options", {}) or {})
+    configured_s_noise = float(options.get("s_noise", 1.0))
+    model_sampling = model_wrap.model_patcher.get_model_object("model_sampling")
+    noise_scale = float(getattr(model_sampling, "noise_scale", 1.0))
+    effective_s_noise = configured_s_noise * noise_scale
+    if not torch.isfinite(torch.tensor(effective_s_noise)) or effective_s_noise < 0.0:
+        reason = "effective ER-SDE s_noise is not finite and nonnegative"
+        runtime.disable_forecasting_for_run(reason)
+        LOG.warning(
+            "Spectrum H3 disabled for this ER-SDE run; preserving native all-actual "
+            "sampling because %s",
+            reason,
+        )
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+    if effective_s_noise == 0.0:
+        if runtime.config.debug:
+            LOG.warning(
+                "Spectrum H3 ER-SDE compensation q_pending=false applied=false "
+                "reason=no_stochastic_increment max_stage=%s stochastic=false",
+                options.get("max_stage", 3),
+            )
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+    if not torch.is_tensor(noise):
+        reason = "ER-SDE sampler noise is not a packed tensor"
+        runtime.disable_forecasting_for_run(reason)
+        LOG.warning("Spectrum H3 disabled for this ER-SDE run: %s", reason)
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+
+    import comfy.k_diffusion.sampling as native_sampling
+
+    base_noise_sampler = native_sampling.default_noise_sampler(
+        noise,
+        seed=extra_args.get("seed"),
+    )
+    base_noise_scaler = options.get("noise_scaler")
+    if base_noise_scaler is None:
+        base_noise_scaler = native_default_er_sde_noise_scaler
+    tracker = ERSDEStochasticTracker(
+        noise_sampler=base_noise_sampler,
+        noise_scaler=base_noise_scaler,
+        effective_s_noise=effective_s_noise,
+        max_stage=int(options.get("max_stage", 3)),
+        debug=runtime.config.debug,
+        run_id=int(runtime.active_run_id),
+    )
+    tracked_options = dict(options)
+    tracked_options["noise_sampler"] = tracker.noise_sampler
+    tracked_options["noise_scaler"] = tracker.noise_scaler
+    tracked_sampler = copy.copy(sampler)
+    tracked_sampler.extra_options = tracked_options
+
+    tracked_extra_args = dict(extra_args)
+    tracked_model_options = dict(tracked_extra_args.get("model_options") or {})
+    tracked_transformer_options = dict(
+        tracked_model_options.get("transformer_options") or {}
+    )
+    tracked_transformer_options[ER_SDE_TRACKER_KEY] = tracker
+    tracked_model_options["transformer_options"] = tracked_transformer_options
+    tracked_extra_args["model_options"] = tracked_model_options
+    try:
+        return tracked_sampler.sample(
+            model_wrap,
+            sigmas,
+            tracked_extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+    finally:
+        tracker.clear()
 
 
 def sampler_sample_wrapper(
@@ -644,6 +932,20 @@ def sampler_sample_wrapper(
             disable_pbar,
         )
     runtime = binding.runtime
+    sampler = executor.class_obj
+    if sampler_name(sampler) in ER_SDE_SAMPLERS:
+        return _run_tracked_er_sde(
+            executor,
+            runtime,
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
     if (
         not runtime.config.selective_rollback_correction
         or runtime.experiment_disabled_reason is not None
@@ -661,7 +963,6 @@ def sampler_sample_wrapper(
 
     import comfy.k_diffusion.sampling as native_sampling
 
-    sampler = executor.class_obj
     function = getattr(sampler, "sampler_function", None)
     options = dict(getattr(sampler, "extra_options", {}) or {})
     unsupported_reason = None
