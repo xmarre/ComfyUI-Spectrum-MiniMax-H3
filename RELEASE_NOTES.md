@@ -1,130 +1,63 @@
-# Spectrum MiniMax H3 v0.2.8
+# Spectrum MiniMax H3 v0.2.10
 
-v0.2.8 finalizes the native ER-SDE replay work and closes the forecast-trust/replay-calibration research cycle with the current user-facing evidence.
+v0.2.10 hardens the Objective Sequential Capture research path against host/CUDA memory pressure and makes recoverable capture failures non-fatal to the surrounding ComfyUI workflow. The bounded analysis transform, objective R/A/B semantics, report schema, forecasting behavior, and production Spectrum defaults are unchanged.
 
-## Native ER-SDE replay compatibility
+## Memory-safe Objective Sequential Capture
 
-Native ComfyUI `SamplerER_SDE` replay-safety detection now accepts the reviewed deterministic native `noise_scaler` closures used by upstream ER-SDE while continuing to fail closed for arbitrary/custom/stateful scalers. An explicitly supplied custom `noise_sampler` remains replay-unsafe. Unknown future closure contracts remain replay-unsafe until reviewed.
+Sequential capture now performs validation and memory admission before allocating the retained analysis destination. The preflight accounts for the decoded source media already live, the new bounded VIDEO/AUDIO destinations, existing pending captures, bounded staging workspaces, and explicit host/CUDA safety margins.
 
-This restores the intended two-pass offline replay path for native/default ER-SDE without broadening custom stochastic replay support.
+The retained research format remains the same:
 
-## Narrowed ER-SDE terminal replay safeguard
+- VIDEO is reduced deterministically to the bounded CPU `float16` analysis surface capped at 393,216 pixels per frame;
+- AUDIO is retained as an independent CPU `float32` waveform;
+- at most two incomplete benchmark IDs and 4 GiB of retained analysis media are kept;
+- raw decoded input tensors are never stored in `_PENDING_CAPTURES`.
 
-The v0.2.7 ER-SDE fix enforced a blanket minimum two-step actual tail. The reproduced failure class is narrower.
+Video staging derives its chunk size from a conservative 64 MiB workspace target, capped at four frames. The approximately 0.7 MP, 192-frame float32 case that exceeded that workspace target at four frames now stages three frames at a time. Audio uses bounded sample chunks as well.
 
-The 25-step failure ended as:
+Finite/range validation no longer materializes a boolean tensor for every source element. It reduces each chunk with `aminmax`, checks only the resulting scalar bounds, clamps the owned work buffer in place, and releases intermediate representations before the next chunk allocation.
 
-```text
-22 actual
-23 forecast
-24 actual
-```
+Preflight, staging, and pending insertion are serialized under the pending-state lock so concurrent capture nodes cannot both admit themselves from stale accounting.
 
-Offline replay then reconstructed the penultimate feature across the final nonlinear bracket. v0.2.8 promotes the penultimate ER-SDE step only during offline capture when the normal runtime schedule would otherwise forecast it. The protected failing case becomes:
+## Lower bounded-evaluator peak memory
 
-```text
-22 actual
-23 actual
-24 actual
-```
+The bounded VIDEO evaluator now processes legacy and candidate chunks sequentially against one reference chunk instead of materializing both comparison chunks together. Intermediate float32 tensors are released after each comparison.
 
-Normal 20-step and 32-step ER-SDE schedules already make their penultimate step actual, so they receive no additional transformer evaluation. Explicitly larger configured tails still take precedence. RES retains its independent three-step protected tail. Euler, RES/CFG++, and Turbo policies are unchanged.
+This reduces the Spectrum-owned evaluator live set without changing the existing bounded metric profile or verdict calculations.
 
-## Generic causal correction retained
+## Recoverable failures no longer abort unrelated output nodes
 
-The generic latest-delta causal correction from PR #39 remains the supported correction used by `model_aware_mode=full`.
+Objective Sequential Capture now converts recoverable capture/evaluation failures into its status output instead of raising through the ComfyUI graph. This includes validation errors, incompatible or duplicate R/A/B roles, preflight rejection, staging failures, report/evaluator failures, and unexpected non-resource-exhaustion exceptions. Earlier accepted R/A roles remain intact when a later role is rejected before completion, while a completed triad is always released after evaluation succeeds or fails.
 
-In a controlled same-seed native ER-SDE 20-step comparison, `schedule_confidence` and `full` both used exactly:
+This lets unrelated output nodes, including video saving/combine nodes on the same execution, continue when the research capture itself cannot complete.
 
-```text
-11 actual steps
-9 forecast steps
-11 actual transformer calls
-0 model-aware extra NFEs
-```
+Actual resource-exhaustion exceptions are deliberately not swallowed. `MemoryError`, CUDA OOM, and non-objective exceptions reporting an out-of-memory condition still propagate so ComfyUI/PyTorch can perform their normal OOM recovery behavior.
 
-`full` changed the measured hidden forecast ratios from:
+## Capture diagnostics and ownership
 
-```text
-audio: 1.777636 -> 1.670690   (~6.02% hidden-error reduction)
-video: 1.313055 -> 1.250087   (~4.80% hidden-error reduction)
-```
+Major capture boundaries now emit timestamped diagnostics with elapsed time and available memory telemetry where supported. Logged stages include input receipt, preflight, destination allocation, bounded chunk validation/resize/transfer/copy, pending insertion, evaluation, and report persistence.
 
-The recurring false eye-motion artifact that remained subtly visible with `schedule_confidence` was absent with `full`. The eyes remained synchronized with the intended eye-closing motion. The hidden-error percentages describe this specific feature-space trace; they are not perceptual-quality percentages.
+Host telemetry uses `psutil` when available with platform fallbacks; CUDA captures also report allocator/free-memory state when available. If host telemetry is unavailable, a conservative absolute incremental guard remains in force.
 
-Earlier controlled native ER-SDE testing also isolated a pronunciation case where `full` retained the intended German pronunciation while `schedule_confidence` sounded like the base path.
+Source ownership is explicit: only newly allocated reduced VIDEO and copied AUDIO tensors enter the pending store. Tests cover source release, reset, eviction, completed-triad teardown, staging failure, and evaluation failure.
 
-These perceptual conclusions are established for the tested native ER-SDE configuration. They are not generalized to Euler, RES/RES CFG++, Turbo/LightX2V, or other samplers.
+## Compatibility
 
-## Trust shrinkage closed for production promotion
+This release does not alter:
 
-`model_aware_trust_shrinkage` remains:
+- the production feature forecaster or sampler schedules;
+- model-aware controller defaults;
+- offline smoothing replay behavior;
+- the validated `coordinate_rls + no_attenuation + hard_clip + 0.40` full-mode generic-correction default;
+- exact legacy generic-correction reproduction;
+- Objective Media schema-v1 verdict thresholds or existing collected reports.
 
-```text
-false
-```
+The package and source-checkout calibration provenance versions are advanced to `0.2.10`.
 
-Causal trust shrinkage produced substantial hidden-feature observer improvements, then failed to show a reliable user-facing perceptual benefit across the completed A/B gate. It remains available for research/reproduction and saved-workflow compatibility. It is not recommended for production promotion in this release.
+## Remaining resource boundary
 
-No additional kappa tuning, denser search, or replacement trust formula is introduced.
-
-## Replay generic correction remains disabled
-
-`model_aware_replay_generic_correction` remains:
-
-```text
-false
-```
-
-Independent replay traces rejected transfer of the causal PR #39 scalar onto the different future-bracket replay direction. The causal correction remains unchanged in its supported causal geometry. The `true` replay setting remains a legacy/scientific-ablation path.
-
-## Offline replay remains supported
-
-Offline smoothing replay remains the compatibility-safe global default and retains its historical MiniMax H3 audio/stutter rationale.
-
-In the final controlled native ER-SDE eye-motion comparison, `full` single-pass produced the best temporal facial behavior among the tested paths. The replay run still showed the abnormal eye motion, used the same 11 first-pass transformer evaluations, added a transformer-free replay pass of about 13.25 seconds in that trace, and retained about 4315.5 MiB of archive data.
-
-This is an ER-SDE-scoped quality result. The release does not change the global replay default or infer the same ranking for other samplers.
-
-## Replay calibration research infrastructure
-
-PR #45 retains the research-only infrastructure needed to evaluate future replay calibration hypotheses without adding a runtime controller:
-
-- exact VIDEO per-target quadratic moments;
-- exact runtime ratio normalization/parity checks;
-- source/config/schedule/topology/trace provenance and fingerprints;
-- structural interior-target validation;
-- CPU-only offline evaluator;
-- whole-run cross-validation;
-- fixed Level 0 controls;
-- affine current-weight Level 1 baseline;
-- one-predictor Level 2 residual tests with coordinate control.
-
-No affine, disagreement, validation-penalty, coordinate, floor, interaction, tree, neural, AutoML, or other new applied replay controller is introduced.
-
-The following research branches remain closed as complete runtime solutions: pure global alpha, causal-kappa replay transfer, hold-anchor replay shrinkage, causal scalar replay transfer, K=2, FinalLayer-transformed correction, and previous-error direction families.
-
-## Compatibility and defaults
-
-Shipping defaults remain compatibility-safe:
-
-```text
-model_aware_mode = off
-model_aware_trust_shrinkage = false
-model_aware_replay_generic_correction = false
-offline_smoothing_replay = true
-```
-
-For current native ER-SDE quality testing, the preferred tested configuration is:
-
-```text
-model_aware_mode = full
-model_aware_trust_shrinkage = false
-offline_smoothing_replay = false
-```
-
-That recommendation is ER-SDE-specific. Existing saved input values continue to be honored.
+The preflight is conservative admission control, not an atomic reservation of host or device memory. A real OOM can still occur if system/WSL commit availability changes after preflight, another process allocates concurrently, allocator/backend scratch exceeds the estimate, or an accelerator does not expose usable free-memory telemetry. Those true resource failures remain visible and are not converted into a successful capture status.
 
 ## Validation
 
-The release is validated against the repository's pinned four-revision ComfyUI compatibility matrix. The matrix builds the wheel, runs the forecaster smoke test, scoped Ruff, `compileall`, and the complete pytest suite against each reviewed native MiniMax H3 revision. Focused coverage includes the narrowed ER-SDE terminal policy, native ER-SDE replay guard, generic correction, trust-off/default semantics, replay-generic-correction-off semantics, exact replay calibration and evaluator, provenance/fingerprints, and saved configuration defaults.
+The PR is covered by the repository's pinned four-revision ComfyUI matrix. The matrix builds the wheel, runs the native-H3 forecaster smoke test, scoped Ruff, `compileall`, and the full pytest suite. Focused sequential-capture coverage includes deterministic staging parity across float16/bfloat16/float32/float64 inputs, bounded workspace accounting, preflight rejection before destination allocation, missing-telemetry fallback, duplicate/topology checks before staging, non-fatal recoverable errors, OOM propagation, source ownership, reset/eviction release, completed-triad teardown, and optional CUDA staging.

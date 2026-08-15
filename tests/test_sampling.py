@@ -6,6 +6,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from comfyui_spectrum_h3 import runtime as runtime_module
 from comfyui_spectrum_h3 import sampling as sampling_module
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.runtime import OfflineReplayAbort, SpectrumH3Runtime
@@ -535,6 +536,240 @@ def test_offline_progress_finishes_when_capture_cannot_be_replayed(monkeypatch):
     assert callback_arguments == []
     assert runtime.active_run_id is None
     assert runtime.offline_archive is None
+
+
+def test_offline_smoother_failure_returns_completed_first_pass(monkeypatch, caplog):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            debug=True,
+            degree=1,
+            max_history=4,
+            force_actual=True,
+            model_aware_mode="off",
+            offline_smoothing_replay=True,
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}},
+        conds={},
+    )
+    topology = (("tiny", 1),)
+    labels = ((0, "positive"),)
+    executor_calls = 0
+
+    class FailingSmoother:
+        def __init__(self, *_args, **_kwargs):
+            assert runtime.active_run_id is None
+            raise MemoryError("synthetic smoother allocation failure")
+
+    monkeypatch.setattr(runtime_module, "OfflineSmoother", FailingSmoother)
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(
+            self,
+            run_noise,
+            _run_latent,
+            _sampler,
+            run_sigmas,
+            _mask,
+            _callback,
+            _disable_pbar,
+            _seed,
+            *,
+            latent_shapes=None,
+        ):
+            nonlocal executor_calls
+            executor_calls += 1
+            for index, sigma in enumerate(run_sigmas[:-1]):
+                decision = runtime.begin_step(sigma)
+                call_id, actual = runtime.begin_model_call(
+                    decision["run_id"],
+                    decision["step_id"],
+                    topology=topology,
+                    labels=labels,
+                    expected_shape=(1, 1, 1),
+                )
+                assert actual
+                runtime.observe_actual(
+                    decision["run_id"],
+                    decision["step_id"],
+                    call_id,
+                    torch.full((1, 1, 1), float(index)),
+                )
+                runtime.finalize_step(decision["run_id"], decision["step_id"])
+            return "completed-first-pass"
+
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            _sampler("sample_er_sde"),
+            torch.tensor([1.0, 0.5, 0.0]),
+            seed=7,
+        )
+
+    assert result == "completed-first-pass"
+    assert executor_calls == 1
+    assert runtime.active_run_id is None
+    assert runtime.offline_archive is None
+    assert "offline smoother construction failed" in caplog.text
+    assert "returning the valid first-pass result" in caplog.text
+
+
+def test_offline_capture_completion_exception_returns_completed_first_pass(
+    monkeypatch, caplog
+):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            model_aware_mode="off",
+            offline_smoothing_replay=True,
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}},
+        conds={},
+    )
+    executor_calls = 0
+
+    def fail_completion():
+        assert runtime.active_run_id is None
+        raise RuntimeError("synthetic archive completion failure")
+
+    monkeypatch.setattr(runtime, "complete_offline_capture", fail_completion)
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *_args, **_kwargs):
+            nonlocal executor_calls
+            executor_calls += 1
+            return "completed-first-pass"
+
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            _sampler("sample_er_sde"),
+            torch.tensor([1.0, 0.0]),
+            seed=7,
+        )
+
+    assert result == "completed-first-pass"
+    assert executor_calls == 1
+    assert runtime.active_run_id is None
+    assert runtime.offline_archive is None
+    assert "offline capture completion failed" in caplog.text
+    assert "returning the valid first-pass result" in caplog.text
+
+
+def test_replay_only_er_sde_transition_is_timestamped_and_schedule_invariant(caplog):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            debug=True,
+            degree=1,
+            max_history=4,
+            force_actual=True,
+            model_aware_mode="off",
+            offline_smoothing_replay=True,
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}},
+        conds={},
+    )
+    topology = (("target_audio_rows", 1), ("target_video_rows", 1))
+    labels = ((0, "positive"),)
+    schedules = []
+    actual_calls = []
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(
+            self,
+            _run_noise,
+            _run_latent,
+            _sampler,
+            run_sigmas,
+            _mask,
+            _callback,
+            _disable_pbar,
+            _seed,
+            *,
+            latent_shapes=None,
+        ):
+            phase = runtime.offline_phase
+            step_ids = []
+            phase_actual_calls = 0
+            for index, sigma in enumerate(run_sigmas[:-1]):
+                decision = runtime.begin_step(sigma)
+                step_ids.append(decision["step_id"])
+                call_id, actual = runtime.begin_model_call(
+                    decision["run_id"],
+                    decision["step_id"],
+                    topology=topology,
+                    labels=labels,
+                    expected_shape=(1, 2, 1),
+                )
+                if actual:
+                    phase_actual_calls += 1
+                    runtime.observe_actual(
+                        decision["run_id"],
+                        decision["step_id"],
+                        call_id,
+                        torch.full((1, 2, 1), float(index)),
+                    )
+                else:
+                    assert runtime.predict(
+                        decision["run_id"],
+                        decision["step_id"],
+                        call_id,
+                        device=torch.device("cpu"),
+                        dtype=torch.float32,
+                    ) is not None
+                runtime.finalize_step(decision["run_id"], decision["step_id"])
+            schedules.append((phase, step_ids))
+            actual_calls.append((phase, phase_actual_calls))
+            return phase
+
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            _sampler("sample_er_sde"),
+            torch.tensor([1.0, 0.5, 0.0]),
+            seed=7,
+        )
+
+    assert result == "replay"
+    assert schedules == [("first_pass", [0, 1]), ("replay", [0, 1])]
+    assert actual_calls == [("first_pass", 2), ("replay", 0)]
+    assert runtime.stats.offline_replay_steps == 2
+    assert runtime.stats.offline_replay_model_calls == 2
+    events = [
+        record.getMessage().split("event=", 1)[1].split()[0]
+        for record in caplog.records
+        if "Spectrum H3 offline transition ts=" in record.getMessage()
+    ]
+    required = [
+        "observe_actual_end",
+        "finalize_step_end",
+        "first_pass_executor_return",
+        "complete_offline_capture_begin",
+        "offline_smoother_construction_begin",
+        "offline_smoother_validation_begin",
+        "offline_smoother_validation_end",
+        "offline_smoother_construction_end",
+        "begin_offline_replay_begin",
+        "begin_offline_replay_end",
+    ]
+    positions = [events.index(event) for event in required]
+    assert positions == sorted(positions)
 
 
 def test_offline_progress_finishes_when_replay_aborts(monkeypatch):

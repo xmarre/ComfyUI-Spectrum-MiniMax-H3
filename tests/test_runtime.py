@@ -1358,11 +1358,12 @@ def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_call
     assert archive.history_storage == offline_archive_storage
     assert archive.history_device == torch.device("cpu")
     if history_storage == offline_archive_storage:
-        assert {
-            anchor.feature.data_ptr() for anchor in archive.anchors[-2:]
-        } == {
+        history_ptrs = {
             entry.feature_flat.data_ptr() for entry in runtime.forecaster._history
         }
+        archive_ptrs = {anchor.feature.data_ptr() for anchor in archive.anchors}
+        assert history_ptrs < archive_ptrs
+        assert archive.anchors[-1].feature.data_ptr() not in history_ptrs
     assert runtime.stats.offline_validation_samples_per_branch == 12
     assert runtime.stats.offline_validation_anchors == 2
     assert runtime.stats.offline_attenuated_predictions == 2
@@ -1457,9 +1458,9 @@ def test_offline_archive_storage_is_independent_on_cuda(
         history_storage=history_storage,
         offline_archive_storage=offline_archive_storage,
     )
-    runtime.begin_offline_capture(total_steps=1, sampler_name="sample_euler")
+    runtime.begin_offline_capture(total_steps=2, sampler_name="sample_euler")
     run_id = runtime.start_run(
-        torch.tensor([1.0, 0.0], device="cuda"),
+        torch.tensor([1.0, 0.5, 0.0], device="cuda"),
         "sample_euler",
         supported_sampler=True,
         max_consecutive_forecasts=1,
@@ -1469,6 +1470,11 @@ def test_offline_archive_storage_is_independent_on_cuda(
         runtime,
         1.0,
         [(LABEL, torch.ones((1, 3, 4), device="cuda"))],
+    )
+    _actual_step(
+        runtime,
+        0.5,
+        [(LABEL, torch.full((1, 3, 4), 2.0, device="cuda"))],
     )
 
     archive = runtime.offline_archive

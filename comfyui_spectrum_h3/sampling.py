@@ -313,7 +313,6 @@ def outer_sample_wrapper(
         run_disable_pbar,
         *,
         phase: str,
-        complete_offline_capture: bool = False,
     ):
         nonlocal continuum_log_emitted
         phase_prefix = _continuum_prefix_for_phase(continuum_prefix, phase)
@@ -348,7 +347,6 @@ def outer_sample_wrapper(
                 runtime.stats.total_steps,
                 runtime.supported_sampler,
             )
-        capture_complete = False
         started = time.perf_counter()
         try:
             result = executor(
@@ -362,9 +360,13 @@ def outer_sample_wrapper(
                 seed,
                 latent_shapes=latent_shapes,
             )
-            if complete_offline_capture:
-                capture_complete = runtime.complete_offline_capture()
-            return result, capture_complete
+            runtime.log_offline_transition(
+                "first_pass_executor_return" if phase == "offline_first_pass" else "executor_return",
+                phase=phase,
+                run_id=run_id,
+                elapsed_s=f"{time.perf_counter() - started:.6f}",
+            )
+            return result
         finally:
             if runtime.config.debug:
                 LOG.warning(
@@ -380,7 +382,7 @@ def outer_sample_wrapper(
                 )
 
     if not runtime.config.offline_smoothing_replay:
-        result, _ = execute_run(
+        result = execute_run(
             noise,
             latent_image,
             sigmas,
@@ -427,7 +429,7 @@ def outer_sample_wrapper(
         LOG.warning(
             "Spectrum H3 offline smoothing replay requires tensor sampling inputs; running one ordinary pass"
         )
-        result, _ = execute_run(
+        result = execute_run(
             noise,
             latent_image,
             sigmas,
@@ -456,7 +458,7 @@ def outer_sample_wrapper(
     )
     runtime.begin_offline_capture(total_steps=offline_steps, sampler_name=name)
     try:
-        first_result, capture_complete = execute_run(
+        first_result = execute_run(
             noise,
             latent_image,
             sigmas,
@@ -464,8 +466,24 @@ def outer_sample_wrapper(
             capture_callback,
             disable_pbar,
             phase="offline_first_pass",
-            complete_offline_capture=True,
         )
+        try:
+            capture_complete = runtime.complete_offline_capture()
+        except Exception as exc:  # noqa: BLE001 - preserve completed first-pass output
+            archive = runtime.offline_archive
+            if archive is not None:
+                archive.invalidate(f"offline capture completion failed: {exc}")
+            capture_complete = False
+            runtime.log_offline_transition(
+                "complete_offline_capture_failed",
+                error_type=type(exc).__name__,
+                reason=exc,
+            )
+            LOG.warning(
+                "Spectrum H3 offline capture completion failed; preserving the valid "
+                "first-pass result: %s",
+                exc,
+            )
         if not capture_complete:
             if complete_progress is not None:
                 complete_progress()
@@ -480,11 +498,26 @@ def outer_sample_wrapper(
             )
             return first_result
 
-        runtime.begin_offline_replay()
+        try:
+            runtime.begin_offline_replay()
+        except Exception as exc:  # noqa: BLE001 - preserve completed first-pass output
+            runtime.log_offline_transition(
+                "begin_offline_replay_failed",
+                error_type=type(exc).__name__,
+                reason=exc,
+            )
+            if complete_progress is not None:
+                complete_progress()
+            LOG.warning(
+                "Spectrum H3 offline replay setup failed; returning the valid first-pass "
+                "result: %s",
+                exc,
+            )
+            return first_result
         if initial_conds is not None:
             guider.conds = _copy_condition_structure(initial_conds)
         try:
-            replay_result, _ = execute_run(
+            replay_result = execute_run(
                 replay_noise,
                 replay_latent,
                 replay_sigmas,
@@ -583,6 +616,11 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
     try:
         try:
             result = execute_attempt(decision)
+            runtime.log_offline_transition(
+                "actual_executor_return" if decision["actual"] else "forecast_executor_return",
+                run_id=decision["run_id"],
+                step=decision["step_id"],
+            )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
         except ForecastRetryActual as retry:
@@ -600,6 +638,12 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                     retry,
                 )
             result = execute_attempt(retry_decision)
+            runtime.log_offline_transition(
+                "actual_executor_return",
+                run_id=decision["run_id"],
+                step=decision["step_id"],
+                retry=True,
+            )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
     except BaseException:

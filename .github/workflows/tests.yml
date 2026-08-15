@@ -54,15 +54,41 @@ jobs:
       - name: Run Ruff and compileall
         run: |
           python -m ruff check \
+            comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/generic_correction.py \
+            comfyui_spectrum_h3/generic_correction_calibration.py \
+            comfyui_spectrum_h3/generic_correction_controller.py \
+            comfyui_spectrum_h3/generic_correction_core.py \
+            comfyui_spectrum_h3/generic_correction_evaluator.py \
+            comfyui_spectrum_h3/generic_correction_research.py \
+            comfyui_spectrum_h3/generic_correction_runtime.py \
+            comfyui_spectrum_h3/generic_correction_topology.py \
+            comfyui_spectrum_h3/experiments.py \
+            comfyui_spectrum_h3/objective_media.py \
+            comfyui_spectrum_h3/objective_media_bounded.py \
+            comfyui_spectrum_h3/objective_media_nodes.py \
             comfyui_spectrum_h3/nodes.py \
+            comfyui_spectrum_h3/runtime.py \
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
+            tests/test_config.py \
             tests/test_generic_correction.py \
+            tests/test_generic_correction_calibration.py \
+            tests/test_generic_correction_core.py \
+            tests/test_generic_correction_evaluator.py \
+            tests/test_generic_correction_research.py \
+            tests/test_generic_correction_research_regional_summary.py \
             tests/test_model_aware.py \
+            tests/test_objective_media.py \
+            tests/test_objective_media_bounded.py \
+            tests/test_objective_media_seed_link.py \
+            tests/test_objective_media_sequential.py \
+            tests/test_runtime.py \
+            tests/test_sampling.py \
             tests/conftest.py \
+            tools/analyze_generic_correction.py \
             --ignore N999,I001,C408,UP035
-          python -m compileall -q comfyui_spectrum_h3 tests
+          python -m compileall -q comfyui_spectrum_h3 tests tools
 
       - name: Run tests against native MiniMax H3
         env:
