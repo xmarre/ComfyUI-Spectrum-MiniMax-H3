@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import copy
-import hashlib
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from comfyui_spectrum_h3.er_sde_ksampler_contract import validate_ksampler_sample
+from comfyui_spectrum_h3.er_sde_stochastic import function_node_ast_digest
 from comfyui_spectrum_h3.sampling import (
     ER_SDE_DEFAULT_NOISE_SAMPLER_DIGEST,
     ER_SDE_KSAMPLER_SAMPLE_DIGEST,
@@ -71,11 +72,222 @@ def _loaded_names(node: ast.AST) -> set[str]:
 
 
 def _ast_digest(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-    normalized = copy.deepcopy(node)
-    normalized.decorator_list = []
-    return hashlib.sha256(
-        ast.dump(normalized, include_attributes=False).encode("utf-8")
-    ).hexdigest()
+    return function_node_ast_digest(node)
+
+
+def _native_ksampler_sample() -> ast.FunctionDef:
+    samplers_tree = _native_tree("comfy/samplers.py")
+    ksampler = next(
+        node
+        for node in samplers_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "KSAMPLER"
+    )
+    return copy.deepcopy(
+        next(
+            node
+            for node in ksampler.body
+            if isinstance(node, ast.FunctionDef) and node.name == "sample"
+        )
+    )
+
+
+def _call_path(node: ast.AST) -> tuple[str, ...] | None:
+    parts = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    return tuple(reversed(parts))
+
+
+def _sampler_dispatch(function: ast.FunctionDef) -> ast.Call:
+    return next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and _call_path(node.func) == ("self", "sampler_function")
+    )
+
+
+def _assignment_for_call(function: ast.FunctionDef, call: ast.Call) -> ast.Assign:
+    return next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Assign) and node.value is call
+    )
+
+
+def _compile_ksampler_method(
+    tmp_path: Path,
+    function: ast.FunctionDef,
+    *,
+    name: str,
+):
+    source_path = tmp_path / f"{name}.py"
+    source = ast.unparse(ast.fix_missing_locations(function)) + "\n"
+    source_path.write_text(source, encoding="utf-8")
+    adapter = type("KSamplerX0Inpaint", (), {})
+    namespace = {
+        "KSamplerX0Inpaint": adapter,
+        "AlternativeAdapter": type("AlternativeAdapter", (), {}),
+        "logging": SimpleNamespace(info=lambda *_args: None),
+        "torch": torch,
+        "detail": lambda *_args: None,
+    }
+    exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
+    method = namespace["sample"]
+    method.__module__ = "runtime_ksampler_patch"
+    method.__qualname__ = "KSAMPLER.sample"
+    return method, adapter
+
+
+def _mutate_ksampler_contract(function: ast.FunctionDef, case: str) -> None:
+    dispatch = _sampler_dispatch(function)
+    dispatch_assignment = _assignment_for_call(function, dispatch)
+    noise_scaling = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and _call_path(node.func)
+        == ("model_wrap", "inner_model", "model_sampling", "noise_scaling")
+    )
+    noise_scaling_assignment = _assignment_for_call(function, noise_scaling)
+    adapter = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "KSamplerX0Inpaint"
+    )
+    inverse = next(
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and _call_path(node.func)
+        == (
+            "model_wrap",
+            "inner_model",
+            "model_sampling",
+            "inverse_noise_scaling",
+        )
+    )
+    inverse_assignment = _assignment_for_call(function, inverse)
+
+    if case == "signature":
+        function.args.args[2].arg = "different_sigmas_parameter"
+    elif case == "logging":
+        function.body.insert(
+            0,
+            ast.Expr(
+                ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id="logging", ctx=ast.Load()),
+                        attr="info",
+                        ctx=ast.Load(),
+                    ),
+                    args=[ast.Constant(value="KSAMPLER diagnostic")],
+                    keywords=[],
+                )
+            ),
+        )
+    elif case == "bookkeeping":
+        function.body.insert(
+            0,
+            ast.Assign(
+                targets=[ast.Name(id="diagnostic_counter", ctx=ast.Store())],
+                value=ast.Constant(value=1),
+            ),
+        )
+    elif case == "callback_instrumentation":
+        callback_function = next(
+            node
+            for node in function.body
+            if isinstance(node, ast.FunctionDef) and node.name == "k_callback"
+        )
+        callback_function.body.insert(
+            -1,
+            ast.If(
+                test=ast.Compare(
+                    left=ast.Name(id="callback", ctx=ast.Load()),
+                    ops=[ast.IsNot()],
+                    comparators=[ast.Constant(value=None)],
+                ),
+                body=[
+                    ast.Expr(
+                        ast.Call(
+                            func=ast.Attribute(
+                                value=ast.Name(id="logging", ctx=ast.Load()),
+                                attr="info",
+                                ctx=ast.Load(),
+                            ),
+                            args=[ast.Constant(value="callback active")],
+                            keywords=[],
+                        )
+                    )
+                ],
+                orelse=[],
+            ),
+        )
+        function.body.insert(
+            function.body.index(callback_function),
+            ast.Assign(
+                targets=[ast.Name(id="diagnostic_total_steps", ctx=ast.Store())],
+                value=ast.BinOp(
+                    left=ast.Call(
+                        func=ast.Name(id="len", ctx=ast.Load()),
+                        args=[ast.Name(id="sigmas", ctx=ast.Load())],
+                        keywords=[],
+                    ),
+                    op=ast.Sub(),
+                    right=ast.Constant(value=1),
+                ),
+            ),
+        )
+    elif case == "drop_extra_options":
+        dispatch.keywords = [keyword for keyword in dispatch.keywords if keyword.arg is not None]
+    elif case == "different_sigmas":
+        dispatch.args[2] = ast.Name(id="modified_sigmas", ctx=ast.Load())
+    elif case == "different_noise":
+        dispatch.args[1] = ast.Name(id="different_noise", ctx=ast.Load())
+    elif case == "different_extra_args":
+        next(keyword for keyword in dispatch.keywords if keyword.arg == "extra_args").value = ast.Name(
+            id="different_extra_args", ctx=ast.Load()
+        )
+    elif case == "different_callback":
+        next(keyword for keyword in dispatch.keywords if keyword.arg == "callback").value = ast.Name(
+            id="callback", ctx=ast.Load()
+        )
+    elif case == "double_dispatch":
+        index = function.body.index(dispatch_assignment)
+        function.body.insert(index, copy.deepcopy(dispatch_assignment))
+    elif case == "missing_noise_scaling":
+        function.body.remove(noise_scaling_assignment)
+    elif case == "late_noise_scaling":
+        function.body.remove(noise_scaling_assignment)
+        function.body.insert(function.body.index(dispatch_assignment) + 1, noise_scaling_assignment)
+    elif case == "conditional_noise_scaling":
+        index = function.body.index(noise_scaling_assignment)
+        function.body[index] = ast.If(
+            test=ast.Constant(value=False),
+            body=[noise_scaling_assignment],
+            orelse=[],
+        )
+    elif case == "conditional_dispatch":
+        index = function.body.index(dispatch_assignment)
+        function.body[index] = ast.If(
+            test=ast.Constant(value=True),
+            body=[dispatch_assignment],
+            orelse=[],
+        )
+    elif case == "bypass_adapter":
+        adapter.func = ast.Name(id="AlternativeAdapter", ctx=ast.Load())
+    elif case == "missing_inverse_scaling":
+        function.body.remove(inverse_assignment)
+    else:
+        raise AssertionError(f"unknown contract mutation {case}")
 
 
 def _delegates_to_ancestral_res(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -187,7 +399,7 @@ def test_native_er_sde_makes_one_model_call_per_outer_solver_iteration():
     assert len(_named_calls(function, "model")) == 1
 
 
-def test_native_er_sde_runtime_sources_match_reviewed_compensation_contract():
+def test_native_er_sde_math_sources_match_reviewed_compensation_contract():
     functions = _native_sampling_functions()
     assert _ast_digest(functions["sample_er_sde"]) == ER_SDE_NATIVE_FUNCTION_DIGEST
     assert (
@@ -195,18 +407,159 @@ def test_native_er_sde_runtime_sources_match_reviewed_compensation_contract():
         == ER_SDE_DEFAULT_NOISE_SAMPLER_DIGEST
     )
 
-    samplers_tree = _native_tree("comfy/samplers.py")
-    ksampler = next(
-        node
-        for node in samplers_tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "KSAMPLER"
+
+def test_official_ksampler_sample_satisfies_semantic_contract(tmp_path):
+    method, adapter = _compile_ksampler_method(
+        tmp_path,
+        _native_ksampler_sample(),
+        name="official_ksampler",
     )
-    sample_method = next(
-        node
-        for node in ksampler.body
-        if isinstance(node, ast.FunctionDef) and node.name == "sample"
+
+    result = validate_ksampler_sample(
+        method,
+        expected_adapter=adapter,
+        expected_reference_digest=ER_SDE_KSAMPLER_SAMPLE_DIGEST,
     )
-    assert _ast_digest(sample_method) == ER_SDE_KSAMPLER_SAMPLE_DIGEST
+
+    assert result.accepted, result.failure
+    assert result.provenance.source_inspected
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("logging", "bookkeeping", "callback_instrumentation"),
+)
+def test_ksampler_semantic_contract_accepts_irrelevant_method_changes(tmp_path, case):
+    function = _native_ksampler_sample()
+    _mutate_ksampler_contract(function, case)
+    method, adapter = _compile_ksampler_method(tmp_path, function, name=case)
+
+    result = validate_ksampler_sample(
+        method,
+        expected_adapter=adapter,
+        expected_reference_digest=ER_SDE_KSAMPLER_SAMPLE_DIGEST,
+    )
+
+    assert result.accepted, result.failure
+    assert result.provenance.observed_digest != ER_SDE_KSAMPLER_SAMPLE_DIGEST
+
+
+@pytest.mark.parametrize(
+    ("case", "failure"),
+    (
+        ("signature", "positional invocation contract"),
+        ("drop_extra_options", "extra_options are not forwarded unchanged"),
+        ("different_sigmas", "scaled noise, and sigmas"),
+        ("different_noise", "scaled noise, and sigmas"),
+        ("different_extra_args", "does not forward extra_args unchanged"),
+        ("different_callback", "callback adapter"),
+        ("double_dispatch", "exactly one self.sampler_function dispatch"),
+        ("missing_noise_scaling", "expected one native noise_scaling call"),
+        ("late_noise_scaling", "must occur before sampler dispatch"),
+        ("conditional_noise_scaling", "initial noise_scaling inputs"),
+        ("conditional_dispatch", "direct method-body assignment"),
+        ("bypass_adapter", "native KSamplerX0Inpaint adapter"),
+        ("missing_inverse_scaling", "expected one final inverse_noise_scaling call"),
+    ),
+)
+def test_ksampler_semantic_contract_rejects_relevant_changes(
+    tmp_path,
+    case,
+    failure,
+):
+    function = _native_ksampler_sample()
+    _mutate_ksampler_contract(function, case)
+    method, adapter = _compile_ksampler_method(tmp_path, function, name=case)
+
+    result = validate_ksampler_sample(
+        method,
+        expected_adapter=adapter,
+        expected_reference_digest=ER_SDE_KSAMPLER_SAMPLE_DIGEST,
+    )
+
+    assert not result.accepted
+    assert failure in result.failure
+
+
+def test_ksampler_semantic_contract_accepts_compatible_plain_monkeypatch(tmp_path):
+    function = _native_ksampler_sample()
+    _mutate_ksampler_contract(function, "logging")
+    method, adapter = _compile_ksampler_method(
+        tmp_path,
+        function,
+        name="compatible_monkeypatch",
+    )
+
+    class KSAMPLER:
+        pass
+
+    KSAMPLER.sample = method
+    result = validate_ksampler_sample(
+        vars(KSAMPLER)["sample"],
+        expected_adapter=adapter,
+        expected_reference_digest=ER_SDE_KSAMPLER_SAMPLE_DIGEST,
+    )
+
+    assert result.accepted, result.failure
+
+
+def test_ksampler_semantic_contract_rejects_incompatible_plain_monkeypatch(tmp_path):
+    function = _native_ksampler_sample()
+    _mutate_ksampler_contract(function, "drop_extra_options")
+    method, adapter = _compile_ksampler_method(
+        tmp_path,
+        function,
+        name="incompatible_monkeypatch",
+    )
+
+    class KSAMPLER:
+        pass
+
+    KSAMPLER.sample = method
+    result = validate_ksampler_sample(
+        vars(KSAMPLER)["sample"],
+        expected_adapter=adapter,
+        expected_reference_digest=ER_SDE_KSAMPLER_SAMPLE_DIGEST,
+    )
+
+    assert not result.accepted
+    assert "extra_options are not forwarded unchanged" in result.failure
+
+
+def test_ksampler_semantic_contract_rejects_uninspectable_source_with_provenance(
+    tmp_path,
+    monkeypatch,
+):
+    missing_source = tmp_path / "missing_runtime_patch.py"
+    namespace = {}
+    exec(  # noqa: S102
+        compile(
+            "def sample(self, model_wrap, sigmas, extra_args, callback, noise, "
+            "latent_image=None, denoise_mask=None, disable_pbar=False):\n    return noise\n",
+            str(missing_source),
+            "exec",
+        ),
+        namespace,
+    )
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "comfyui_version",
+        SimpleNamespace(__version__="runtime-test"),
+    )
+
+    result = validate_ksampler_sample(
+        namespace["sample"],
+        expected_adapter=type("KSamplerX0Inpaint", (), {}),
+        expected_reference_digest=ER_SDE_KSAMPLER_SAMPLE_DIGEST,
+    )
+
+    assert not result.accepted
+    assert "source is unavailable" in result.failure
+    fields = result.provenance.log_fields()
+    assert "observed_digest=unavailable" in fields
+    assert f"expected_reference_digest={ER_SDE_KSAMPLER_SAMPLE_DIGEST}" in fields
+    assert "source_inspected=False" in fields
+    assert "comfyui_version=runtime-test" in fields
 
 
 def test_native_er_sde_stages_reuse_only_solver_local_denoised_history():

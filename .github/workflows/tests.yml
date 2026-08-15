@@ -64,6 +64,7 @@ jobs:
             comfyui_spectrum_h3/generic_correction_runtime.py \
             comfyui_spectrum_h3/generic_correction_topology.py \
             comfyui_spectrum_h3/experiments.py \
+            comfyui_spectrum_h3/er_sde_ksampler_contract.py \
             comfyui_spectrum_h3/er_sde_stochastic.py \
             comfyui_spectrum_h3/objective_media.py \
             comfyui_spectrum_h3/objective_media_bounded.py \

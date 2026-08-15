@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import comfyui_spectrum_h3.sampling as sampling_module
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.er_sde_stochastic import (
     ERSDEStepDescriptor,
@@ -23,12 +24,12 @@ from comfyui_spectrum_h3.sampling import (
     RUN_ID_KEY,
     STEP_ID_KEY,
     SpectrumH3Binding,
+    _copy_ksampler_with_options,
     _er_sde_tracking_contract,
     outer_sample_wrapper,
     predict_noise_wrapper,
     sampler_sample_wrapper,
 )
-import comfyui_spectrum_h3.sampling as sampling_module
 
 
 def _descriptor(
@@ -993,6 +994,60 @@ def test_effective_s_noise_zero_uses_untouched_native_path_without_tracker(monke
     assert ER_SDE_TRACKER_KEY not in observed_model_options[0]["transformer_options"]
     assert runtime.disabled_reason is None
     runtime.end_run(run_id)
+
+
+def test_ksampler_shallow_copies_are_isolated_and_preserve_instance_state():
+    sampler_function = lambda *_args: None
+    original_options = {"s_noise": 1.0}
+    inpaint_options = {"random": False}
+    retained_state = object()
+
+    class NativeSampler:
+        def __init__(self):
+            self.sampler_function = sampler_function
+            self.extra_options = original_options
+            self.inpaint_options = inpaint_options
+            self.retained_state = retained_state
+
+        def sample(self, *_args):
+            raise AssertionError("copy validation must not invoke the sampler")
+
+    sampler = NativeSampler()
+    first_options = {"noise_sampler": object()}
+    second_options = {"noise_sampler": object()}
+
+    first, first_failure = _copy_ksampler_with_options(sampler, first_options)
+    second, second_failure = _copy_ksampler_with_options(sampler, second_options)
+
+    assert first_failure is None
+    assert second_failure is None
+    assert first is not None and second is not None
+    assert first is not second and first is not sampler and second is not sampler
+    assert first.extra_options is first_options
+    assert second.extra_options is second_options
+    assert sampler.extra_options is original_options
+    assert first.inpaint_options is second.inpaint_options is inpaint_options
+    assert first.retained_state is second.retained_state is retained_state
+    assert first.sampler_function is second.sampler_function is sampler_function
+
+
+def test_ksampler_custom_copy_descriptor_fails_closed():
+    class CustomCopySampler:
+        def __init__(self):
+            self.sampler_function = lambda *_args: None
+            self.extra_options = {}
+            self.inpaint_options = {}
+
+        def __copy__(self):
+            return self
+
+        def sample(self, *_args):
+            return None
+
+    copied, failure = _copy_ksampler_with_options(CustomCopySampler(), {})
+
+    assert copied is None
+    assert failure == "KSAMPLER defines an unreviewed custom __copy__ method"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

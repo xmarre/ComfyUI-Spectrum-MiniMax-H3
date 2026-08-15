@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import logging
 import sys
 import time
@@ -9,6 +10,10 @@ from typing import Any
 
 import torch
 
+from .er_sde_ksampler_contract import (
+    KSamplerSampleContract,
+    validate_ksampler_sample,
+)
 from .er_sde_stochastic import (
     ERSDEStochasticTracker,
     ERSDETrackingError,
@@ -138,6 +143,52 @@ def sampler_supports_seeded_replay(sampler: Any) -> bool:
     return _er_sde_noise_scaler_supports_replay(options.get("noise_scaler"))
 
 
+def _ksampler_sample_contract(sampler: Any) -> KSamplerSampleContract:
+    import comfy.samplers
+
+    sample_method = vars(type(sampler)).get("sample")
+    return validate_ksampler_sample(
+        sample_method,
+        expected_adapter=comfy.samplers.KSamplerX0Inpaint,
+        expected_reference_digest=ER_SDE_KSAMPLER_SAMPLE_DIGEST,
+    )
+
+
+def _copy_ksampler_with_options(
+    sampler: Any,
+    options: dict[str, Any],
+) -> tuple[Any | None, str | None]:
+    """Prove and perform the shallow copy used to isolate tracked options."""
+    if not inspect.isfunction(vars(type(sampler)).get("sample")):
+        return None, "KSAMPLER.sample is not a plain function descriptor"
+    if vars(type(sampler)).get("__copy__") is not None:
+        return None, "KSAMPLER defines an unreviewed custom __copy__ method"
+    try:
+        original_state = vars(sampler)
+        original_options = sampler.extra_options
+        copied = copy.copy(sampler)
+    except Exception as exc:  # noqa: BLE001 - fail closed on custom runtime state
+        return None, f"KSAMPLER state/copy inspection failed: {type(exc).__name__}: {exc}"
+    if copied is sampler or type(copied) is not type(sampler):
+        return None, "KSAMPLER shallow copy did not create a distinct native instance"
+    try:
+        for name, value in original_state.items():
+            if getattr(copied, name, object()) is not value:
+                return None, f"KSAMPLER shallow copy changed instance field {name!r}"
+        copied.extra_options = options
+        if sampler.extra_options is not original_options:
+            return None, "KSAMPLER shallow copy mutated the original extra_options"
+        if copied.extra_options is not options:
+            return None, "KSAMPLER shallow copy did not accept invocation-local options"
+        if copied.sampler_function is not sampler.sampler_function:
+            return None, "KSAMPLER shallow copy changed sampler_function binding"
+        if copied.inpaint_options is not sampler.inpaint_options:
+            return None, "KSAMPLER shallow copy changed inpaint_options ownership"
+    except Exception as exc:  # noqa: BLE001 - fail closed on custom runtime state
+        return None, f"KSAMPLER copied-state validation failed: {type(exc).__name__}: {exc}"
+    return copied, None
+
+
 def _er_sde_tracking_contract(sampler: Any) -> tuple[bool, str | None]:
     """Accept only the native solver/wrapper semantics reviewed by this project."""
     import comfy.k_diffusion.sampling as native_sampling
@@ -151,10 +202,24 @@ def _er_sde_tracking_contract(sampler: Any) -> tuple[bool, str | None]:
     if type(sampler) is not comfy.samplers.KSAMPLER:
         return False, "ER-SDE sampler object is not native ComfyUI KSAMPLER"
     if (
-        function_ast_digest(type(sampler).sample)
-        != ER_SDE_KSAMPLER_SAMPLE_DIGEST
+        comfy.samplers.KSAMPLER.__module__ != "comfy.samplers"
+        or comfy.samplers.KSAMPLER.__name__ != "KSAMPLER"
     ):
-        return False, "native KSAMPLER.sample implementation is not a reviewed revision"
+        return False, "native ComfyUI KSAMPLER class provenance is unreviewed"
+    if (
+        comfy.samplers.KSamplerX0Inpaint.__module__ != "comfy.samplers"
+        or comfy.samplers.KSamplerX0Inpaint.__name__ != "KSamplerX0Inpaint"
+    ):
+        return False, "native KSamplerX0Inpaint adapter provenance is unreviewed"
+    sample_contract = _ksampler_sample_contract(sampler)
+    if not sample_contract.accepted:
+        return False, (
+            f"KSAMPLER.sample contract rejected: {sample_contract.failure}; "
+            f"{sample_contract.provenance.log_fields()}"
+        )
+    _, copy_failure = _copy_ksampler_with_options(sampler, {})
+    if copy_failure is not None:
+        return False, f"KSAMPLER copy contract rejected: {copy_failure}"
     if (
         function_ast_digest(native_sampling.default_noise_sampler)
         != ER_SDE_DEFAULT_NOISE_SAMPLER_DIGEST
@@ -880,8 +945,43 @@ def _run_tracked_er_sde(
     tracked_options = dict(options)
     tracked_options["noise_sampler"] = tracker.noise_sampler
     tracked_options["noise_scaler"] = tracker.noise_scaler
-    tracked_sampler = copy.copy(sampler)
-    tracked_sampler.extra_options = tracked_options
+    tracked_sampler, copy_failure = _copy_ksampler_with_options(
+        sampler,
+        tracked_options,
+    )
+    if copy_failure is not None:
+        tracker.clear()
+        runtime.disable_forecasting_for_run(copy_failure)
+        LOG.warning(
+            "Spectrum H3 disabled for this ER-SDE run; preserving native all-actual "
+            "sampling because KSAMPLER copy validation failed: %s",
+            copy_failure,
+        )
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+    assert tracked_sampler is not None
+
+    if runtime.config.debug:
+        sample_contract = _ksampler_sample_contract(sampler)
+        LOG.warning(
+            "Spectrum H3 ER-SDE stochastic tracking active run_id=%s sampler=%s "
+            "max_stage=%s configured_s_noise=%.8f effective_s_noise=%.8f "
+            "ksampler_contract=accepted %s",
+            runtime.active_run_id,
+            sampler_name(sampler),
+            options.get("max_stage", 3),
+            configured_s_noise,
+            effective_s_noise,
+            sample_contract.provenance.log_fields(),
+        )
 
     tracked_extra_args = dict(extra_args)
     tracked_model_options = dict(tracked_extra_args.get("model_options") or {})

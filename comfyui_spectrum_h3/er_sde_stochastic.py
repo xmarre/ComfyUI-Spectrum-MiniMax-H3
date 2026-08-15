@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import inspect
 import logging
 import math
 import textwrap
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -33,10 +35,26 @@ class _PendingIncrement:
     value: torch.Tensor
 
 
-def function_ast_digest(function: Callable[..., Any]) -> str | None:
+def function_node_ast_digest(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> str:
+    """Return the normalized digest shared by runtime and source-contract tests."""
+    normalized = copy.deepcopy(function_node)
+    normalized.decorator_list = []
+    return hashlib.sha256(
+        ast.dump(normalized, include_attributes=False).encode("utf-8")
+    ).hexdigest()
+
+
+def function_ast_digest(
+    function: Callable[..., Any],
+    *,
+    unwrap: bool = True,
+) -> str | None:
     """Return a stable semantic-source digest, or None when source is unavailable."""
     try:
-        source = inspect.getsource(inspect.unwrap(function))
+        inspected = inspect.unwrap(function) if unwrap else function
+        source = inspect.getsource(inspected)
         module = ast.parse(textwrap.dedent(source))
     except (OSError, TypeError, SyntaxError):
         return None
@@ -44,10 +62,7 @@ def function_ast_digest(function: Callable[..., Any]) -> str | None:
         module.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)
     ):
         return None
-    function_node = module.body[0]
-    function_node.decorator_list = []
-    normalized = ast.dump(function_node, include_attributes=False)
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return function_node_ast_digest(module.body[0])
 
 
 def native_default_er_sde_noise_scaler(value: torch.Tensor) -> torch.Tensor:
@@ -245,5 +260,6 @@ __all__ = [
     "ERSDEStochasticTracker",
     "ERSDETrackingError",
     "function_ast_digest",
+    "function_node_ast_digest",
     "native_default_er_sde_noise_scaler",
 ]
