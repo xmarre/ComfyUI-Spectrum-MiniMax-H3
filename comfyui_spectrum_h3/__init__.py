@@ -1,4 +1,5 @@
 from .config import AGGRESSIVE_PRESET, CONSERVATIVE_PRESET, SpectrumH3Config
+from .er_sde_offline_replay_safety import install_er_sde_offline_replay_safety
 from .er_sde_policy import install_er_sde_tail_policy
 from .forecast import HistoryWeightForecaster
 from .generic_correction import install_generic_residual_correction
@@ -30,6 +31,7 @@ install_replay_calibration()
 install_replay_calibration_validation()
 install_replay_calibration_provenance()
 install_er_sde_tail_policy()
+install_er_sde_offline_replay_safety()
 
 __all__ = [
     "AGGRESSIVE_PRESET",
