@@ -1,63 +1,107 @@
-# Spectrum MiniMax H3 v0.2.10
+# Spectrum MiniMax H3 v0.2.11
 
-v0.2.10 hardens the Objective Sequential Capture research path against host/CUDA memory pressure and makes recoverable capture failures non-fatal to the surrounding ComfyUI workflow. The bounded analysis transform, objective R/A/B semantics, report schema, forecasting behavior, and production Spectrum defaults are unchanged.
+v0.2.11 fixes native ER-SDE forecast-state corruption, removes the characteristic high-frequency/confetti artifact from Spectrum ER-SDE forecast steps, hardens sampler-wrapper compatibility, and prevents optional post-run research from blocking an already-completed generation.
 
-## Memory-safe Objective Sequential Capture
+## Native ER-SDE solver-space fix
 
-Sequential capture now performs validation and memory admission before allocating the retained analysis destination. The preflight accounts for the decoded source media already live, the new bounded VIDEO/AUDIO destinations, existing pending captures, bounded staging workspaces, and explicit host/CUDA safety margins.
+Earlier Spectrum ER-SDE forecast steps predicted H3 hidden/velocity state without evaluating the current stochastic latent, then reconstructed denoised/x0 against ER-SDE's current `x`. Direct subtraction of the pending stochastic increment corrected one real mismatch term but did not remove the visible artifact in real MiniMax H3 testing.
 
-The retained research format remains the same:
+The stronger mismatch was solver-space consistency: ER-SDE consumes and differentiates denoised/x0 values in its update/history, while the skipped H3 hidden forecast was not a valid current-state denoised observation.
 
-- VIDEO is reduced deterministically to the bounded CPU `float16` analysis surface capped at 393,216 pixels per frame;
-- AUDIO is retained as an independent CPU `float32` waveform;
-- at most two incomplete benchmark IDs and 4 GiB of retained analysis media are kept;
-- raw decoded input tensors are never stored in `_PENDING_CAPTURES`.
+v0.2.11 therefore keeps native ER-SDE's stochastic latent trajectory unchanged and reconstructs skipped solver-facing denoised/x0 values from exact actual denoised anchors:
 
-Video staging derives its chunk size from a conservative 64 MiB workspace target, capped at four frames. The approximately 0.7 MP, 192-frame float32 case that exceeded that workspace target at four frames now stages three frames at a time. Audio uses bounded sample chunks as well.
+- the first causal forecast after one exact actual anchor uses the latest exact actual denoised value;
+- later causal forecasts use bounded linear dense output in native ER-SDE lambda coordinate from the two latest exact actual anchors;
+- degenerate, reversed, non-finite, or excessively long extrapolation falls back to the latest exact actual anchor;
+- native `s_noise`, RNG draws, stochastic latent updates, stage-2/stage-3 history and terminal behavior remain intact;
+- there are zero additional H3 transformer/denoiser NFEs.
 
-Finite/range validation no longer materializes a boolean tensor for every source element. It reduces each chunk with `aminmax`, checks only the resulting scalar bounds, clamps the owned work buffer in place, and releases intermediate representations before the next chunk allocation.
+The dense output is substituted before native ER-SDE's callback, integration update, derivative history and `old_denoised` assignment.
 
-Preflight, staging, and pending insertion are serialized under the pending-state lock so concurrent capture nodes cannot both admit themselves from stale accounting.
+## Real MiniMax H3 validation
 
-## Lower bounded-evaluator peak memory
+The solver-space candidate was tested on real native MiniMax H3 ER-SDE generations after the simpler exact-q candidate failed visually.
 
-The bounded VIDEO evaluator now processes legacy and candidate chunks sequentially against one reference chunk instead of materializing both comparison chunks together. Intermediate float32 tensors are released after each comparison.
+Observed result:
 
-This reduces the Spectrum-owned evaluator live set without changing the existing bounded metric profile or verdict calculations.
+- forecast confetti/noise disappeared completely;
+- final fine/low-resolution visual structure improved modestly but visibly across repeated generations;
+- action/motion remained comparable in the tested prompts;
+- audio remained comparable;
+- the normal 20-step Spectrum budget remained 11 actual H3 evaluations + 9 forecasts;
+- no additional H3 transformer NFE was introduced.
 
-## Recoverable failures no longer abort unrelated output nodes
+A later T2V rerun from an older saved workflow also completed normally after the teardown hardening below.
 
-Objective Sequential Capture now converts recoverable capture/evaluation failures into its status output instead of raising through the ComfyUI graph. This includes validation errors, incompatible or duplicate R/A/B roles, preflight rejection, staging failures, report/evaluator failures, and unexpected non-resource-exhaustion exceptions. Earlier accepted R/A roles remain intact when a later role is rejected before completion, while a completed triad is always released after evaluation succeeds or fails.
+## Native stochastic ownership and replay safety
 
-This lets unrelated output nodes, including video saving/combine nodes on the same execution, continue when the research capture itself cannot complete.
+Spectrum still tracks ER-SDE's exact additive stochastic increment so ownership is explicit across actual, forecast and replay paths. The stochastic increment remains part of native ER-SDE's latent `x`; Spectrum does not disable, globally attenuate or rescale native ER-SDE noise.
 
-Actual resource-exhaustion exceptions are deliberately not swallowed. `MemoryError`, CUDA OOM, and non-objective exceptions reporting an out-of-memory condition still propagate so ComfyUI/PyTorch can perform their normal OOM recovery behavior.
+Replay and compatibility paths retain exact stochastic compensation where solver-space dense output is not the reviewed causal path.
 
-## Capture diagnostics and ownership
+`s_noise=0` remains on the untouched native path without stochastic tracker allocation.
 
-Major capture boundaries now emit timestamped diagnostics with elapsed time and available memory telemetry where supported. Logged stages include input receipt, preflight, destination allocation, bounded chunk validation/resize/transfer/copy, pending insertion, evaluation, and report persistence.
+## TiledDiffusion sampler-wrapper compatibility
 
-Host telemetry uses `psutil` when available with platform fallbacks; CUDA captures also report allocator/free-memory state when available. If host telemetry is unavailable, a conservative absolute incremental guard remains in force.
+Real runtime testing exposed ComfyUI-TiledDiffusion's variadic `KSAMPLER_sample(*args, **kwargs)` monkeypatch above ComfyUI's native `KSAMPLER.sample`.
 
-Source ownership is explicit: only newly allocated reduced VIDEO and copied AUDIO tensors enter the pending store. Tests cover source release, reset, eviction, completed-triad teardown, staging failure, and evaluation failure.
+The ER-SDE preflight now supports that audited passthrough structure without broadly trusting arbitrary wrappers. The semantic validator:
+
+- verifies exact `*args/**kwargs` delegation;
+- validates the stored native target recursively;
+- verifies the reviewed TiledDiffusion `model_options` / `sigmas` bookkeeping shape;
+- rejects changed argument forwarding, alias mutation, cycles and unrelated state mutation;
+- still fails closed to untouched native sampling when the wrapper contract cannot be proven.
+
+## Post-run teardown safety
+
+A real saved-workflow run later hard-wedged WSL after all ER-SDE solver steps and the Spectrum run summary had completed, before `Spectrum H3 run teardown` or downstream VAE/video nodes appeared.
+
+The old generic-correction hook performed optional persistence/evaluation synchronously inside `SpectrumH3Runtime.end_run()`. A filesystem/evaluator stall could therefore block a valid completed sampler result from reaching downstream nodes.
+
+v0.2.11 changes the boundary:
+
+- calibration-block export remains synchronous and bounded;
+- core Spectrum runtime/history release remains synchronous;
+- optional generic-correction persistence/evaluation is dispatched only after runtime release;
+- the research worker is daemonized and bounded to one active job;
+- if a previous research job is still active, later diagnostic jobs are skipped rather than accumulating threads;
+- the research worker receives only a tensor-free calibration block and cannot retain Spectrum feature-history VRAM;
+- teardown debug breadcrumbs identify calibration export, runtime release and research dispatch boundaries.
+
+No speculative `torch.cuda.empty_cache()`, forced CUDA synchronization, or history offload was added.
+
+## README refresh
+
+The README has been rewritten around the current production behavior and now documents:
+
+- the v0.2.11 ER-SDE solver-space path;
+- current Python defaults and recommended ER-SDE quality settings;
+- supported samplers and fail-closed behavior;
+- TiledDiffusion compatibility;
+- model-aware/generic-correction defaults;
+- offline replay and live-preview behavior;
+- attention/cache compatibility;
+- memory/storage guidance and teardown diagnostics;
+- research nodes and current debugging information.
 
 ## Compatibility
 
-This release does not alter:
+This release does not change the global Python defaults for:
 
-- the production feature forecaster or sampler schedules;
-- model-aware controller defaults;
-- offline smoothing replay behavior;
-- the validated `coordinate_rls + no_attenuation + hard_clip + 0.40` full-mode generic-correction default;
-- exact legacy generic-correction reproduction;
-- Objective Media schema-v1 verdict thresholds or existing collected reports.
+- `offline_smoothing_replay=true`;
+- `model_aware_mode=off`;
+- `audio_blend_weight=0.0`;
+- the validated full-mode `coordinate_rls + no_attenuation + hard_clip + 0.40` generic correction.
 
-The package and source-checkout calibration provenance versions are advanced to `0.2.10`.
+Saved ComfyUI workflows can retain serialized values from older releases; updating the custom node does not automatically rewrite those widgets.
 
-## Remaining resource boundary
-
-The preflight is conservative admission control, not an atomic reservation of host or device memory. A real OOM can still occur if system/WSL commit availability changes after preflight, another process allocates concurrently, allocator/backend scratch exceeds the estimate, or an accelerator does not expose usable free-memory telemetry. Those true resource failures remain visible and are not converted into a successful capture status.
+Unknown or unreviewed sampler/noise/wrapper contracts continue to fail closed to native execution.
 
 ## Validation
 
-The PR is covered by the repository's pinned four-revision ComfyUI matrix. The matrix builds the wheel, runs the native-H3 forecaster smoke test, scoped Ruff, `compileall`, and the full pytest suite. Focused sequential-capture coverage includes deterministic staging parity across float16/bfloat16/float32/float64 inputs, bounded workspace accounting, preflight rejection before destination allocation, missing-telemetry fallback, duplicate/topology checks before staging, non-fatal recoverable errors, OOM propagation, source ownership, reset/eviction release, completed-triad teardown, and optional CUDA staging.
+The release is covered by the repository's four-revision pinned ComfyUI matrix. It builds the wheel, runs the native-H3 forecaster smoke test, scoped Ruff, `compileall`, and the full pytest suite on every reviewed revision.
+
+Focused v0.2.11 coverage includes ER-SDE stochastic ownership, first/terminal boundaries, seeded RNG/replay parity, stages 1/2/3, solver-space bootstrap hold and lambda extrapolation, extrapolation guards, all-actual parity, replay isolation, TiledDiffusion wrapper validation, bounded denoised-anchor lifetime, post-run release/research ordering, bounded background research dispatch and failure cleanup.
+
+The package and source-checkout calibration provenance versions are advanced to `0.2.11`.
