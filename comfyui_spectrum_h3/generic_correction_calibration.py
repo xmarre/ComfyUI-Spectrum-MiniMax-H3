@@ -20,7 +20,7 @@ SCHEMA_VERSION = 1
 SOURCE_SCHEMA_REVISION = "generic-correction-v1"
 LOG_PREFIX = "SPECTRUM_GENERIC_CORRECTION_CALIBRATION_JSON="
 PACKAGE_NAME = "comfyui-spectrum-minimax-h3"
-FALLBACK_PACKAGE_VERSION = "0.2.10"
+FALLBACK_PACKAGE_VERSION = "0.2.11"
 MAX_SERIALIZED_BYTES = 512 * 1024
 MAX_RETAINED_ROWS = 4096
 
@@ -130,8 +130,6 @@ def exact_segment_moments(
     if len({key for key, *_ in normalized}) != len(normalized):
         raise ValueError("exact moment segment keys must be unique")
 
-    # MPS does not support float64 reductions. Other backends use five float64
-    # accumulators per segment to minimize drift across large chunked streams.
     accumulator_dtype = torch.float32 if target_device.type == "mps" else torch.float64
     accumulators = {
         key: torch.zeros(5, device=target_device, dtype=accumulator_dtype)
