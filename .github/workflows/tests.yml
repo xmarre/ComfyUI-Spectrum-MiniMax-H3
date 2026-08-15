@@ -55,7 +55,9 @@ jobs:
         run: |
           python -m ruff check \
             comfyui_spectrum_h3/external_patch_compat.py \
+            comfyui_spectrum_h3/external_patch_hardening.py \
             tests/test_external_patch_compat.py \
+            tests/test_external_patch_hardening.py \
             --ignore I001,UP037
           python -m ruff check \
             comfyui_spectrum_h3/config.py \
@@ -101,6 +103,21 @@ jobs:
             tools/analyze_generic_correction.py \
             --ignore N999,I001,C408,UP035
           python -m compileall -q comfyui_spectrum_h3 tests tools
+
+      - name: Run focused external compatibility suites
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
+          PYTHONPATH: ${{ github.workspace }}/ComfyUI
+        run: |
+          python -m pytest -q \
+            tests/test_external_patch_compat.py \
+            tests/test_external_patch_hardening.py \
+            tests/test_h3_wrapper.py \
+            tests/test_runtime.py \
+            tests/test_sampling.py \
+            tests/test_model_aware.py \
+            tests/test_native_equivalence.py \
+            tests/test_er_sde_stochastic_compensation.py
 
       - name: Run tests against native MiniMax H3
         env:
