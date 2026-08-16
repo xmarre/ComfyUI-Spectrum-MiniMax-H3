@@ -325,10 +325,6 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, float(value)))
 
 
-def _risk_from_perturbation(value: float) -> float:
-    return _clamp(math.log1p(8.0 * max(0.0, float(value))) / math.log(9.0))
-
-
 def _runtime_structural_perturbation(
     parsed: ParsedExternalPatchContracts,
 ) -> tuple[float, float]:
@@ -363,50 +359,17 @@ def _external_profile_from_base(
     base = base_lookup.profile
     runtime_count = len(parsed.active_descriptors)
     runtime_perturbation, runtime_final = _runtime_structural_perturbation(parsed)
-    combined_perturbation = math.expm1(
-        math.log1p(max(0.0, float(base.patch_perturbation)))
-        + math.log1p(runtime_perturbation)
-    )
-    combined_final = math.expm1(
-        math.log1p(max(0.0, float(base.final_block_perturbation)))
-        + math.log1p(runtime_final)
-    )
 
-    old_patch_risk = _risk_from_perturbation(base.patch_perturbation)
-    old_final_risk = _risk_from_perturbation(base.final_block_perturbation)
-    base_sensitivity = _clamp(
-        (
-            float(base.aggregate_sensitivity)
-            - 0.35 * old_patch_risk
-            - 0.30 * old_final_risk
-        )
-        / 0.35
-    )
-    new_patch_risk = _risk_from_perturbation(combined_perturbation)
-    new_final_risk = _risk_from_perturbation(combined_final)
-    aggregate_sensitivity = _clamp(
-        0.35 * base_sensitivity + 0.35 * new_patch_risk + 0.30 * new_final_risk
-    )
-
-    old_active = int(base.active_patch_count)
-    old_recognized = int(base.recognized_lora_count)
-    old_coverage = old_recognized / max(1, old_active)
-    if old_active:
-        base_coverage = _clamp((float(base.profile_confidence) - 0.45 * old_coverage) / 0.55)
-    else:
-        base_coverage = _clamp(base.profile_confidence)
-    active_patch_count = old_active + runtime_count
-    recognized_coverage = (old_recognized + runtime_count) / max(1, active_patch_count)
-    profile_confidence = _clamp(
-        0.55 * base_coverage + 0.45 * recognized_coverage
-        if active_patch_count
-        else base_coverage
-    )
-    unknown_risk = _clamp(int(base.unknown_patch_count) / max(1, active_patch_count))
-    forecast_risk_prior = _clamp(
-        profile_confidence * aggregate_sensitivity
-        + (1.0 - profile_confidence) * (0.35 + 0.35 * unknown_risk)
-    )
+    # The external contract describes deterministic activation modulation, not a
+    # parameter-space LoRA/model patch. Its raw structural magnitude is useful
+    # telemetry, but it is not calibrated to the parameter perturbation metric
+    # consumed by ModelAwareController. Feeding it into that prior can saturate
+    # patch/model risk and turn a recognized Diff-Aid configuration into an
+    # unintended all-actual schedule. Preserve the base model/parameter-patch
+    # forecastability prior here; hard regime changes are protected by the
+    # transaction-level boundary guard below and continuous behavior is judged by
+    # the ordinary online trajectory evidence after real anchors.
+    active_patch_count = int(base.active_patch_count) + runtime_count
     kinds = tuple(dict.fromkeys(value.kind for value in parsed.active_descriptors))
     adjustment_elapsed = max(0.0, time.perf_counter() - adjustment_started)
     return ExternalAwareProfile(
@@ -415,11 +378,11 @@ def _external_profile_from_base(
         patch_identity=f"{base.patch_identity}:external:{parsed.fingerprint[:16]}",
         active_patch_count=active_patch_count,
         active_patch_keys=int(base.active_patch_keys),
-        profile_confidence=profile_confidence,
-        aggregate_sensitivity=aggregate_sensitivity,
-        patch_perturbation=combined_perturbation,
-        final_block_perturbation=combined_final,
-        forecast_risk_prior=forecast_risk_prior,
+        profile_confidence=float(base.profile_confidence),
+        aggregate_sensitivity=float(base.aggregate_sensitivity),
+        patch_perturbation=float(base.patch_perturbation),
+        final_block_perturbation=float(base.final_block_perturbation),
+        forecast_risk_prior=float(base.forecast_risk_prior),
         build_seconds=(0.0 if base_lookup.cache_hit else float(base.build_seconds)) + adjustment_elapsed,
         estimated_bytes=int(base.estimated_bytes) + 256 * len(parsed.descriptors),
         transient_workspace_bytes=int(base.transient_workspace_bytes),
