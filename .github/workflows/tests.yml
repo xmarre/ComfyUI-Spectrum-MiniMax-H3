@@ -58,6 +58,7 @@ jobs:
             comfyui_spectrum_h3/external_patch_hardening.py \
             tests/test_external_patch_compat.py \
             tests/test_external_patch_hardening.py \
+            tests/test_external_patch_transaction_parity.py \
             --ignore I001,UP037
           python -m ruff check \
             comfyui_spectrum_h3/config.py \
@@ -112,6 +113,7 @@ jobs:
           python -m pytest -q \
             tests/test_external_patch_compat.py \
             tests/test_external_patch_hardening.py \
+            tests/test_external_patch_transaction_parity.py \
             tests/test_h3_wrapper.py \
             tests/test_runtime.py \
             tests/test_sampling.py \
@@ -127,6 +129,7 @@ jobs:
           python -m pytest -q \
             --ignore=tests/test_external_patch_compat.py \
             --ignore=tests/test_external_patch_hardening.py \
+            --ignore=tests/test_external_patch_transaction_parity.py \
             --ignore=tests/test_h3_wrapper.py \
             --ignore=tests/test_runtime.py \
             --ignore=tests/test_sampling.py \
