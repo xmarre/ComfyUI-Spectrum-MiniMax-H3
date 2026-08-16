@@ -1,46 +1,58 @@
-# Spectrum MiniMax H3 v0.2.13
+# Spectrum MiniMax H3 v0.2.14
 
-v0.2.13 fixes a false native ER-SDE compatibility rejection on Python 3.13. Spectrum could disable ER-SDE and fall back to an untouched native sampler with:
+v0.2.14 hardens native ER-SDE offline smoothing replay around a reproduced WSL hard-wedge boundary. In the captured failing run, Spectrum completed the entire first pass, released causal history, constructed and validated the offline smoother, entered transformer-free replay, and then stopped producing output after replay step 13. That trace rules out the previously suspected post-run teardown boundary and narrows the protection target to work occurring inside replay.
 
-```text
-native sample_er_sde implementation is not a reviewed revision
-```
+## Native ER-SDE replay preview protection
 
-The affected ComfyUI `sample_er_sde` implementation had not actually changed. The failure came from Spectrum's source-provenance guard hashing a decorator-stripped Python AST with the runtime default representation from `ast.dump()`.
+KJNodes Model Preview Override performs observational preview work from the sampler callback, including GPU preview/decode work and a blocking GPU-to-CPU transfer before its asynchronous encoder handoff. Offline replay can drive that callback much faster than the transformer-backed capture pass while the full replay archive is still live.
 
-## Python 3.13 ER-SDE compatibility fix
+For **native ER-SDE offline replay only**, Spectrum now recognizes the reviewed KJNodes nested callback provenance and bypasses the KJ preview wrapper while forwarding directly to the underlying Spectrum replay callback. This preserves Spectrum's replay progress and external callback semantics without performing KJ's preview decode/copy during the fast replay.
 
-Python 3.13 changed the default AST dump representation so empty fields are omitted unless `show_empty=True`. Spectrum's reviewed ER-SDE source digests were generated from the full-field representation used by Python 3.12 and older runtimes.
+The guard is deliberately narrow:
 
-That meant identical native source could produce a different digest solely because ComfyUI was running under Python 3.13. The same interpreter-dependent mismatch affected both the reviewed `sample_er_sde` implementation and native `default_noise_sampler` provenance.
+- KJNodes preview remains active during the expensive first-pass capture;
+- native ER-SDE single-pass behavior is unchanged;
+- other sampler and replay callback paths are unchanged;
+- arbitrary callback wrappers are never unwrapped;
+- the KJ callback is accepted only when its module, qualified name, source-file suffix and `original_callback` closure shape match the reviewed implementation.
 
-v0.2.13 normalizes the AST representation before hashing:
+This release does **not** claim that the historical WSL wedge has been proven to originate inside KJNodes. The callback is the strongest narrowed protection target from the reproduced trace, and the additional diagnostics below make a subsequent real run classify the remaining boundary precisely if the wedge recurs.
 
-- Python runtimes that support `show_empty` explicitly use `ast.dump(..., show_empty=True)`;
-- older Python versions retain the existing compatible dump path;
-- the existing reviewed digest constants remain unchanged;
-- genuinely changed or unreviewed ER-SDE source still fails closed.
+## Replay boundary diagnostics
 
-This keeps the source-contract safety invariant while removing the interpreter-version false rejection.
+With `debug=true`, native ER-SDE replay now records boundary breadcrumbs around:
 
-## Scope
+- sampler callback begin/end;
+- stochastic noise-sampler begin/end;
+- successful replay step finalization.
 
-This release does not change ER-SDE solver math, stochastic compensation, solver-space dense output, forecast cadence, offline replay ownership, `s_noise`, `max_stage`, sampler options, or scheduler behavior.
+These breadcrumbs do not reduce latent tensors and do not introduce an explicit CUDA synchronization.
 
-The issue was reproduced independently of scheduler choice. The reported ComfyUI v0.30.0 and v0.33.0 ER-SDE implementations use the same relevant solver body, so changing to the beta scheduler cannot resolve this provenance failure.
+The replay `finalize_step_end` breadcrumb is installed outside the v0.2.12 external-patch finalizer. It therefore means the effective finalization chain has completed, including Diff-Aid compatibility bookkeeping, rather than reporting completion before an outer finalizer has finished.
+
+## Existing compatibility preserved
+
+The conflict resolution for PR #55 was performed against v0.2.13 rather than taking the older v0.2.11 branch state. v0.2.14 therefore retains:
+
+- v0.2.12 Diff-Aid H3 forecast compatibility and hard-transition protection;
+- v0.2.13 Python 3.13 native ER-SDE source-provenance normalization;
+- the v0.2.11 ER-SDE stochastic-state and solver-space dense-output correction.
+
+There is no change to native ER-SDE solver math, RNG ownership, `s_noise`, `max_stage`, forecast cadence, scheduler behavior, or the normal actual/forecast NFE budget.
+
+## Live preview behavior
+
+For offline smoothing replay with native ER-SDE, KJNodes Model Preview Override now provides the useful first-pass preview and is intentionally skipped during the transformer-free replay. For paths outside that exact combination, the existing preview behavior remains unchanged.
 
 ## Validation
 
-The fix was validated by reproducing the Python 3.13 digest difference and confirming that normalized full-field AST dumping restores the existing reviewed digests exactly:
+The reconciled PR #55 head passed the complete repository test matrix before merge:
 
-- `sample_er_sde`: `55b76bd3a76d44fbd363de39f2ab3ea672c78de9f001f47168b47ec6ff6d2447`
-- `default_noise_sampler`: `11cfe81f36f0b43e96c12eff32a4f074f35227a53ca116e837bf268b6383f9ad`
+- four reviewed ComfyUI revisions on Python 3.12;
+- the current reviewed ComfyUI revision on Python 3.13;
+- forecaster smoke test;
+- Ruff and `compileall`;
+- focused external-patch compatibility suites;
+- native MiniMax H3 test suite.
 
-CI now includes a dedicated Python 3.13 job against the reviewed current ComfyUI revision in addition to the existing Python 3.12 multi-revision matrix. The full PR #58 matrix passed before merge.
-
-## Compatibility
-
-- Fixes issue #57 for Python 3.13 environments using reviewed native ComfyUI ER-SDE.
-- Python 3.10, 3.11 and 3.12 behavior remains unchanged.
-- Python 3.13 is now explicitly included in package classifiers and CI coverage.
-- Native fallback behavior remains fail-closed for genuinely unreviewed ER-SDE implementations.
+Dedicated regression coverage verifies strict KJ callback recognition/rejection, callback begin/end behavior including exception propagation, debug-off inertness, and the required wrapper ordering that keeps replay finalization telemetry outside external-patch bookkeeping.
