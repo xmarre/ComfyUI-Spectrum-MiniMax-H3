@@ -33,9 +33,9 @@ install_replay_calibration()
 install_replay_calibration_validation()
 install_replay_calibration_provenance()
 install_er_sde_tail_policy()
-install_er_sde_offline_replay_safety()
 install_external_patch_compat()
 install_external_patch_hardening()
+install_er_sde_offline_replay_safety()
 
 # External compatibility wraps the already-installed safe end-run hook. Preserve
 # the inner implementation's identity and expose the effective outermost hook
