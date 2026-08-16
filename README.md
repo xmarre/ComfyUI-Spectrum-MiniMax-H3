@@ -8,7 +8,7 @@ Spectrum is an **approximate accelerator**. Forecasted steps change the denoisin
 
 ## v0.2.11: native ER-SDE quality fix
 
-v0.2.11 fixes the characteristic high-frequency / "confetti" corruption that could appear on Spectrum forecast steps with native ER-SDE.
+v0.2.11 fixes the characteristic high-frequency / "confetti" corruption on Spectrum forecast steps with native ER-SDE.
 
 The problem was not simply ER-SDE's random increment. A skipped H3 hidden/velocity forecast was being reconstructed against ER-SDE's current stochastic latent as if it were a valid current-state denoised/x0 estimate. ER-SDE then consumed that inconsistent value in its own solver update and higher-order derivative history.
 
@@ -97,7 +97,7 @@ For quality-critical work, compare Spectrum enabled/disabled with the exact same
 
 Keep the defaults unless you have a reason to change them.
 
-`offline_smoothing_replay=true` uses a compute-heavy causal capture pass followed by a transformer-free replay. It was introduced to preserve audio fidelity after matched H3 testing showed that direct audio spectral mixing and later joint H3 evaluations could cause speech/stutter regressions. The default keeps `audio_blend_weight=0.0`.
+`offline_smoothing_replay=true` uses a compute-heavy causal capture pass followed by a transformer-free replay. It was introduced to preserve audio fidelity after matched H3 testing showed speech/stutter regressions from direct audio spectral mixing and from later joint H3 evaluations. The default keeps `audio_blend_weight=0.0`.
 
 ### Native ER-SDE quality path
 
@@ -313,7 +313,7 @@ Spectrum H3 teardown transition ...
 Spectrum H3 run teardown ...
 ```
 
-If Spectrum encounters an unreviewed sampler/wrapper contract it should log the reason and run native rather than silently applying an unsafe approximation. Malformed declared external compatibility metadata that could affect forecast correctness likewise fails safe to all-actual sampling for that run rather than aborting an otherwise valid generation.
+If Spectrum encounters an unreviewed sampler/wrapper contract it should log the reason and run native rather than silently applying an unsafe approximation. Malformed declared external compatibility metadata fails safe to all-actual sampling for that run rather than aborting an otherwise valid generation.
 
 For bug reports, include:
 
@@ -328,9 +328,9 @@ For bug reports, include:
 
 ## Compatibility notes for saved workflows
 
-ComfyUI serializes node widget values. Updating Spectrum therefore does not necessarily rewrite old saved settings to current defaults.
+ComfyUI serializes node widget values. Updating Spectrum does not rewrite existing serialized workflow widget values to current defaults.
 
-In particular, workflows saved on older releases may retain old values for `offline_smoothing_replay`, model-aware options, or generic-correction settings. Compare the saved node against the defaults above when reproducing behavior across versions.
+In particular, workflows saved on older releases retain the serialized values they already contain for `offline_smoothing_replay`, model-aware options, or generic-correction settings. Compare the saved node against the defaults above when reproducing behavior across versions.
 
 ## License
 
