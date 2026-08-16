@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 from types import SimpleNamespace
 
@@ -83,9 +84,12 @@ def test_no_contract_is_empty_and_deterministic():
         (contract(block_indices_0based=[5]), "outside 0..4"),
         (contract(strength=float("nan")), "must be finite"),
         (contract(strength=float("inf")), "must be finite"),
-        (contract(sigma_start=0.8, sigma_end=0.2), "sigma_start"),
-        (contract(sigma_start=-0.1), "sigma_start"),
-        (contract(sigma_end=1.1), "sigma_start"),
+        (
+            contract(sigma_start=0.8, sigma_end=0.2),
+            r"0 <= sigma_start <= sigma_end <= 1",
+        ),
+        (contract(sigma_start=-0.1), r"0 <= sigma_start <= sigma_end <= 1"),
+        (contract(sigma_end=1.1), r"0 <= sigma_start <= sigma_end <= 1"),
         (contract(sigma_ramp=-0.1), "sigma_ramp"),
         (contract(model_block_count=4), "declares 4 blocks"),
         (contract(block_indices_0based=[0, 0]), "duplicate block indices"),
@@ -219,6 +223,7 @@ def test_valid_runtime_patch_is_recognized_without_becoming_unknown_lora_patch()
     assert profile.recognized_lora_count == 0
     assert profile.unknown_patch_count == 0
     assert profile.active_patch_count == 1
+    assert profile.active_patch_keys == 0
     assert profile.runtime_patch_kinds == ("text_activation_modulation",)
     assert profile.runtime_patch_perturbation > 0.0
     assert profile.patch_perturbation >= profile.runtime_patch_perturbation
@@ -501,6 +506,10 @@ def test_malformed_runtime_state_fails_safe_to_current_actual_and_future_all_act
     assert run.contract_failures == 1
     assert run.failed_safe
 
+    fake.set_step(1, "forecast")
+    assert compat.observe_external_patch_runtime(fake, {}) is False
+    assert run.contract_failures == 1
+
 
 def test_offline_replay_does_not_reintroduce_transition_promotion():
     fake = _FakeRuntime(
@@ -509,11 +518,38 @@ def test_offline_replay_does_not_reintroduce_transition_promotion():
     )
     run = compat._compat_state(fake).run
     run.committed_active = (True,)
-    fake.set_step(4, "replay")
+    fake.set_step(4, "forecast")
     compat.observe_external_patch_runtime(fake, runtime_options(runtime_entry(sigma=0.50)))
-    assert fake._step.mode == "replay"
+    assert fake._step.mode == "forecast"
     assert run.transitions == 0
     assert run.forced_actuals == 0
+
+
+def test_predict_noise_wrapper_transaction_parity_tripwire():
+    original = compat._ORIGINAL_PREDICT_NOISE_WRAPPER
+    assert original is not None
+    base_source = inspect.getsource(original)
+    compat_source = inspect.getsource(compat._predict_noise_wrapper)
+    transaction_tokens = (
+        "runtime.begin_step(",
+        "copy_model_options_with_step(",
+        "runtime.describe_current_er_sde_step(",
+        "tracker.consume(",
+        "tracker.clear(",
+        "ForecastRetryActual",
+        "OfflineReplayAbort",
+        "ERSDETrackingError",
+        "runtime.log_offline_transition(",
+        "runtime.prepare_actual_retry(",
+        'retry_decision["actual"] = True',
+        "runtime.finalize_step(",
+        "runtime.abort_step(",
+    )
+    for token in transaction_tokens:
+        assert compat_source.count(token) == base_source.count(token), token
+    assert compat_source.index("_log_effective_step(runtime, decision)") > compat_source.index(
+        "result = execute_attempt(decision)"
+    )
 
 
 def test_transition_forced_actual_is_visible_to_er_sde_descriptor_immediately():
