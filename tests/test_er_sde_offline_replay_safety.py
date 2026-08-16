@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import types
 
+from comfyui_spectrum_h3 import external_patch_compat
 from comfyui_spectrum_h3.er_sde_offline_replay_safety import (
     _NOT_KJ,
     _strict_kj_original_callback,
     _trace_er_sde_callback,
 )
+from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
 
 
 def _synthetic_kj_callback(original_callback, *, filename="/tmp/ComfyUI-KJNodes/nodes/preview_override_node.py"):
@@ -23,6 +25,15 @@ def _synthetic_kj_callback(original_callback, *, filename="/tmp/ComfyUI-KJNodes/
     callback.__qualname__ = "_PreviewOverrideWrapper.__call__.<locals>.new_callback"
     callback.__code__ = callback.__code__.replace(co_filename=filename)
     return callback
+
+
+def test_replay_finalize_breadcrumb_wraps_effective_external_finalize():
+    current = SpectrumH3Runtime.finalize_step
+    assert getattr(current, "_spectrum_er_sde_replay_finalize_breadcrumb", False)
+    assert (
+        getattr(current, "_spectrum_er_sde_replay_finalize_original", None)
+        is external_patch_compat._runtime_finalize_step
+    )
 
 
 def test_strict_kj_callback_unwrap_preserves_underlying_callback():
