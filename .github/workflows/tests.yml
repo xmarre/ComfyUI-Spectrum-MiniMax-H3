@@ -18,6 +18,11 @@ jobs:
           - 0dd9b154a1654fc699dcdc3af066c7cce096045a
           - 5599a05fea715cb2aff11f30f5b06e16d0dfa0c4
           - 27bca654eb9a70237d93f56a6ea336ab55f8925d
+        python_version:
+          - "3.12"
+        include:
+          - comfy_ref: 27bca654eb9a70237d93f56a6ea336ab55f8925d
+            python_version: "3.13"
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
@@ -36,7 +41,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python_version }}
           cache: pip
 
       - name: Install test dependencies
