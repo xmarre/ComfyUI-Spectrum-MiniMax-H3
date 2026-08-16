@@ -346,10 +346,18 @@ def _runtime_structural_perturbation(
     return math.expm1(all_log), math.expm1(final_log)
 
 
+def _external_cache_key(
+    base_cache_key: tuple[Any, ...],
+    fingerprint: str,
+) -> tuple[Any, ...]:
+    return tuple(base_cache_key) + ("external_patch_contracts_v1", fingerprint)
+
+
 def _external_profile_from_base(
     base_lookup: Any,
     parsed: ParsedExternalPatchContracts,
     *,
+    cache_key: tuple[Any, ...],
     adjustment_started: float,
 ) -> ExternalAwareProfile:
     base = base_lookup.profile
@@ -399,10 +407,6 @@ def _external_profile_from_base(
         profile_confidence * aggregate_sensitivity
         + (1.0 - profile_confidence) * (0.35 + 0.35 * unknown_risk)
     )
-    cache_key = tuple(base.cache_key) + (
-        "external_patch_contracts_v1",
-        parsed.fingerprint,
-    )
     kinds = tuple(dict.fromkeys(value.kind for value in parsed.active_descriptors))
     adjustment_elapsed = max(0.0, time.perf_counter() - adjustment_started)
     return ExternalAwareProfile(
@@ -410,7 +414,7 @@ def _external_profile_from_base(
         cache_key=cache_key,
         patch_identity=f"{base.patch_identity}:external:{parsed.fingerprint[:16]}",
         active_patch_count=active_patch_count,
-        active_patch_keys=int(base.active_patch_keys) + runtime_count,
+        active_patch_keys=int(base.active_patch_keys),
         profile_confidence=profile_confidence,
         aggregate_sensitivity=aggregate_sensitivity,
         patch_perturbation=combined_perturbation,
@@ -442,8 +446,8 @@ def get_model_forecastability_profile_with_external_patches(model_patcher: Any) 
     )
     if not parsed.descriptors:
         return base_lookup
-    effective_key = tuple(base_lookup.profile.cache_key) + (
-        "external_patch_contracts_v1",
+    effective_key = _external_cache_key(
+        base_lookup.profile.cache_key,
         parsed.fingerprint,
     )
     with _PROFILE_CACHE_LOCK:
@@ -454,6 +458,7 @@ def get_model_forecastability_profile_with_external_patches(model_patcher: Any) 
         profile = _external_profile_from_base(
             base_lookup,
             parsed,
+            cache_key=effective_key,
             adjustment_started=started,
         )
         _PROFILE_CACHE[effective_key] = profile
@@ -528,7 +533,7 @@ def _runtime_entries(
         raise ExternalPatchContractError(
             f"{EXTERNAL_PATCH_RUNTIME_KEY} is missing or is not a sequence"
         )
-    by_id: dict[str, dict[str, Any]] = {}
+    by_id: dict[str, tuple[str, dict[str, Any]]] = {}
     for position, value in enumerate(raw):
         if not isinstance(value, dict):
             raise ExternalPatchContractError(f"runtime_state[{position}] must be a dictionary")
@@ -543,8 +548,7 @@ def _runtime_entries(
             raise ExternalPatchContractError(
                 f"duplicate runtime state for external patch instance {instance_id!r}"
             )
-        by_id[instance_id] = value
-        by_id[instance_id]["__provider_checked"] = provider
+        by_id[instance_id] = (provider, value)
 
     normalized: list[float] = []
     expected_ids = {value.instance_id for value in parsed.descriptors}
@@ -555,8 +559,8 @@ def _runtime_entries(
             f"external patch runtime/static instance mismatch missing={missing} extra={extra}"
         )
     for descriptor in parsed.descriptors:
-        value = by_id[descriptor.instance_id]
-        if value["__provider_checked"] != descriptor.provider:
+        provider, value = by_id[descriptor.instance_id]
+        if provider != descriptor.provider:
             raise ExternalPatchContractError(
                 f"external patch provider changed for instance {descriptor.instance_id!r}"
             )
