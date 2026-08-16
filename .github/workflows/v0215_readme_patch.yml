@@ -1,0 +1,32 @@
+name: v0.2.15 README patch
+
+on:
+  push:
+    branches:
+      - release/v0.2.15-continuum-interop
+    paths:
+      - .github/v0215_readme_patch.py
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch README
+        run: python .github/v0215_readme_patch.py
+      - name: Commit README
+        run: |
+          if git diff --quiet -- README.md; then
+            echo 'README already patched.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md
+          git commit -m 'Document v0.2.15 Continuum interoperability'
+          git push origin HEAD:release/v0.2.15-continuum-interop
