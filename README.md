@@ -6,6 +6,16 @@ Spectrum reduces the number of expensive H3 transformer evaluations during sampl
 
 Spectrum is an **approximate accelerator**. Forecasted steps change the denoising trajectory, so output can differ from native H3 even with the same seed and workflow.
 
+## v0.2.14: native ER-SDE offline replay safety
+
+v0.2.14 hardens native ER-SDE offline smoothing replay around a reproduced WSL hard-wedge boundary. The captured failing run completed first-pass teardown, constructed and validated the offline smoother, entered transformer-free replay, and stopped producing output after replay step 13.
+
+During **native ER-SDE offline replay only**, Spectrum now recognizes the reviewed KJNodes Model Preview Override nested callback and forwards directly to its underlying Spectrum replay callback. KJ preview remains active during the transformer-backed first-pass capture. The replay path preserves Spectrum progress/callback semantics while avoiding KJ's synchronous preview/decode and GPU-to-CPU copy work during the fast replay.
+
+The guard accepts only the reviewed KJ callback provenance and closure shape. Other sampler paths, native ER-SDE single-pass operation, and unrelated callback wrappers retain their existing behavior. Debug mode also records callback, noise-sampler, and successful replay-finalization boundary breadcrumbs so a recurring wedge can be localized more precisely.
+
+The reproduced trace identifies KJ replay preview work as the strongest narrowed protection target. It does not establish KJNodes as the proven historical root cause of the WSL wedge.
+
 ## v0.2.12: Diff-Aid H3 forecast compatibility
 
 v0.2.12 adds coordinated interoperability with **ComfyUI-DiffAid-Patches v1.0.6+** for the native MiniMax H3 sparse activation patch.
@@ -254,7 +264,9 @@ Because callback side effects must not run twice, ordinary sampler callbacks are
 
 ## Live preview
 
-The explicitly supported capture-pass preview integration is **KJNodes Model Preview Override**, typically used with Kijai's MiniMax H3 TAE. Spectrum recognizes the `kj_preview_override` wrapper as observational and keeps it active during capture/replay.
+The explicitly supported capture-pass preview integration is **KJNodes Model Preview Override**, typically used with Kijai's MiniMax H3 TAE. Spectrum recognizes the `kj_preview_override` wrapper as observational.
+
+With native ER-SDE plus `offline_smoothing_replay=true`, v0.2.14 keeps KJ preview active during the first-pass capture and bypasses the KJ preview wrapper during transformer-free replay while preserving Spectrum's underlying replay callback/progress semantics. Other supported paths retain their existing preview behavior.
 
 Built-in ComfyUI preview callbacks, ComfyUI-bleh Better Previews, VHS Preview and other callback-based preview implementations are not currently guaranteed to update during the capture pass.
 
@@ -333,6 +345,9 @@ Spectrum H3 external patch transition step=... transitions=... action=force_actu
 Spectrum H3 ER-SDE stochastic tracking active ...
 Spectrum H3 ER-SDE dense anchor ...
 Spectrum H3 ER-SDE dense output ...
+Spectrum H3 offline transition ... event=er_sde_replay_preview_bypass ...
+Spectrum H3 offline transition ... event=er_sde_callback_begin|er_sde_callback_end ...
+Spectrum H3 ER-SDE replay boundary event=noise_sampler_begin|noise_sampler_end ...
 Spectrum H3 run summary ... external_patch_transitions=... external_patch_forced_actuals=... external_patch_contract_failures=...
 Spectrum H3 teardown transition ...
 Spectrum H3 run teardown ...
