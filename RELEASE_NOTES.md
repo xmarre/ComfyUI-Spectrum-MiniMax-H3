@@ -75,7 +75,7 @@ The reconciled Continuum interop in PR #61 passed the complete repository CI mat
 - Diff-Aid coexistence completed with zero external-patch contract failures;
 - sampling, VAE decode, Continuum assembly, downstream processing, and final video output completed.
 
-The ER-SDE prefix fix in PR #62 passed the full five-lane matrix — four reviewed ComfyUI revisions on Python 3.12 plus the current Python 3.13 lane — including forecaster smoke, Ruff/compileall, focused compatibility suites, and the full native MiniMax H3 tests. CodeRabbit's final review reported no actionable findings.
+The ER-SDE prefix fix in PR #62 passed the full five-lane matrix — four reviewed ComfyUI revisions on Python 3.12 plus the current Python 3.13 lane — including forecaster smoke, Ruff/compileall, focused compatibility suites, and the full native MiniMax H3 tests. PR #62's final CodeRabbit review reported no actionable findings.
 
 A final real Continuum + native ER-SDE runtime gate used **2 × 5-second chunks** with Model Preview Override. The previously reproducible third-step / Spectrum `step=2` confetti was gone.
 
