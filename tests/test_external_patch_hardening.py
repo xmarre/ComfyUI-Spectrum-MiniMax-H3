@@ -43,9 +43,7 @@ def test_runtime_validation_does_not_mutate_producer_owned_metadata():
     transformer_options = {compat.EXTERNAL_PATCH_RUNTIME_KEY: (entry,)}
     before = copy.deepcopy(transformer_options)
 
-    assert hardening._runtime_entries_without_mutation(
-        transformer_options, parsed
-    ) == pytest.approx((0.5,))
+    assert compat._runtime_entries(transformer_options, parsed) == pytest.approx((0.5,))
     assert transformer_options == before
 
 
@@ -67,37 +65,16 @@ def test_malformed_profile_metadata_returns_base_profile_until_runtime_fail_safe
     assert hardening.get_model_forecastability_profile_fail_safe(object()) is sentinel
 
 
-def test_external_profile_keeps_parameter_patch_key_count_separate(monkeypatch):
-    base = SimpleNamespace(active_patch_keys=7)
-    profile = compat.ExternalAwareProfile(
-        base=base,
-        cache_key=("base", "external"),
-        patch_identity="identity",
-        active_patch_count=3,
-        active_patch_keys=9,
-        profile_confidence=0.8,
-        aggregate_sensitivity=0.5,
-        patch_perturbation=0.2,
-        final_block_perturbation=0.2,
-        forecast_risk_prior=0.4,
-        build_seconds=0.0,
-        estimated_bytes=0,
-        transient_workspace_bytes=0,
-        recognized_runtime_patch_count=2,
-        runtime_patch_kinds=("text_activation_modulation",),
-        runtime_patch_perturbation=0.2,
-        runtime_final_block_perturbation=0.2,
-        external_contract_fingerprint="fingerprint",
-    )
-    monkeypatch.setattr(
-        hardening,
-        "_ORIGINAL_EXTERNAL_PROFILE_BUILDER",
-        lambda *args, **kwargs: profile,
-    )
+def test_hardening_install_requires_compat_prerequisite(monkeypatch):
+    monkeypatch.setattr(hardening, "_INSTALLED", False)
+    monkeypatch.setattr(compat, "_INSTALLED", False)
+    monkeypatch.setattr(compat, "_ORIGINAL_PROFILE_LOOKUP", None)
 
-    adjusted = hardening._profile_builder_with_runtime_key_semantics()
-    assert adjusted.active_patch_keys == 7
-    assert adjusted.recognized_runtime_patch_count == 2
+    with pytest.raises(
+        RuntimeError,
+        match=r"requires install_external_patch_compat\(\) first",
+    ):
+        hardening.install_external_patch_hardening()
 
 
 def test_clearing_model_profile_cache_also_clears_external_cache(monkeypatch):
