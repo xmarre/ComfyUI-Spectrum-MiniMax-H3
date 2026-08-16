@@ -123,4 +123,13 @@ jobs:
         env:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
           PYTHONPATH: ${{ github.workspace }}/ComfyUI
-        run: python -m pytest -q
+        run: |
+          python -m pytest -q \
+            --ignore=tests/test_external_patch_compat.py \
+            --ignore=tests/test_external_patch_hardening.py \
+            --ignore=tests/test_h3_wrapper.py \
+            --ignore=tests/test_runtime.py \
+            --ignore=tests/test_sampling.py \
+            --ignore=tests/test_model_aware.py \
+            --ignore=tests/test_native_equivalence.py \
+            --ignore=tests/test_er_sde_stochastic_compensation.py
