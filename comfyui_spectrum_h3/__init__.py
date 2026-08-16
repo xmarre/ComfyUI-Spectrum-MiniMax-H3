@@ -38,7 +38,7 @@ install_external_patch_hardening()
 # External compatibility wraps the already-installed safe end-run hook. Preserve
 # the inner implementation's identity and expose the effective outermost hook
 # separately so teardown invariants can verify both layers of the chain.
-from . import postrun_safety as _postrun_safety  # noqa: E402
+from . import postrun_safety as _postrun_safety
 
 _postrun_safety.EFFECTIVE_END_RUN_HOOK = SpectrumH3Runtime.end_run
 
