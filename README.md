@@ -6,6 +6,18 @@ Spectrum reduces the number of expensive H3 transformer evaluations during sampl
 
 Spectrum is an **approximate accelerator**. Forecasted steps change the denoising trajectory, so output can differ from native H3 even with the same seed and workflow.
 
+## v0.2.15: H3 Continuum interoperability
+
+v0.2.15 adds first-class interoperability with **H3 Continuum** through its optional API v1 actual-prefix request. Continuation chunks can require their initial solver steps to remain real H3 transformer evaluations; Spectrum treats that as a run-local scheduling constraint without adding a hard dependency on Continuum.
+
+The prefix applies to ordinary sampling, single-pass fallback, and the offline-smoothing first pass, while transformer-free offline replay remains prefix-free. Invalid, inactive, malformed, negative, or unknown-API metadata leaves normal Spectrum behavior unchanged. Prefix state is scoped to one sampling call and cannot leak into later continuation chunks.
+
+The interop composes with Diff-Aid's external-patch transition contract. If a Diff-Aid hard transition lands on an already-prefix-protected step, the transition is observed without adding a duplicate H3 evaluation.
+
+This release also fixes the native ER-SDE edge case exposed by a two-step Continuum prefix. When the first forecast follows consecutive exact actual anchors, Spectrum now uses the newest exact solver-space denoised anchor as a hold instead of falling back to the older direct pending-`q` correction. Later forecasts retain bounded lambda-space extrapolation; offline replay retains its separate exact-`q` path. Native ER-SDE RNG/stochastic ownership and the no-extra-NFE contract are unchanged.
+
+Real validation used Continuum continuation chunks with Model Preview Override. The previously reproducible confetti on the first post-prefix forecast / third preview step is gone.
+
 ## v0.2.14: native ER-SDE offline replay safety
 
 v0.2.14 hardens native ER-SDE offline smoothing replay around a reproduced WSL hard-wedge boundary. The captured failing run completed first-pass teardown, constructed and validated the offline smoother, entered transformer-free replay, and stopped producing output after replay step 13.
