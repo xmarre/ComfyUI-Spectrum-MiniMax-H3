@@ -267,20 +267,11 @@ class ERSDEStochasticTracker:
         return increment
 
     def _causal_dense_output_ready(self, descriptor: ERSDEStepDescriptor) -> bool:
-        """Enable dense output only once exact actual-anchor cadence proves it safe."""
+        """Enable solver-space output for a causal forecast after an exact actual anchor."""
         if descriptor.mode != "forecast" or not self._denoised_anchors:
             return False
         latest = self._denoised_anchors[-1]
-        if descriptor.step_id != latest.step_id + 1:
-            return False
-        if len(self._denoised_anchors) == 1:
-            # The reviewed one-point bootstrap is exactly actual step 0 -> forecast step 1.
-            return latest.step_id == 0 and descriptor.step_id == 1
-        previous = self._denoised_anchors[-2]
-        # After any causal forecast, ER-SDE forces an actual refresh. A gap of at
-        # least two between exact anchors proves that this history has crossed a
-        # forecast interval rather than being only warmup/all-actual history.
-        return latest.step_id - previous.step_id >= 2
+        return descriptor.step_id == latest.step_id + 1
 
     def consume(
         self,
@@ -424,11 +415,6 @@ class ERSDEStochasticTracker:
                 "ER-SDE dense-output anchor does not match the current packed denoised tensor"
             )
 
-        latest_coordinate = self._solver_coordinates.get(latest.step_id)
-        target_coordinate = self._solver_coordinates.get(descriptor.step_id)
-        if latest_coordinate is None or target_coordinate is None:
-            return None
-
         if len(self._denoised_anchors) == 1:
             predicted = latest.value.clone(memory_format=torch.contiguous_format)
             return ERSDEDenseOutputPrediction(
@@ -447,8 +433,28 @@ class ERSDEStochasticTracker:
             raise ERSDEDenseOutputError(
                 "ER-SDE dense-output actual anchor tensors are incompatible"
             )
+
+        # Consecutive actual anchors are warmup/prefix history, not evidence of a
+        # previously crossed forecast interval. Do not feed the skipped H3 forecast
+        # back to ER-SDE and do not extrapolate from this cadence: hold the newest
+        # exact solver-space denoised anchor for the first post-prefix forecast.
+        if latest.step_id - previous.step_id == 1:
+            predicted = latest.value.clone(memory_format=torch.contiguous_format)
+            return ERSDEDenseOutputPrediction(
+                value=predicted,
+                mode="latest_actual_hold_consecutive_anchors",
+                anchor_steps=(latest.step_id,),
+                alpha=0.0,
+            )
+
+        latest_coordinate = self._solver_coordinates.get(latest.step_id)
+        target_coordinate = self._solver_coordinates.get(descriptor.step_id)
         previous_coordinate = self._solver_coordinates.get(previous.step_id)
-        if previous_coordinate is None:
+        if (
+            latest_coordinate is None
+            or target_coordinate is None
+            or previous_coordinate is None
+        ):
             predicted = latest.value.clone(memory_format=torch.contiguous_format)
             return ERSDEDenseOutputPrediction(
                 value=predicted,
@@ -456,6 +462,7 @@ class ERSDEStochasticTracker:
                 anchor_steps=(latest.step_id,),
                 alpha=0.0,
             )
+
         denominator = latest_coordinate - previous_coordinate
         advance = target_coordinate - latest_coordinate
         alpha = advance / denominator
