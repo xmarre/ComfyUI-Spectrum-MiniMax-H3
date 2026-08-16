@@ -1,5 +1,6 @@
 from pathlib import Path
 
+# Temporary one-shot helper for PR #62 test reconciliation.
 path = Path("tests/test_er_sde_stochastic_compensation.py")
 text = path.read_text(encoding="utf-8")
 
