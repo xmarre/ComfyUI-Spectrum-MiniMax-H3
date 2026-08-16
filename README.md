@@ -6,9 +6,21 @@ Spectrum reduces the number of expensive H3 transformer evaluations during sampl
 
 Spectrum is an **approximate accelerator**. Forecasted steps change the denoising trajectory, so output can differ from native H3 even with the same seed and workflow.
 
+## v0.2.12: Diff-Aid H3 forecast compatibility
+
+v0.2.12 adds coordinated interoperability with **ComfyUI-DiffAid-Patches v1.0.6+** for the native MiniMax H3 sparse activation patch.
+
+Diff-Aid now publishes a versioned pure-data descriptor plus the exact normalized sigma already used by its own H3 timestep wrapper. Spectrum uses that contract to distinguish deterministic text-activation modulation from LoRA/model-parameter patches, keep patched/unpatched cache identities separate, and protect hard sigma-window regime changes with a real anchor when necessary.
+
+The compatibility metadata does **not** inflate Spectrum's calibrated parameter-space model-aware patch prior. Raw Diff-Aid structural magnitude remains visible as separate runtime telemetry while normal online trajectory evidence continues to govern model-aware scheduling. This avoids the development regression where a five-block Diff-Aid patch at strength `0.5` saturated static patch risk and caused 10 unnecessary transformer NFEs.
+
+Real 20-step native ER-SDE validation preserved the normal **11 actual + 9 forecast** schedule with `model_aware_extra_nfes=0` for both a full `[0,1]` hard window and a `[0,0.95]` hard window. The `0.95` run detected its off→on boundary at normalized sigma `0.947368` on an already-actual step, so the transition added no NFE.
+
+In the tested multi-shot prompt, `sigma_end=0.95` retained Diff-Aid's stronger prompt adherence while restoring the intended cut between the first and later shots compared with full-window activation. Treat that as an empirical workflow result rather than a universal model default.
+
 ## v0.2.11: native ER-SDE quality fix
 
-v0.2.11 fixes the characteristic high-frequency / "confetti" corruption that could appear on Spectrum forecast steps with native ER-SDE.
+v0.2.11 fixes the characteristic high-frequency / "confetti" corruption on Spectrum forecast steps with native ER-SDE.
 
 The problem was not simply ER-SDE's random increment. A skipped H3 hidden/velocity forecast was being reconstructed against ER-SDE's current stochastic latent as if it were a valid current-state denoised/x0 estimate. ER-SDE then consumed that inconsistent value in its own solver update and higher-order derivative history.
 
@@ -97,7 +109,7 @@ For quality-critical work, compare Spectrum enabled/disabled with the exact same
 
 Keep the defaults unless you have a reason to change them.
 
-`offline_smoothing_replay=true` uses a compute-heavy causal capture pass followed by a transformer-free replay. It was introduced to preserve audio fidelity after matched H3 testing showed that direct audio spectral mixing and later joint H3 evaluations could cause speech/stutter regressions. The default keeps `audio_blend_weight=0.0`.
+`offline_smoothing_replay=true` uses a compute-heavy causal capture pass followed by a transformer-free replay. It was introduced to preserve audio fidelity after matched H3 testing showed speech/stutter regressions from direct audio spectral mixing and from later joint H3 evaluations. The default keeps `audio_blend_weight=0.0`.
 
 ### Native ER-SDE quality path
 
@@ -206,6 +218,29 @@ That is 11 actual evaluations and 9 forecasts. Fallbacks, model-aware scheduling
 
 The shipping full-mode generic controller uses signed coordinate transport with scalar RLS and a hard `±0.40` gain bound. More experimental reliability/regional controller options remain available for research/reproduction but are not the production default.
 
+## Deterministic external activation patches
+
+Spectrum can consume a versioned, pure-data compatibility contract from recognized MiniMax H3 patches that deterministically modify transformer activations. The first supported producer is the MiniMax H3 node in **ComfyUI-DiffAid-Patches v1.0.6+**. The descriptor contributes external-runtime identity and cache fingerprinting so patched and unpatched models cannot alias the same cached profile. Recognized activation modulation is reported separately from LoRA/model-parameter patches.
+
+The raw structural magnitude of a recognized activation patch is telemetry, not a calibrated parameter-space perturbation metric. It is therefore retained as `external_patch_runtime_perturbation` / `external_patch_final_perturbation` but is not folded into Spectrum's model-aware `patch_risk` prior. Online trajectory evidence still participates normally in model-aware scheduling.
+
+For a nonzero external patch with a partial hard sigma window (`sigma_ramp=0`), Spectrum compares the exact normalized-sigma active/inactive state supplied by the producer against the last successfully completed solver step. If the current call is the first call in a new hard modulation regime and it was scheduled as a forecast, Spectrum promotes that **current step** to one actual H3 evaluation so the forecast history immediately receives an anchor from the new regime. The state is committed only after successful step finalization; abort/retry/rollback do not advance it early. Multiple contracts crossing on the same step still require only one actual evaluation.
+
+A full `[0,1]` window has no interior transition and adds no compatibility NFE. Smooth `sigma_ramp>0` modulation remains continuous and does not force refreshes solely because its gain changes. The hard-boundary guard remains active when `model_aware_mode=off` because it is a forecast-correctness rule rather than an optional scheduling heuristic.
+
+This mechanism is independent of the native ER-SDE stochastic-state compensation described above. Diff-Aid is deterministic activation modulation; Spectrum does not reuse ER-SDE stochastic compensation for it. Spectrum also does **not** post-hoc multiply or otherwise scale the forecasted `[audio | video]` target feature to imitate Diff-Aid. The external modulation occurs before selected transformer blocks and is transformed nonlinearly by the remaining network, so the compatible action at a declared discontinuity is to acquire a real anchor.
+
+Validated workflow order:
+
+```text
+Load Diffusion Model
+-> MiniMax H3 Diff-Aid Sparse Patch
+-> Spectrum Apply MiniMax H3
+-> guider / scheduler
+```
+
+In current real testing, a five-block Diff-Aid H3 patch (`1,13,25,37,50`) at strength `0.5` preserved Spectrum's 11-actual / 9-forecast ER-SDE schedule for both `sigma_end=1.0` and `sigma_end=0.95`, with zero model-aware extra NFEs. `sigma_end=0.95` also preserved the intended shot cut in the tested multi-shot prompt while retaining Diff-Aid's prompt-adherence enhancement.
+
 ## Offline smoothing replay
 
 With `offline_smoothing_replay=true`, Spectrum performs two sampler passes:
@@ -292,16 +327,18 @@ Enable `debug=true` before reporting a sampler problem. Useful messages include:
 
 ```text
 Spectrum H3 run start ...
+Spectrum H3 external patch profile provider=... instance=... kind=... strength=... blocks=... final_block=... sigma_window=... sigma_ramp=...
 Spectrum H3 step ... decision=actual|forecast ...
+Spectrum H3 external patch transition step=... transitions=... action=force_actual|already_actual
 Spectrum H3 ER-SDE stochastic tracking active ...
 Spectrum H3 ER-SDE dense anchor ...
 Spectrum H3 ER-SDE dense output ...
-Spectrum H3 run summary ...
+Spectrum H3 run summary ... external_patch_transitions=... external_patch_forced_actuals=... external_patch_contract_failures=...
 Spectrum H3 teardown transition ...
 Spectrum H3 run teardown ...
 ```
 
-If Spectrum encounters an unreviewed sampler/wrapper contract it should log the reason and run native rather than silently applying an unsafe approximation.
+If Spectrum encounters an unreviewed sampler/wrapper contract it should log the reason and run native rather than silently applying an unsafe approximation. Malformed declared external compatibility metadata fails safe to all-actual sampling for that run rather than aborting an otherwise valid generation.
 
 For bug reports, include:
 
@@ -316,9 +353,9 @@ For bug reports, include:
 
 ## Compatibility notes for saved workflows
 
-ComfyUI serializes node widget values. Updating Spectrum therefore does not necessarily rewrite old saved settings to current defaults.
+ComfyUI serializes node widget values. Updating Spectrum does not rewrite existing serialized workflow widget values to current defaults.
 
-In particular, workflows saved on older releases may retain old values for `offline_smoothing_replay`, model-aware options, or generic-correction settings. Compare the saved node against the defaults above when reproducing behavior across versions.
+In particular, workflows saved on older releases retain the serialized values they already contain for `offline_smoothing_replay`, model-aware options, or generic-correction settings. Compare the saved node against the defaults above when reproducing behavior across versions.
 
 ## License
 

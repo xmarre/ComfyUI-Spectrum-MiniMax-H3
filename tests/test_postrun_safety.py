@@ -4,6 +4,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+from comfyui_spectrum_h3 import external_patch_compat as external_compat
 from comfyui_spectrum_h3 import postrun_safety as postrun
 from comfyui_spectrum_h3.generic_correction_calibration import GenericCalibrationState
 from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
@@ -132,5 +133,6 @@ def test_background_research_failure_releases_single_worker_slot(monkeypatch):
     postrun._RESEARCH_SLOT.release()
 
 
-def test_installed_runtime_end_run_uses_postrun_safety():
-    assert SpectrumH3Runtime.end_run is postrun._safe_end_run
+def test_installed_runtime_end_run_preserves_postrun_chain_identity():
+    assert SpectrumH3Runtime.end_run is postrun.EFFECTIVE_END_RUN_HOOK
+    assert external_compat._ORIGINAL_END_RUN is postrun._safe_end_run

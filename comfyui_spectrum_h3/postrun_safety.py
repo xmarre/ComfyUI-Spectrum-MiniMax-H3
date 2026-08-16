@@ -158,8 +158,14 @@ def _safe_end_run(self: SpectrumH3Runtime, run_id: int) -> None:
         )
 
 
+# Keep the post-run implementation's identity stable. Later compatibility layers
+# may wrap SpectrumH3Runtime.end_run and publish that outermost callable here.
+EFFECTIVE_END_RUN_HOOK = _safe_end_run
+
+
 def install_postrun_safety() -> None:
     """Replace the synchronous generic-correction end hook once per interpreter."""
+    global EFFECTIVE_END_RUN_HOOK
     if getattr(SpectrumH3Runtime, "_postrun_safety_installed", False):
         return
     current = SpectrumH3Runtime.end_run
@@ -169,6 +175,7 @@ def install_postrun_safety() -> None:
         )
     SpectrumH3Runtime.end_run = _safe_end_run
     SpectrumH3Runtime._postrun_safety_installed = True
+    EFFECTIVE_END_RUN_HOOK = SpectrumH3Runtime.end_run
 
 
-__all__ = ["install_postrun_safety"]
+__all__ = ["EFFECTIVE_END_RUN_HOOK", "install_postrun_safety"]

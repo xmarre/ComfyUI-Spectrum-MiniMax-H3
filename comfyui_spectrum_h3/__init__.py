@@ -1,6 +1,8 @@
 from .config import AGGRESSIVE_PRESET, CONSERVATIVE_PRESET, SpectrumH3Config
 from .er_sde_offline_replay_safety import install_er_sde_offline_replay_safety
 from .er_sde_policy import install_er_sde_tail_policy
+from .external_patch_compat import install_external_patch_compat
+from .external_patch_hardening import install_external_patch_hardening
 from .forecast import HistoryWeightForecaster
 from .generic_correction import install_generic_residual_correction
 from .minimax_h3 import locate_minimax_h3_inner, require_native_minimax_h3
@@ -32,6 +34,15 @@ install_replay_calibration_validation()
 install_replay_calibration_provenance()
 install_er_sde_tail_policy()
 install_er_sde_offline_replay_safety()
+install_external_patch_compat()
+install_external_patch_hardening()
+
+# External compatibility wraps the already-installed safe end-run hook. Preserve
+# the inner implementation's identity and expose the effective outermost hook
+# separately so teardown invariants can verify both layers of the chain.
+from . import postrun_safety as _postrun_safety
+
+_postrun_safety.EFFECTIVE_END_RUN_HOOK = SpectrumH3Runtime.end_run
 
 __all__ = [
     "AGGRESSIVE_PRESET",
