@@ -35,12 +35,12 @@ install_er_sde_tail_policy()
 install_external_patch_compat()
 install_external_patch_hardening()
 
-# External compatibility extends the already-installed safe end-run wrapper.
-# Keep the postrun module's installed-function identity synchronized so its
-# teardown invariant and tests continue to describe the effective runtime hook.
-from . import postrun_safety as _postrun_safety
+# External compatibility wraps the already-installed safe end-run hook. Preserve
+# the inner implementation's identity and expose the effective outermost hook
+# separately so teardown invariants can verify both layers of the chain.
+from . import postrun_safety as _postrun_safety  # noqa: E402
 
-_postrun_safety._safe_end_run = SpectrumH3Runtime.end_run
+_postrun_safety.EFFECTIVE_END_RUN_HOOK = SpectrumH3Runtime.end_run
 
 __all__ = [
     "AGGRESSIVE_PRESET",
