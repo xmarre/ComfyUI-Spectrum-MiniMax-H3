@@ -146,16 +146,19 @@ def test_extrapolation_guard_uses_latest_actual_hold_instead_of_noisy_raw_foreca
     assert not tracker.has_pending
 
 
-def test_consecutive_warmup_anchors_preserve_existing_exact_q_path_for_first_forecast():
+def test_consecutive_actual_prefix_anchors_hold_latest_actual_for_first_forecast():
     tracker = _tracker()
-    tracker.consume(torch.tensor([[1.0, 2.0]]), _descriptor(0, mode="actual"))
+    actual0 = torch.tensor([[1.0, 2.0]])
+    tracker.consume(actual0, _descriptor(0, mode="actual"))
+
     _produce_pending(
         tracker,
         lambda_source=10.0,
         lambda_target=7.0,
         sigma_next=0.8,
     )
-    tracker.consume(torch.tensor([[2.0, 3.0]]), _descriptor(1, mode="actual"))
+    actual1 = torch.tensor([[2.0, 3.0]])
+    tracker.consume(actual1, _descriptor(1, mode="actual"))
 
     q2 = _produce_pending(
         tracker,
@@ -163,10 +166,11 @@ def test_consecutive_warmup_anchors_preserve_existing_exact_q_path_for_first_for
         lambda_target=4.0,
         sigma_next=0.6,
     )
-    base = torch.tensor([[4.0, 5.0]])
-    returned2 = tracker.consume(base + q2, _descriptor(2))
+    raw_forecast = torch.tensor([[100.0, -100.0]]) + q2
+    returned2 = tracker.consume(raw_forecast, _descriptor(2))
 
-    torch.testing.assert_close(returned2, base, rtol=0, atol=1e-6)
+    torch.testing.assert_close(returned2, actual1, rtol=0, atol=0)
+    assert not tracker.has_pending
     assert tracker.denoised_anchor_steps == (0, 1)
 
 
