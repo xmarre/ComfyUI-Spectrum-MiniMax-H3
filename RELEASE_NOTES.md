@@ -1,107 +1,99 @@
-# Spectrum MiniMax H3 v0.2.11
+# Spectrum MiniMax H3 v0.2.12
 
-v0.2.11 fixes native ER-SDE forecast-state corruption, removes the characteristic high-frequency/confetti artifact from Spectrum ER-SDE forecast steps, hardens sampler-wrapper compatibility, and prevents optional post-run research from blocking an already-completed generation.
+v0.2.12 adds coordinated MiniMax H3 interoperability with ComfyUI-DiffAid-Patches v1.0.6. Spectrum now understands Diff-Aid's deterministic text-activation modulation as a versioned runtime contract, protects hard sigma-window regime changes with a real anchor when necessary, and keeps the normal Spectrum acceleration budget instead of misclassifying Diff-Aid modulation strength as parameter-space model risk.
 
-## Native ER-SDE solver-space fix
+## Diff-Aid H3 interoperability
 
-Earlier Spectrum ER-SDE forecast steps predicted H3 hidden/velocity state without evaluating the current stochastic latent, then reconstructed denoised/x0 against ER-SDE's current `x`. Direct subtraction of the pending stochastic increment corrected one real mismatch term but did not remove the visible artifact in real MiniMax H3 testing.
+The supported workflow order is:
 
-The stronger mismatch was solver-space consistency: ER-SDE consumes and differentiates denoised/x0 values in its update/history, while the skipped H3 hidden forecast was not a valid current-state denoised observation.
+```text
+Load Diffusion Model
+-> MiniMax H3 Diff-Aid Sparse Patch
+-> Spectrum Apply MiniMax H3
+-> guider / scheduler
+```
 
-v0.2.11 therefore keeps native ER-SDE's stochastic latent trajectory unchanged and reconstructs skipped solver-facing denoised/x0 values from exact actual denoised anchors:
+ComfyUI-DiffAid-Patches v1.0.6 publishes a pure-data descriptor for each enabled, nonzero H3 sparse patch and exposes the exact per-call normalized sigma already used by Diff-Aid's own timestep wrapper. Spectrum consumes that metadata without depending on Diff-Aid internals.
 
-- the first causal forecast after one exact actual anchor uses the latest exact actual denoised value;
-- later causal forecasts use bounded linear dense output in native ER-SDE lambda coordinate from the two latest exact actual anchors;
-- degenerate, reversed, non-finite, or excessively long extrapolation falls back to the latest exact actual anchor;
-- native `s_noise`, RNG draws, stochastic latent updates, stage-2/stage-3 history and terminal behavior remain intact;
-- there are zero additional H3 transformer/denoiser NFEs.
+The v1 contract describes the producer, patch kind, MiniMax H3 architecture, unique patch instance, resolved 0-based block indices, model block count, strength, sigma window/ramp, token weighting, conditional-only mode and text-modulation scope. Runtime entries identify the same instance and carry the normalized sigma for the current model call.
 
-The dense output is substituted before native ER-SDE's callback, integration update, derivative history and `old_denoised` assignment.
+The contract contains no model objects or retained tensors.
+
+## Hard sigma-window correctness
+
+For a partial hard window (`sigma_ramp=0`), Spectrum compares the producer's exact active/inactive state with the last successfully finalized solver step.
+
+If a patch crosses a hard on/off boundary on a step that Spectrum had scheduled as a forecast, that current step is promoted to one actual H3 evaluation so forecast history immediately receives an anchor from the new modulation regime.
+
+The transition state is committed only after successful step finalization. Retry, abort and rollback paths therefore cannot advance the external-patch regime early. Multiple contracts crossing on the same solver step still require at most one promoted actual evaluation.
+
+A full `[0,1]` hard window has no interior transition and adds no compatibility NFE. Smooth `sigma_ramp>0` modulation remains continuous and is not converted into forced refreshes solely because its gain changes.
+
+The hard-boundary guard is independent of `model_aware_mode`; it remains active even when model-aware scheduling is off because it is a forecast-correctness rule.
+
+## Model-aware risk separation
+
+Real testing exposed an important calibration error during development: the first consumer implementation accumulated Diff-Aid's activation-modulation strength across affected blocks and fed that raw structural magnitude into Spectrum's parameter-space model-aware patch prior.
+
+A five-block H3 patch at strength `0.5` produced raw structural telemetry of `2.112114`, saturated `patch_risk=1.0`, and turned a normal 20-step ER-SDE run into 16 actual + 4 forecast steps with 10 unnecessary model-aware NFEs.
+
+v0.2.12 fixes the semantics at the profile source:
+
+- recognized external activation patches still contribute to patch/runtime counts and cache identity;
+- their raw structural magnitude remains available as `external_patch_runtime_perturbation` telemetry;
+- they do not inflate the calibrated parameter-space `patch_perturbation`, `final_block_perturbation`, profile confidence or forecast-risk prior;
+- ordinary online Spectrum trajectory evidence remains free to request actual evaluations when the observed trajectory itself becomes risky.
+
+This keeps the safety mechanisms that are calibrated to Spectrum's trajectory while removing a unit/meaning mismatch between Diff-Aid activation strength and parameter-patch perturbation.
 
 ## Real MiniMax H3 validation
 
-The solver-space candidate was tested on real native MiniMax H3 ER-SDE generations after the simpler exact-q candidate failed visually.
+The final producer/consumer pair was validated in restarted ComfyUI on native MiniMax H3 with ER-SDE, 20 steps, `model_aware_mode=full`, using the five-block Diff-Aid H3 patch `1,13,25,37,50` at strength `0.5`.
 
-Observed result:
+Three matched runs produced:
 
-- forecast confetti/noise disappeared completely;
-- final fine/low-resolution visual structure improved modestly but visibly across repeated generations;
-- action/motion remained comparable in the tested prompts;
-- audio remained comparable;
-- the normal 20-step Spectrum budget remained 11 actual H3 evaluations + 9 forecasts;
-- no additional H3 transformer NFE was introduced.
+| Run | Diff-Aid window | Actual / forecast | Sampler time | Compatibility result |
+|---|---|---:|---:|---|
+| Spectrum control | Diff-Aid inactive | 11 / 9 | 187.236 s | no external contract |
+| Diff-Aid full window | `[0.0, 1.0]`, ramp 0 | 11 / 9 | 189.001 s | 0 transitions, 0 forced actuals |
+| Diff-Aid partial window | `[0.0, 0.95]`, ramp 0 | 11 / 9 | 184.946 s | 1 transition, 0 forced actuals |
 
-A later T2V rerun from an older saved workflow also completed normally after the teardown hardening below.
+The partial-window run detected the exact off→on boundary at normalized sigma `0.947368` on solver step 8. That step was already an actual refresh, so the transition required no additional H3 transformer call.
 
-## Native stochastic ownership and replay safety
+All three runs retained the normal 11 actual + 9 forecast budget and reported `model_aware_extra_nfes=0`. The small runtime differences are within normal run-to-run variance; the compatibility path itself did not introduce a meaningful sampling penalty.
 
-Spectrum still tracks ER-SDE's exact additive stochastic increment so ownership is explicit across actual, forecast and replay paths. The stochastic increment remains part of native ER-SDE's latent `x`; Spectrum does not disable, globally attenuate or rescale native ER-SDE noise.
+In the tested multi-shot prompt, Diff-Aid retained its stronger prompt-following/visual prompt representation. Full-window activation changed the intended shot transition into a more continuous shot, while `sigma_end=0.95` restored the intended cut between the first and later shots while retaining the prompt-adherence enhancement. This is an empirical workflow result rather than a universal model default.
 
-Replay and compatibility paths retain exact stochastic compensation where solver-space dense output is not the reviewed causal path.
+## Fail-safe behavior
 
-`s_noise=0` remains on the untouched native path without stochastic tracker allocation.
+Declared compatibility metadata is validated strictly. Malformed or inconsistent external metadata does not abort an otherwise valid generation; Spectrum fails safe to all-actual sampling for that run and records a contract failure.
 
-## TiledDiffusion sampler-wrapper compatibility
+Validation covers schema/provider/instance identity, architecture/kind/scope, block mappings, model block count, scalar ranges, runtime instance ordering and finite normalized sigma values. Runtime metadata is validated without mutating producer-owned dictionaries.
 
-Real runtime testing exposed ComfyUI-TiledDiffusion's variadic `KSAMPLER_sample(*args, **kwargs)` monkeypatch above ComfyUI's native `KSAMPLER.sample`.
+Unknown external model modifications that do not publish the reviewed contract remain outside this compatibility path.
 
-The ER-SDE preflight now supports that audited passthrough structure without broadly trusting arbitrary wrappers. The semantic validator:
+## Transaction and teardown hardening
 
-- verifies exact `*args/**kwargs` delegation;
-- validates the stored native target recursively;
-- verifies the reviewed TiledDiffusion `model_options` / `sigmas` bookkeeping shape;
-- rejects changed argument forwarding, alias mutation, cycles and unrelated state mutation;
-- still fails closed to untouched native sampling when the wrapper contract cannot be proven.
+The compatibility layer preserves Spectrum's existing transaction order around model execution, ER-SDE consumption, retries, finalization and abort handling. A dedicated transaction-parity tripwire compares the critical native and compatibility operation ordering so future sampling edits cannot silently diverge.
 
-## Post-run teardown safety
+The compatibility end-run wrapper also preserves the underlying post-run safety hook as a distinct callable rather than rebinding it, keeping the teardown invariant auditable.
 
-A real saved-workflow run later hard-wedged WSL after all ER-SDE solver steps and the Spectrum run summary had completed, before `Spectrum H3 run teardown` or downstream VAE/video nodes appeared.
+Offline replay does not re-promote hard transitions already handled during the causal capture pass.
 
-The old generic-correction hook performed optional persistence/evaluation synchronously inside `SpectrumH3Runtime.end_run()`. A filesystem/evaluator stall could therefore block a valid completed sampler result from reaching downstream nodes.
+## Compatibility requirements
 
-v0.2.11 changes the boundary:
+- Spectrum MiniMax H3: **v0.2.12 or newer**
+- ComfyUI-DiffAid-Patches: **v1.0.6 or newer** for the producer half of this contract
+- Native MiniMax H3 packed-model path as already required by Spectrum
 
-- calibration-block export remains synchronous and bounded;
-- core Spectrum runtime/history release remains synchronous;
-- optional generic-correction persistence/evaluation is dispatched only after runtime release;
-- the research worker is daemonized and bounded to one active job;
-- if a previous research job is still active, later diagnostic jobs are skipped rather than accumulating threads;
-- the research worker receives only a tensor-free calibration block and cannot retain Spectrum feature-history VRAM;
-- teardown debug breadcrumbs identify calibration export, runtime release and research dispatch boundaries.
+Older Diff-Aid releases do not publish the compatibility descriptor/runtime sigma metadata and therefore do not provide this coordinated path.
 
-No speculative `torch.cuda.empty_cache()`, forced CUDA synchronization, or history offload was added.
-
-## README refresh
-
-The README has been rewritten around the current production behavior and now documents:
-
-- the v0.2.11 ER-SDE solver-space path;
-- current Python defaults and recommended ER-SDE quality settings;
-- supported samplers and fail-closed behavior;
-- TiledDiffusion compatibility;
-- model-aware/generic-correction defaults;
-- offline replay and live-preview behavior;
-- attention/cache compatibility;
-- memory/storage guidance and teardown diagnostics;
-- research nodes and current debugging information.
-
-## Compatibility
-
-This release does not change the global Python defaults for:
-
-- `offline_smoothing_replay=true`;
-- `model_aware_mode=off`;
-- `audio_blend_weight=0.0`;
-- the validated full-mode `coordinate_rls + no_attenuation + hard_clip + 0.40` generic correction.
-
-Saved ComfyUI workflows can retain serialized values from older releases; updating the custom node does not automatically rewrite those widgets.
-
-Unknown or unreviewed sampler/noise/wrapper contracts continue to fail closed to native execution.
+This release does not change the global Python defaults for `offline_smoothing_replay`, `model_aware_mode`, audio blend, or the validated full-mode `coordinate_rls + no_attenuation + hard_clip + 0.40` generic correction.
 
 ## Validation
 
-The release is covered by the repository's four-revision pinned ComfyUI matrix. It builds the wheel, runs the native-H3 forecaster smoke test, scoped Ruff, `compileall`, and the full pytest suite on every reviewed revision.
+The final PR head is covered by Spectrum's four-revision pinned ComfyUI matrix. The workflow builds the wheel, runs the native-H3 forecaster smoke test, scoped Ruff, `compileall`, focused external-compatibility suites, transaction-order parity tests and the native-H3 test suite on every reviewed ComfyUI revision.
 
-Focused v0.2.11 coverage includes ER-SDE stochastic ownership, first/terminal boundaries, seeded RNG/replay parity, stages 1/2/3, solver-space bootstrap hold and lambda extrapolation, extrapolation guards, all-actual parity, replay isolation, TiledDiffusion wrapper validation, bounded denoised-anchor lifetime, post-run release/research ordering, bounded background research dispatch and failure cleanup.
+The companion Diff-Aid v1.0.6 producer PR is independently green, including its focused/full compatibility tests and CodeRabbit review.
 
-The package and source-checkout calibration provenance versions are advanced to `0.2.11`.
+The package and source-checkout calibration provenance versions are advanced to `0.2.12`.
