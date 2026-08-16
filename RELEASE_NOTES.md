@@ -1,58 +1,88 @@
-# Spectrum MiniMax H3 v0.2.14
+# Spectrum MiniMax H3 v0.2.15
 
-v0.2.14 hardens native ER-SDE offline smoothing replay around a reproduced WSL hard-wedge boundary. In the captured failing run, Spectrum completed the entire first pass, released causal history, constructed and validated the offline smoother, entered transformer-free replay, and then stopped producing output after replay step 13. That trace rules out the previously suspected post-run teardown boundary and narrows the protection target to work occurring inside replay.
+v0.2.15 adds first-class interoperability with H3 Continuum's continuation sampler contract and closes the native ER-SDE solver-space edge case exposed by Continuum's two-step actual prefix.
 
-## Native ER-SDE replay preview protection
+## H3 Continuum actual-prefix interoperability
 
-KJNodes Model Preview Override performs observational preview work from the sampler callback, including GPU preview/decode work and a blocking GPU-to-CPU transfer before its asynchronous encoder handoff. Offline replay can drive that callback much faster than the transformer-backed capture pass while the full replay archive is still live.
+Spectrum can now consume H3 Continuum's optional versioned runtime request from:
 
-For **native ER-SDE offline replay only**, Spectrum now recognizes the reviewed KJNodes nested callback provenance and bypasses the KJ preview wrapper while forwarding directly to the underlying Spectrum replay callback. This preserves Spectrum's replay progress and external callback semantics without performing KJ's preview decode/copy during the fast replay.
+```text
+transformer_options["h3_continuum"]
+```
 
-The guard is deliberately narrow:
+For the reviewed API v1 contract, an active request can specify an initial number of solver steps that must remain real H3 transformer evaluations. Spectrum treats that request as a run-local scheduling constraint rather than as a special sampler implementation.
 
-- KJNodes preview remains active during the expensive first-pass capture;
-- native ER-SDE single-pass behavior is unchanged;
-- other sampler and replay callback paths are unchanged;
-- arbitrary callback wrappers are never unwrapped;
-- the KJ callback is accepted only when its module, qualified name, source-file suffix and `original_callback` closure shape match the reviewed implementation.
+The integration is deliberately narrow:
 
-This release does **not** claim that the historical WSL wedge has been proven to originate inside KJNodes. The callback is the strongest narrowed protection target from the reproduced trace, and the additional diagnostics below make a subsequent real run classify the remaining boundary precisely if the wedge recurs.
+- no hard dependency on H3 Continuum is added;
+- missing, inactive, malformed, wrong-type, negative, or unknown-API metadata leaves ordinary Spectrum behavior unchanged;
+- the requested prefix is clamped to the available solver-step count;
+- the prefix applies to ordinary runs, single-pass fallback, and the offline-smoothing first pass;
+- offline replay is explicitly prefix-free because it reuses the already-captured anchor schedule;
+- each continuation sampling call accepts and logs its request independently, with no prefix state leaking into later chunks.
 
-## Replay boundary diagnostics
+The original interop design and runtime validation were contributed by **@ukr8b3g-cmyk** in PR #52 and reconciled onto current Spectrum main in PR #61 after the contributor branch became stale against the later ER-SDE, Diff-Aid, Python 3.13, and replay-safety work.
 
-With `debug=true`, native ER-SDE replay now records boundary breadcrumbs around:
+## Diff-Aid coexistence
 
-- sampler callback begin/end;
-- stochastic noise-sampler begin/end;
-- successful replay step finalization.
+Continuum's actual-prefix request composes with the v0.2.12 external-patch compatibility layer rather than bypassing it.
 
-These breadcrumbs do not reduce latent tensors and do not introduce an explicit CUDA synchronization.
+A dedicated regression places a Diff-Aid hard-sigma transition on a step already protected by the Continuum prefix and verifies that:
 
-The replay `finalize_step_end` breadcrumb is installed outside the v0.2.12 external-patch finalizer. It therefore means the effective finalization chain has completed, including Diff-Aid compatibility bookkeeping, rather than reporting completion before an outer finalizer has finished.
+- the step remains one actual H3 evaluation;
+- the external transition is observed exactly once;
+- Diff-Aid does not request an additional compatibility NFE for an already-actual step;
+- the two-step prefix still accounts for exactly two transformer calls;
+- external-patch run state is released normally at teardown.
 
-## Existing compatibility preserved
+## Native ER-SDE first forecast after an actual prefix
 
-The conflict resolution for PR #55 was performed against v0.2.13 rather than taking the older v0.2.11 branch state. v0.2.14 therefore retains:
+Continuum commonly produces a continuation schedule beginning like:
 
-- v0.2.12 Diff-Aid H3 forecast compatibility and hard-transition protection;
-- v0.2.13 Python 3.13 native ER-SDE source-provenance normalization;
-- the v0.2.11 ER-SDE stochastic-state and solver-space dense-output correction.
+```text
+actual 0  (Continuum prefix)
+actual 1  (Continuum prefix)
+forecast 2
+actual 3
+forecast 4
+```
 
-There is no change to native ER-SDE solver math, RNG ownership, `s_noise`, `max_stage`, forecast cadence, scheduler behavior, or the normal actual/forecast NFE budget.
+The v0.2.11 ER-SDE solver-space bridge handled the original one-anchor bootstrap and later two-anchor lambda-space extrapolation, but deliberately rejected two *consecutive* actual anchors as extrapolation history. That made the first post-prefix forecast fall back to the older direct pending-`q` correction path.
 
-## Live preview behavior
+Real Model Preview Override output reproduced the characteristic high-frequency/confetti corruption exactly on that first forecast.
 
-For offline smoothing replay with native ER-SDE, KJNodes Model Preview Override now provides the useful first-pass preview and is intentionally skipped during the transformer-free replay. For paths outside that exact combination, the existing preview behavior remains unchanged.
+v0.2.15 closes that gap:
 
-## Validation
+- any causal forecast immediately following an exact actual anchor is eligible for solver-space handling;
+- when the retained anchors are consecutive warmup/prefix actuals, the first forecast uses the newest exact solver-space denoised anchor as a hold;
+- later forecasts retain the existing bounded native-ER-SDE lambda-space extrapolation once the anchor geometry supports it;
+- unexpectedly missing extrapolation coordinates fall safe to the newest exact actual hold rather than reintroducing the noisy causal forecast;
+- offline replay deliberately retains its separate exact pending-`q` compensation path so replay-smoothed hidden features remain observable to the sampler;
+- the native ER-SDE RNG stream, stochastic latent ownership, `s_noise`, stages 1/2/3, and no-extra-NFE contract are unchanged.
 
-The reconciled PR #55 head passed the complete repository test matrix before merge:
+The seeded replay regression now protects the actual invariant — byte-identical native stochastic draws — without incorrectly requiring the causal first-pass and replay denoised trajectories to be identical when their solver-facing policies intentionally differ.
 
-- four reviewed ComfyUI revisions on Python 3.12;
-- the current reviewed ComfyUI revision on Python 3.13;
-- forecaster smoke test;
-- Ruff and `compileall`;
-- focused external-patch compatibility suites;
-- native MiniMax H3 test suite.
+## Runtime validation
 
-Dedicated regression coverage verifies strict KJ callback recognition/rejection, callback begin/end behavior including exception propagation, debug-off inertness, and the required wrapper ordering that keeps replay finalization telemetry outside external-patch bookkeeping.
+The reconciled Continuum interop in PR #61 passed the complete repository CI matrix and was then validated on restarted ComfyUI 0.33.0 with the current H3 continuation path:
+
+- the initial chunk ran without a Continuum prefix request;
+- continuation chunks accepted `H3 Continuum API v1, actual prefix=2` exactly once each;
+- steps 0 and 1 were actual evaluations with reason `H3 Continuum actual prefix`;
+- step 2 returned to normal Spectrum forecast policy;
+- no duplicate prefix NFEs or cross-chunk state leakage occurred;
+- current-Core `video_audio` continuation references (`ref_audio` + `ref_img`) were exercised;
+- Diff-Aid coexistence completed with zero external-patch contract failures;
+- sampling, VAE decode, Continuum assembly, downstream processing, and final video output completed.
+
+The ER-SDE prefix fix in PR #62 passed the full five-lane matrix — four reviewed ComfyUI revisions on Python 3.12 plus the current Python 3.13 lane — including forecaster smoke, Ruff/compileall, focused compatibility suites, and the full native MiniMax H3 tests. CodeRabbit's final review reported no actionable findings.
+
+A final real Continuum + native ER-SDE runtime gate used **2 × 5-second chunks** with Model Preview Override. The previously reproducible third-step / Spectrum `step=2` confetti was gone.
+
+## Compatibility and release scope
+
+This release preserves the v0.2.14 native ER-SDE offline-replay/KJ preview protection, v0.2.13 Python 3.13 provenance normalization, v0.2.12 Diff-Aid interoperability, and the existing model-aware/generic-correction defaults.
+
+Spectrum only consumes Continuum's declared API v1 metadata; it does not vendor or patch H3 Continuum itself. The installed Continuum version must independently support the installed ComfyUI H3 runtime.
+
+There is no change to the normal Spectrum defaults, ordinary non-Continuum schedules, native ER-SDE random stream, or the standard transformer NFE budget outside the explicit Continuum prefix request.
