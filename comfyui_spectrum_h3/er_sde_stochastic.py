@@ -59,9 +59,15 @@ def function_node_ast_digest(
     """Return the normalized digest shared by runtime and source-contract tests."""
     normalized = copy.deepcopy(function_node)
     normalized.decorator_list = []
-    return hashlib.sha256(
-        ast.dump(normalized, include_attributes=False).encode("utf-8")
-    ).hexdigest()
+    # Python 3.13 changed ast.dump() to omit empty fields by default. The reviewed
+    # source digests were generated from the full-field representation used by
+    # Python <=3.12. Force that representation when the runtime supports the new
+    # show_empty switch so identical native source keeps identical provenance.
+    try:
+        dumped = ast.dump(normalized, include_attributes=False, show_empty=True)
+    except TypeError:
+        dumped = ast.dump(normalized, include_attributes=False)
+    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
 
 
 def function_ast_digest(
