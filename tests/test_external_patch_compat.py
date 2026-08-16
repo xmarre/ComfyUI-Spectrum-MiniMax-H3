@@ -217,8 +217,8 @@ def test_no_contract_profile_behavior_remains_base_profile():
 
 
 def test_valid_runtime_patch_is_recognized_without_becoming_unknown_lora_patch():
-    lookup = _profile_for([contract()])
-    profile = lookup.profile
+    base = _profile_for(None).profile
+    profile = _profile_for([contract()]).profile
     assert profile.recognized_runtime_patch_count == 1
     assert profile.recognized_lora_count == 0
     assert profile.unknown_patch_count == 0
@@ -226,7 +226,11 @@ def test_valid_runtime_patch_is_recognized_without_becoming_unknown_lora_patch()
     assert profile.active_patch_keys == 0
     assert profile.runtime_patch_kinds == ("text_activation_modulation",)
     assert profile.runtime_patch_perturbation > 0.0
-    assert profile.patch_perturbation >= profile.runtime_patch_perturbation
+    assert profile.profile_confidence == pytest.approx(base.profile_confidence)
+    assert profile.aggregate_sensitivity == pytest.approx(base.aggregate_sensitivity)
+    assert profile.patch_perturbation == pytest.approx(base.patch_perturbation)
+    assert profile.final_block_perturbation == pytest.approx(base.final_block_perturbation)
+    assert profile.forecast_risk_prior == pytest.approx(base.forecast_risk_prior)
 
 
 def test_profile_cache_key_changes_for_strength_blocks_and_sigma_window():
@@ -250,12 +254,13 @@ def test_identical_external_profile_hits_its_effective_cache():
 
 
 def test_final_block_and_nonfinal_runtime_perturbations_are_distinguished():
+    base = _profile_for(None).profile
     final_profile = _profile_for([contract(block_indices_0based=[4])]).profile
     nonfinal_profile = _profile_for([contract(block_indices_0based=[0, 1, 2, 3])]).profile
     assert final_profile.runtime_final_block_perturbation > 0.0
     assert nonfinal_profile.runtime_final_block_perturbation == 0.0
-    assert final_profile.final_block_perturbation > 0.0
-    assert nonfinal_profile.final_block_perturbation == 0.0
+    assert final_profile.final_block_perturbation == pytest.approx(base.final_block_perturbation)
+    assert nonfinal_profile.final_block_perturbation == pytest.approx(base.final_block_perturbation)
 
 
 def test_negative_strength_uses_magnitude_and_zero_strength_is_inert():
@@ -271,6 +276,7 @@ def test_negative_strength_uses_magnitude_and_zero_strength_is_inert():
 
 
 def test_runtime_risk_values_remain_finite_and_bounded_for_stacked_strong_patches():
+    base = _profile_for(None).profile
     profile = _profile_for(
         [
             contract(instance_id="diffaid-h3-1", strength=3.0),
@@ -278,10 +284,35 @@ def test_runtime_risk_values_remain_finite_and_bounded_for_stacked_strong_patche
         ]
     ).profile
     assert profile.recognized_runtime_patch_count == 2
-    assert math.isfinite(profile.aggregate_sensitivity)
-    assert math.isfinite(profile.forecast_risk_prior)
-    assert 0.0 <= profile.aggregate_sensitivity <= 1.0
-    assert 0.0 <= profile.forecast_risk_prior <= 1.0
+    assert math.isfinite(profile.runtime_patch_perturbation)
+    assert math.isfinite(profile.runtime_final_block_perturbation)
+    assert profile.runtime_patch_perturbation > 0.0
+    assert profile.aggregate_sensitivity == pytest.approx(base.aggregate_sensitivity)
+    assert profile.forecast_risk_prior == pytest.approx(base.forecast_risk_prior)
+
+
+def test_recognized_runtime_patch_does_not_inflate_model_aware_schedule_risk():
+    base = _profile_for(None).profile
+    profile = _profile_for([contract(strength=0.5)]).profile
+
+    # This reproduces the shape of the real regression: five affected blocks,
+    # including the final block, at strength 0.5 produces a large raw structural
+    # telemetry value. That value must not be treated as calibrated parameter risk.
+    assert profile.runtime_patch_perturbation > 2.0
+    assert profile.runtime_final_block_perturbation == pytest.approx(0.5)
+
+    base_controller = model_aware.ModelAwareController("full", 0.65)
+    external_controller = model_aware.ModelAwareController("full", 0.65)
+    base_controller.set_profile(base)
+    external_controller.set_profile(profile)
+    for controller in (base_controller, external_controller):
+        controller.anchor_count = 8
+        controller.forecast_ratio_ewma = 1.41
+        controller.curvature_ratio_ewma = 1.45
+
+    base_risks = base_controller._risks(1.0)
+    external_risks = external_controller._risks(1.0)
+    assert external_risks == pytest.approx(base_risks)
 
 
 class _FakeRuntime:
