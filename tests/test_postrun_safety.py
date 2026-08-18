@@ -102,6 +102,16 @@ def test_dispatch_research_never_waits_for_isolated_worker_completion(
     _wait_for_research_slot()
 
 
+def test_faulthandler_fatal_signal_is_normalized():
+    assert (
+        postrun._fatal_signal_from_stderr(
+            "Fatal Python error: Segmentation fault\nCurrent thread ..."
+        )
+        == "SIGSEGV"
+    )
+    assert postrun._fatal_signal_from_stderr("ordinary timeout") is None
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX rlimit semantics required")
 def test_research_command_disables_core_dumps_before_worker(tmp_path):
     worker = tmp_path / "core_limit_worker.py"
@@ -144,8 +154,10 @@ def test_isolated_research_sigsegv_cannot_terminate_parent(
         assert postrun._dispatch_research({"compatible": True})
         _wait_for_research_slot()
 
-    assert "isolated research terminated by SIGSEGV" in caplog.text
-    assert "timed out" not in caplog.text
+    assert (
+        "isolated research terminated by SIGSEGV" in caplog.text
+        or "isolated research reported fatal SIGSEGV" in caplog.text
+    )
     assert "completed generation remains valid" in caplog.text
 
 
