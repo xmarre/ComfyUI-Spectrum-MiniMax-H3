@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
 import subprocess
 import sys
@@ -23,7 +24,23 @@ LOG = logging.getLogger(__name__)
 # only owns subprocess I/O/lifetime management; it never runs the evaluator.
 _RESEARCH_SLOT = threading.BoundedSemaphore(1)
 _RESEARCH_TIMEOUT_SECONDS = 30.0
+_RESEARCH_TERMINATION_GRACE_SECONDS = 1.0
 _RESEARCH_WORKER = Path(__file__).with_name("generic_correction_worker.py")
+_RESEARCH_BOOTSTRAP = """\
+import os
+import runpy
+import sys
+
+if os.name == "posix":
+    try:
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, OSError, ValueError):
+        pass
+
+runpy.run_path(sys.argv[1], run_name="__main__")
+"""
 _CORE_RUNTIME_END = _generic._ORIGINAL_RUNTIME_END
 
 
@@ -49,12 +66,60 @@ def _stderr_tail(text: str, *, limit: int = 2000) -> str:
     return rendered.replace("\n", " | ")
 
 
+def _timeout_stream_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 def _signal_name(returncode: int) -> str:
     number = -int(returncode)
     try:
         return signal.Signals(number).name
     except (ValueError, TypeError):
         return f"signal {number}"
+
+
+def _research_command(worker: Path | None = None) -> list[str]:
+    target = _RESEARCH_WORKER if worker is None else worker
+    return [
+        sys.executable,
+        "-I",
+        "-X",
+        "faulthandler",
+        "-c",
+        _RESEARCH_BOOTSTRAP,
+        str(target),
+    ]
+
+
+def _kill_research_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+
+
+def _close_process_pipes(process: subprocess.Popen[str]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
 
 
 def _research_process_watcher(
@@ -67,15 +132,36 @@ def _research_process_watcher(
                 payload,
                 timeout=_RESEARCH_TIMEOUT_SECONDS,
             )
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
-            LOG.warning(
-                "Spectrum H3 generic-correction isolated research timed out after "
-                "%.1f s and was terminated; the completed generation remains valid%s",
-                _RESEARCH_TIMEOUT_SECONDS,
-                f": {_stderr_tail(stderr)}" if _stderr_tail(stderr) else "",
-            )
+        except subprocess.TimeoutExpired as exc:
+            partial_stderr = _timeout_stream_text(exc.stderr)
+            _kill_research_process(process)
+            cleanup_timed_out = False
+            try:
+                _, stderr = process.communicate(
+                    timeout=_RESEARCH_TERMINATION_GRACE_SECONDS
+                )
+            except subprocess.TimeoutExpired as cleanup_exc:
+                cleanup_timed_out = True
+                stderr = _timeout_stream_text(cleanup_exc.stderr) or partial_stderr
+                _close_process_pipes(process)
+
+            detail = _stderr_tail(stderr or partial_stderr)
+            if cleanup_timed_out:
+                LOG.warning(
+                    "Spectrum H3 generic-correction isolated research timed out after "
+                    "%.1f s; forced termination did not drain within %.1f s. The "
+                    "completed generation remains valid%s",
+                    _RESEARCH_TIMEOUT_SECONDS,
+                    _RESEARCH_TERMINATION_GRACE_SECONDS,
+                    f": {detail}" if detail else "",
+                )
+            else:
+                LOG.warning(
+                    "Spectrum H3 generic-correction isolated research timed out after "
+                    "%.1f s and was terminated; the completed generation remains valid%s",
+                    _RESEARCH_TIMEOUT_SECONDS,
+                    f": {detail}" if detail else "",
+                )
             return
 
         returncode = int(process.returncode or 0)
@@ -150,19 +236,14 @@ def _dispatch_research(block: dict[str, Any]) -> bool:
             allow_nan=False,
         )
         process = subprocess.Popen(
-            [
-                sys.executable,
-                "-I",
-                "-X",
-                "faulthandler",
-                str(_RESEARCH_WORKER),
-            ],
+            _research_command(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
+            start_new_session=(os.name == "posix"),
         )
         watcher = threading.Thread(
             target=_research_process_watcher,
@@ -174,8 +255,10 @@ def _dispatch_research(block: dict[str, Any]) -> bool:
     except Exception as exc:  # noqa: BLE001 - dispatch must not affect generation
         if process is not None:
             try:
-                process.kill()
-                process.communicate(timeout=1.0)
+                _kill_research_process(process)
+                process.communicate(timeout=_RESEARCH_TERMINATION_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                _close_process_pipes(process)
             except Exception as cleanup_exc:  # noqa: BLE001 - best-effort cleanup
                 LOG.debug(
                     "Spectrum H3 isolated research cleanup after dispatch failure failed: %s",

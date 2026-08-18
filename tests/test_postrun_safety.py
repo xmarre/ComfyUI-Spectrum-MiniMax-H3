@@ -102,6 +102,28 @@ def test_dispatch_research_never_waits_for_isolated_worker_completion(
     _wait_for_research_slot()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX rlimit semantics required")
+def test_research_command_disables_core_dumps_before_worker(tmp_path):
+    worker = tmp_path / "core_limit_worker.py"
+    worker.write_text(
+        "import resource\nprint(resource.getrlimit(resource.RLIMIT_CORE)[0])\n",
+        encoding="utf-8",
+    )
+
+    completed = postrun.subprocess.run(
+        postrun._research_command(worker),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=5.0,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == "0"
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signal semantics required")
 def test_isolated_research_sigsegv_cannot_terminate_parent(
     monkeypatch,
@@ -123,6 +145,34 @@ def test_isolated_research_sigsegv_cannot_terminate_parent(
         _wait_for_research_slot()
 
     assert "isolated research terminated by SIGSEGV" in caplog.text
+    assert "timed out" not in caplog.text
+    assert "completed generation remains valid" in caplog.text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group semantics required")
+def test_research_timeout_kills_descendants_and_releases_slot(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    worker = tmp_path / "descendant_worker.py"
+    worker.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2)'])\n"
+        "time.sleep(2)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(postrun, "_RESEARCH_SLOT", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(postrun, "_RESEARCH_WORKER", worker)
+    monkeypatch.setattr(postrun, "default_store_root", lambda: tmp_path)
+    monkeypatch.setattr(postrun, "_RESEARCH_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(postrun, "_RESEARCH_TERMINATION_GRACE_SECONDS", 0.25)
+
+    with caplog.at_level("WARNING"):
+        assert postrun._dispatch_research({"compatible": True})
+        _wait_for_research_slot(timeout=1.0)
+
+    assert "isolated research timed out after 0.1 s and was terminated" in caplog.text
     assert "completed generation remains valid" in caplog.text
 
 
@@ -151,11 +201,7 @@ def test_isolated_research_python_failure_releases_worker_slot(
 
 def test_worker_script_loads_research_without_package_entrypoint(tmp_path):
     completed = postrun.subprocess.run(
-        [
-            postrun.sys.executable,
-            "-I",
-            str(postrun._RESEARCH_WORKER),
-        ],
+        postrun._research_command(),
         input='{"block":{},"root":"' + str(tmp_path).replace("\\", "\\\\") + '"}',
         capture_output=True,
         text=True,
