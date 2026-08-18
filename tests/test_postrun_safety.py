@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from types import SimpleNamespace
+
+import pytest
 
 from comfyui_spectrum_h3 import external_patch_compat as external_compat
 from comfyui_spectrum_h3 import postrun_safety as postrun
@@ -37,6 +40,16 @@ def _fake_runtime(run_id: int = 7):
     )
 
 
+def _wait_for_research_slot(timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if postrun._RESEARCH_SLOT.acquire(blocking=False):
+            postrun._RESEARCH_SLOT.release()
+            return
+        time.sleep(0.01)
+    raise AssertionError("isolated research slot was not released")
+
+
 def test_safe_end_releases_runtime_before_dispatching_research(monkeypatch):
     runtime = _fake_runtime()
     events = []
@@ -69,68 +82,92 @@ def test_safe_end_releases_runtime_before_dispatching_research(monkeypatch):
     assert runtime.forecaster._generic_correction_capture_mode is None
 
 
-def test_dispatch_research_never_waits_for_worker_completion(monkeypatch):
+def test_dispatch_research_never_waits_for_isolated_worker_completion(
+    monkeypatch,
+    tmp_path,
+):
+    worker = tmp_path / "slow_worker.py"
+    worker.write_text("import time\ntime.sleep(0.5)\n", encoding="utf-8")
     monkeypatch.setattr(postrun, "_RESEARCH_SLOT", threading.BoundedSemaphore(1))
-    started = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-
-    def persist(_block):
-        started.set()
-        assert release.wait(timeout=2.0)
-        finished.set()
-        return SimpleNamespace(
-            duplicate=False,
-            console_summary="synthetic research",
-            elapsed_seconds=0.01,
-        )
-
-    monkeypatch.setattr(postrun._generic, "persist_and_analyze", persist)
+    monkeypatch.setattr(postrun, "_RESEARCH_WORKER", worker)
+    monkeypatch.setattr(postrun, "default_store_root", lambda: tmp_path)
+    monkeypatch.setattr(postrun, "_RESEARCH_TIMEOUT_SECONDS", 2.0)
 
     began = time.perf_counter()
     assert postrun._dispatch_research({"compatible": True})
     elapsed = time.perf_counter() - began
 
     assert elapsed < 0.25
-    assert started.wait(timeout=1.0)
-    assert not finished.is_set()
     assert not postrun._dispatch_research({"compatible": True})
-
-    release.set()
-    assert finished.wait(timeout=1.0)
-    deadline = time.monotonic() + 1.0
-    acquired = False
-    while time.monotonic() < deadline:
-        if postrun._RESEARCH_SLOT.acquire(blocking=False):
-            acquired = True
-            break
-        time.sleep(0.01)
-    assert acquired
-    postrun._RESEARCH_SLOT.release()
+    _wait_for_research_slot()
 
 
-def test_background_research_failure_releases_single_worker_slot(monkeypatch):
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal semantics required")
+def test_isolated_research_sigsegv_cannot_terminate_parent(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    worker = tmp_path / "segv_worker.py"
+    worker.write_text(
+        "import os, signal\nos.kill(os.getpid(), signal.SIGSEGV)\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(postrun, "_RESEARCH_SLOT", threading.BoundedSemaphore(1))
-    attempted = threading.Event()
+    monkeypatch.setattr(postrun, "_RESEARCH_WORKER", worker)
+    monkeypatch.setattr(postrun, "default_store_root", lambda: tmp_path)
+    monkeypatch.setattr(postrun, "_RESEARCH_TIMEOUT_SECONDS", 2.0)
 
-    def persist(_block):
-        attempted.set()
-        raise OSError("synthetic report failure")
+    with caplog.at_level("WARNING"):
+        assert postrun._dispatch_research({"compatible": True})
+        _wait_for_research_slot()
 
-    monkeypatch.setattr(postrun._generic, "persist_and_analyze", persist)
+    assert "isolated research terminated by SIGSEGV" in caplog.text
+    assert "completed generation remains valid" in caplog.text
 
-    assert postrun._dispatch_research({"compatible": True})
-    assert attempted.wait(timeout=1.0)
 
-    deadline = time.monotonic() + 1.0
-    acquired = False
-    while time.monotonic() < deadline:
-        if postrun._RESEARCH_SLOT.acquire(blocking=False):
-            acquired = True
-            break
-        time.sleep(0.01)
-    assert acquired
-    postrun._RESEARCH_SLOT.release()
+def test_isolated_research_python_failure_releases_worker_slot(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    worker = tmp_path / "failed_worker.py"
+    worker.write_text(
+        "import sys\nsys.stderr.write('synthetic report failure\\n')\nraise SystemExit(3)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(postrun, "_RESEARCH_SLOT", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(postrun, "_RESEARCH_WORKER", worker)
+    monkeypatch.setattr(postrun, "default_store_root", lambda: tmp_path)
+    monkeypatch.setattr(postrun, "_RESEARCH_TIMEOUT_SECONDS", 2.0)
+
+    with caplog.at_level("WARNING"):
+        assert postrun._dispatch_research({"compatible": True})
+        _wait_for_research_slot()
+
+    assert "isolated research exited with status 3" in caplog.text
+    assert "synthetic report failure" in caplog.text
+
+
+def test_worker_script_loads_research_without_package_entrypoint(tmp_path):
+    completed = postrun.subprocess.run(
+        [
+            postrun.sys.executable,
+            "-I",
+            str(postrun._RESEARCH_WORKER),
+        ],
+        input='{"block":{},"root":"' + str(tmp_path).replace("\\", "\\\\") + '"}',
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=5.0,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "CalibrationError" in completed.stderr
+    assert "unsupported generic calibration schema" in completed.stderr
 
 
 def test_installed_runtime_end_run_preserves_postrun_chain_identity():

@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+import json
 import logging
+import signal
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from . import generic_correction as _generic
 from .generic_correction_calibration import GenericCalibrationState
+from .generic_correction_research import default_store_root
 from .runtime import SpectrumH3Runtime
 
 LOG = logging.getLogger(__name__)
 
-# Generic-correction research is diagnostic-only. A single daemon worker is enough:
-# if one report job ever wedges, later jobs are skipped rather than accumulating
-# threads or blocking completed generations.
+# Generic-correction research is diagnostic-only. Keep at most one analysis in
+# flight, and run the evaluator in a separate interpreter so a native crash in
+# diagnostic code cannot terminate the live ComfyUI process. The watcher thread
+# only owns subprocess I/O/lifetime management; it never runs the evaluator.
 _RESEARCH_SLOT = threading.BoundedSemaphore(1)
+_RESEARCH_TIMEOUT_SECONDS = 30.0
+_RESEARCH_WORKER = Path(__file__).with_name("generic_correction_worker.py")
 _CORE_RUNTIME_END = _generic._ORIGINAL_RUNTIME_END
 
 
@@ -31,19 +40,89 @@ def _teardown_log(runtime: Any, event: str, **fields: Any) -> None:
     )
 
 
-def _research_worker(block: dict[str, Any]) -> None:
+def _stderr_tail(text: str, *, limit: int = 2000) -> str:
+    rendered = (text or "").strip()
+    if not rendered:
+        return ""
+    if len(rendered) > limit:
+        rendered = "..." + rendered[-limit:]
+    return rendered.replace("\n", " | ")
+
+
+def _signal_name(returncode: int) -> str:
+    number = -int(returncode)
     try:
-        result = _generic.persist_and_analyze(block)
-        duplicate_note = " (duplicate ignored)" if result.duplicate else ""
-        LOG.warning("\n%s%s", result.console_summary, duplicate_note)
+        return signal.Signals(number).name
+    except (ValueError, TypeError):
+        return f"signal {number}"
+
+
+def _research_process_watcher(
+    process: subprocess.Popen[str],
+    payload: str,
+) -> None:
+    try:
+        try:
+            stdout, stderr = process.communicate(
+                payload,
+                timeout=_RESEARCH_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            LOG.warning(
+                "Spectrum H3 generic-correction isolated research timed out after "
+                "%.1f s and was terminated; the completed generation remains valid%s",
+                _RESEARCH_TIMEOUT_SECONDS,
+                f": {_stderr_tail(stderr)}" if _stderr_tail(stderr) else "",
+            )
+            return
+
+        returncode = int(process.returncode or 0)
+        if returncode != 0:
+            detail = _stderr_tail(stderr)
+            if returncode < 0:
+                failure = f"terminated by {_signal_name(returncode)}"
+            else:
+                failure = f"exited with status {returncode}"
+            LOG.warning(
+                "Spectrum H3 generic-correction isolated research %s; the completed "
+                "generation remains valid%s",
+                failure,
+                f": {detail}" if detail else "",
+            )
+            return
+
+        try:
+            result = json.loads(stdout)
+        except (TypeError, json.JSONDecodeError) as exc:
+            LOG.warning(
+                "Spectrum H3 generic-correction isolated research returned malformed "
+                "output; the completed generation remains valid: %s%s",
+                exc,
+                f"; stderr={_stderr_tail(stderr)}" if _stderr_tail(stderr) else "",
+            )
+            return
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            LOG.warning(
+                "Spectrum H3 generic-correction isolated research returned an invalid "
+                "result; the completed generation remains valid"
+            )
+            return
+
+        duplicate_note = " (duplicate ignored)" if result.get("duplicate") else ""
+        summary = str(result.get("console_summary") or "").strip()
+        if summary:
+            LOG.warning("\n%s%s", summary, duplicate_note)
+        elapsed = float(result.get("elapsed_seconds", 0.0))
         LOG.warning(
             "Spectrum H3 generic-correction post-run analysis completed in %.3f s",
-            result.elapsed_seconds,
+            elapsed,
         )
-    except Exception as exc:  # noqa: BLE001 - research must never affect generation
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never affect generation
         LOG.warning(
-            "Spectrum H3 generic-correction background research failed; "
-            "the completed generation remains valid: %s",
+            "Spectrum H3 generic-correction research watcher failed; the completed "
+            "generation remains valid: %s",
             exc,
         )
     finally:
@@ -51,25 +130,60 @@ def _research_worker(block: dict[str, Any]) -> None:
 
 
 def _dispatch_research(block: dict[str, Any]) -> bool:
-    """Start one bounded daemon research job without joining the sampling path."""
+    """Dispatch one bounded, process-isolated research job without blocking sampling."""
     if not _RESEARCH_SLOT.acquire(blocking=False):
         LOG.warning(
             "Spectrum H3 generic-correction post-run research skipped because a "
-            "previous background analysis is still active"
+            "previous isolated analysis is still active"
         )
         return False
+
+    process: subprocess.Popen[str] | None = None
     try:
-        worker = threading.Thread(
-            target=_research_worker,
-            args=(block,),
-            name="SpectrumH3GenericResearch",
+        payload = json.dumps(
+            {
+                "block": block,
+                "root": str(default_store_root()),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-X",
+                "faulthandler",
+                str(_RESEARCH_WORKER),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        watcher = threading.Thread(
+            target=_research_process_watcher,
+            args=(process, payload),
+            name="SpectrumH3GenericResearchWatcher",
             daemon=True,
         )
-        worker.start()
-    except Exception as exc:  # noqa: BLE001 - thread creation must not affect generation
+        watcher.start()
+    except Exception as exc:  # noqa: BLE001 - dispatch must not affect generation
+        if process is not None:
+            try:
+                process.kill()
+                process.communicate(timeout=1.0)
+            except Exception as cleanup_exc:  # noqa: BLE001 - best-effort cleanup
+                LOG.debug(
+                    "Spectrum H3 isolated research cleanup after dispatch failure failed: %s",
+                    cleanup_exc,
+                )
         _RESEARCH_SLOT.release()
         LOG.warning(
-            "Spectrum H3 generic-correction post-run research could not be dispatched; "
+            "Spectrum H3 generic-correction isolated research could not be dispatched; "
             "the completed generation remains valid: %s",
             exc,
         )
@@ -78,15 +192,13 @@ def _dispatch_research(block: dict[str, Any]) -> bool:
 
 
 def _safe_end_run(self: SpectrumH3Runtime, run_id: int) -> None:
-    """End a run before any optional research and expose teardown crash boundaries.
+    """End a run before optional research and expose teardown crash boundaries.
 
-    The previous generic-correction hook performed persistence/evaluation inline in
-    ``SpectrumH3Runtime.end_run``. That made diagnostic research part of the sampler
-    critical path: a filesystem/evaluator hang after the native sampler had already
-    returned could prevent downstream VAE/video nodes from ever receiving the valid
-    result. Keep calibration export synchronous and bounded, release runtime/VRAM
-    state synchronously, then transfer the tensor-free calibration block to at most
-    one daemon research worker.
+    Calibration export stays synchronous and bounded. Runtime/VRAM ownership is
+    released synchronously. The tensor-free calibration block is then handed to
+    at most one process-isolated research job. A Python exception, hang, or native
+    crash in that diagnostic evaluator therefore cannot terminate the ComfyUI
+    process or invalidate the completed generation.
     """
     active = getattr(self, "_run", None)
     if active is None or active.run_id != int(run_id):
@@ -155,6 +267,7 @@ def _safe_end_run(self: SpectrumH3Runtime, run_id: int) -> None:
             "research_dispatch",
             run_id=run_id,
             dispatched=dispatched,
+            isolation="subprocess",
         )
 
 
