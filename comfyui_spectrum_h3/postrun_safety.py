@@ -41,6 +41,13 @@ if os.name == "posix":
 
 runpy.run_path(sys.argv[1], run_name="__main__")
 """
+_FAULTHANDLER_FATAL_SIGNALS = (
+    ("Fatal Python error: Segmentation fault", "SIGSEGV"),
+    ("Fatal Python error: Aborted", "SIGABRT"),
+    ("Fatal Python error: Bus error", "SIGBUS"),
+    ("Fatal Python error: Illegal instruction", "SIGILL"),
+    ("Fatal Python error: Floating-point exception", "SIGFPE"),
+)
 _CORE_RUNTIME_END = _generic._ORIGINAL_RUNTIME_END
 
 
@@ -72,6 +79,14 @@ def _timeout_stream_text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+def _fatal_signal_from_stderr(text: str) -> str | None:
+    """Normalize a fatal signal already reported by CPython's faulthandler."""
+    for marker, signal_name in _FAULTHANDLER_FATAL_SIGNALS:
+        if marker in text:
+            return signal_name
+    return None
 
 
 def _signal_name(returncode: int) -> str:
@@ -134,6 +149,7 @@ def _research_process_watcher(
             )
         except subprocess.TimeoutExpired as exc:
             partial_stderr = _timeout_stream_text(exc.stderr)
+            fatal_signal = _fatal_signal_from_stderr(partial_stderr)
             _kill_research_process(process)
             cleanup_timed_out = False
             try:
@@ -145,7 +161,32 @@ def _research_process_watcher(
                 stderr = _timeout_stream_text(cleanup_exc.stderr) or partial_stderr
                 _close_process_pipes(process)
 
-            detail = _stderr_tail(stderr or partial_stderr)
+            combined_stderr = stderr or partial_stderr
+            fatal_signal = fatal_signal or _fatal_signal_from_stderr(combined_stderr)
+            detail = _stderr_tail(combined_stderr)
+            if fatal_signal is not None:
+                if cleanup_timed_out:
+                    LOG.warning(
+                        "Spectrum H3 generic-correction isolated research reported fatal "
+                        "%s but did not become reapable within %.1f s; forced termination "
+                        "did not drain within %.1f s. The completed generation remains "
+                        "valid%s",
+                        fatal_signal,
+                        _RESEARCH_TIMEOUT_SECONDS,
+                        _RESEARCH_TERMINATION_GRACE_SECONDS,
+                        f": {detail}" if detail else "",
+                    )
+                else:
+                    LOG.warning(
+                        "Spectrum H3 generic-correction isolated research reported fatal "
+                        "%s but did not become reapable within %.1f s and was "
+                        "force-terminated; the completed generation remains valid%s",
+                        fatal_signal,
+                        _RESEARCH_TIMEOUT_SECONDS,
+                        f": {detail}" if detail else "",
+                    )
+                return
+
             if cleanup_timed_out:
                 LOG.warning(
                     "Spectrum H3 generic-correction isolated research timed out after "
