@@ -152,7 +152,15 @@ def test_isolated_research_sigsegv_cannot_terminate_parent(
 
     with caplog.at_level("WARNING"):
         assert postrun._dispatch_research({"compatible": True})
-        _wait_for_research_slot()
+        # The watcher is allowed the research timeout plus its bounded forced-
+        # termination drain. Leave scheduler margin beyond that combined budget.
+        _wait_for_research_slot(
+            timeout=(
+                postrun._RESEARCH_TIMEOUT_SECONDS
+                + postrun._RESEARCH_TERMINATION_GRACE_SECONDS
+                + 1.0
+            )
+        )
 
     assert (
         "isolated research terminated by SIGSEGV" in caplog.text
