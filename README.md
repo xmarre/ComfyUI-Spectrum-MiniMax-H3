@@ -6,78 +6,34 @@ Spectrum reduces the number of expensive H3 transformer evaluations during sampl
 
 Spectrum is an **approximate accelerator**. Forecasted steps change the denoising trajectory, so output can differ from native H3 even with the same seed and workflow.
 
-## v0.2.16: Untwist compatibility and post-run crash containment
+## Recent releases
 
-v0.2.16 adds Spectrum-side recognition for the native MiniMax H3 integration in **ComfyUI-Flux.2-Untwisting-RoPE** and releases the post-run research isolation/hardening work merged after v0.2.15.
+Full release details are kept in [RELEASE_NOTES.md](RELEASE_NOTES.md) and the GitHub release pages.
 
-Untwist publishes a separate visual-reference compatibility namespace:
+### v0.2.16 — Untwist compatibility and post-run isolation
 
-```text
-spectrum_h3_visual_reference_patch_profiles
-spectrum_h3_visual_reference_patch_runtime
-```
+- Added Spectrum compatibility for the MiniMax H3 integration in **ComfyUI-Flux.2-Untwisting-RoPE**, including distinct cache identity, hard-boundary anchoring, and stacking with Diff-Aid.
+- Moved optional generic-correction post-run analysis into an isolated subprocess and hardened crash, timeout, and process cleanup so diagnostic failures cannot terminate a completed generation.
 
-Spectrum validates the producer identity, H3 block coverage, reference scope, active progress window, hard-boundary declarations, high/low scale endpoints, interpolation `beta`, temporal-axis mode, and scalar strength summary. The complete visual configuration participates in the external-patch fingerprint, so behaviorally different Untwist profiles cannot alias the same cached Spectrum profile.
+### v0.2.15 — H3 Continuum interoperability
 
-Untwist remains distinct from Diff-Aid's existing `text_activation_modulation` contract. Both patch kinds can be present in one run, remain separately visible in telemetry, and share Spectrum's transaction-level hard-boundary guard. A hard transition that lands on a forecast promotes that current step to one actual H3 evaluation; a transition on an already-actual step adds no duplicate NFE.
+- Added H3 Continuum actual-prefix interoperability across normal sampling, fallback, and offline-smoothing capture without adding a hard dependency.
+- Fixed the native ER-SDE first-forecast corruption exposed by consecutive Continuum prefix actuals.
 
-The companion Untwist schedule is inclusive at both endpoints. With `end_percent=0.90`, progress exactly at `0.90` is still active; the first solver call after the boundary is the regime transition. Spectrum maps that contract with `normalized_sigma = 1 - progress`, preserving the same inclusive endpoint semantics.
+### v0.2.14 — Native ER-SDE offline replay safety
 
-v0.2.16 also moves optional generic-correction post-run evaluation/report work into an isolated Python subprocess after core Spectrum runtime/history state has been released. A native crash in that optional research worker can no longer terminate the completed ComfyUI generation process. The follow-up lifetime hardening preserves CPython faulthandler fatal-signal diagnostics, isolates the POSIX worker process group, bounds timeout/pipe-drain cleanup, and preserves the Windows direct-process path.
+- Hardened native ER-SDE offline replay around the reviewed KJNodes Model Preview Override callback by bypassing only its replay-time preview wrapper.
+- Added callback, noise-sampler, and replay-finalization diagnostics for hangs and hard wedges.
 
-The release contains all runtime work merged after v0.2.15: PRs **#64**, **#66**, and **#65**. Current `main` also includes the post-release PR #69 review clarifications and parser regressions; that follow-up changes comments/tests only and does not alter v0.2.16 runtime behavior.
+### v0.2.12 — Diff-Aid compatibility
 
-## v0.2.15: H3 Continuum interoperability
+- Added ComfyUI-DiffAid-Patches v1.0.6+ compatibility with separate external-patch identity, telemetry, cache separation, and hard-window transition anchoring.
+- Preserved the normal 11-actual / 9-forecast schedule in validated 20-step native ER-SDE tests without model-aware extra NFEs.
 
-v0.2.15 adds first-class interoperability with **H3 Continuum** through its optional API v1 actual-prefix request. Continuation chunks can require their initial solver steps to remain real H3 transformer evaluations; Spectrum treats that as a run-local scheduling constraint without adding a hard dependency on Continuum.
+### v0.2.11 — Native ER-SDE quality fix
 
-The prefix applies to ordinary sampling, single-pass fallback, and the offline-smoothing first pass, while transformer-free offline replay remains prefix-free. Invalid, inactive, malformed, negative, or unknown-API metadata leaves normal Spectrum behavior unchanged. Prefix state is scoped to one sampling call and cannot leak into later continuation chunks.
-
-The interop composes with Diff-Aid's external-patch transition contract. If a Diff-Aid hard transition lands on an already-prefix-protected step, the transition is observed without adding a duplicate H3 evaluation.
-
-This release also fixes the native ER-SDE edge case exposed by a two-step Continuum prefix. When the first forecast follows consecutive exact actual anchors, Spectrum now uses the newest exact solver-space denoised anchor as a hold instead of falling back to the older direct pending-`q` correction. Later forecasts retain bounded lambda-space extrapolation; offline replay retains its separate exact-`q` path. Native ER-SDE RNG/stochastic ownership and the no-extra-NFE contract are unchanged.
-
-Real validation used Continuum continuation chunks with Model Preview Override. The previously reproducible confetti on the first post-prefix forecast / third preview step is gone.
-
-## v0.2.14: native ER-SDE offline replay safety
-
-v0.2.14 hardens native ER-SDE offline smoothing replay around a reproduced WSL hard-wedge boundary. The captured failing run completed first-pass teardown, constructed and validated the offline smoother, entered transformer-free replay, and stopped producing output after replay step 13.
-
-During **native ER-SDE offline replay only**, Spectrum now recognizes the reviewed KJNodes Model Preview Override nested callback and forwards directly to its underlying Spectrum replay callback. KJ preview remains active during the transformer-backed first-pass capture. The replay path preserves Spectrum progress/callback semantics while avoiding KJ's synchronous preview/decode and GPU-to-CPU copy work during the fast replay.
-
-The guard accepts only the reviewed KJ callback provenance and closure shape. Other sampler paths, native ER-SDE single-pass operation, and unrelated callback wrappers retain their existing behavior. Debug mode also records callback, noise-sampler, and successful replay-finalization boundary breadcrumbs so a recurring wedge can be localized more precisely.
-
-The reproduced trace identifies KJ replay preview work as the strongest narrowed protection target. It does not establish KJNodes as the proven historical root cause of the WSL wedge.
-
-## v0.2.12: Diff-Aid H3 forecast compatibility
-
-v0.2.12 adds coordinated interoperability with **ComfyUI-DiffAid-Patches v1.0.6+** for the native MiniMax H3 sparse activation patch.
-
-Diff-Aid now publishes a versioned pure-data descriptor plus the exact normalized sigma already used by its own H3 timestep wrapper. Spectrum uses that contract to distinguish deterministic text-activation modulation from LoRA/model-parameter patches, keep patched/unpatched cache identities separate, and protect hard sigma-window regime changes with a real anchor when necessary.
-
-The compatibility metadata does **not** inflate Spectrum's calibrated parameter-space model-aware patch prior. Raw Diff-Aid structural magnitude remains visible as separate runtime telemetry while normal online trajectory evidence continues to govern model-aware scheduling. This avoids the development regression where a five-block Diff-Aid patch at strength `0.5` saturated static patch risk and caused 10 unnecessary transformer NFEs.
-
-Real 20-step native ER-SDE validation preserved the normal **11 actual + 9 forecast** schedule with `model_aware_extra_nfes=0` for both a full `[0,1]` hard window and a `[0,0.95]` hard window. The `0.95` run detected its off→on boundary at normalized sigma `0.947368` on an already-actual step, so the transition added no NFE.
-
-In the tested multi-shot prompt, `sigma_end=0.95` retained Diff-Aid's stronger prompt adherence while restoring the intended cut between the first and later shots compared with full-window activation. Treat that as an empirical workflow result rather than a universal model default.
-
-## v0.2.11: native ER-SDE quality fix
-
-v0.2.11 fixes the characteristic high-frequency / "confetti" corruption on Spectrum forecast steps with native ER-SDE.
-
-The problem was not simply ER-SDE's random increment. A skipped H3 hidden/velocity forecast was being reconstructed against ER-SDE's current stochastic latent as if it were a valid current-state denoised/x0 estimate. ER-SDE then consumed that inconsistent value in its own solver update and higher-order derivative history.
-
-Spectrum now keeps ER-SDE's native stochastic latent trajectory unchanged while reconstructing skipped **solver-facing denoised/x0 values in ER-SDE solver space** from exact actual denoised anchors:
-
-- the first causal forecast after one actual anchor uses the latest exact actual denoised value;
-- later causal forecasts use bounded linear dense output in native ER-SDE lambda coordinate from the two latest exact actual anchors;
-- degenerate or excessive extrapolation falls back to the latest exact actual anchor;
-- the native ER-SDE random stream, `s_noise`, stage-2/stage-3 history, and latent `x` trajectory remain intact;
-- no additional H3 transformer/denoiser NFE is added.
-
-Real MiniMax H3 validation removed the forecast confetti completely and produced a modest but repeatable improvement in fine/low-resolution visual structure without an observed loss of motion/action or audio quality.
-
-The release also hardens post-run teardown: generic-correction research persistence/evaluation is no longer allowed to block a completed sampler result from reaching VAE decode or video saving.
+- Fixed native ER-SDE forecast "confetti" corruption with solver-space denoised interpolation while preserving the native stochastic trajectory and RNG stream.
+- Hardened post-run teardown so optional generic-correction research work cannot block a completed generation from reaching decode/save.
 
 ## Installation
 
