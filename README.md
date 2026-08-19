@@ -12,7 +12,7 @@ Full release details are kept in [RELEASE_NOTES.md](RELEASE_NOTES.md) and the Gi
 
 ### v0.2.16 — Untwist compatibility and post-run isolation
 
-- Added Spectrum compatibility for the MiniMax H3 integration in **ComfyUI-Flux.2-Untwisting-RoPE**, including distinct cache identity, hard-boundary anchoring, and stacking with Diff-Aid.
+- Added Spectrum compatibility for the MiniMax H3 integration in [**ComfyUI-Untwisting-RoPE**](https://github.com/xmarre/ComfyUI-Untwisting-RoPE), including distinct cache identity, hard-boundary anchoring, and stacking with Diff-Aid.
 - Moved optional generic-correction post-run analysis into an isolated subprocess and hardened crash, timeout, and process cleanup so diagnostic failures cannot terminate a completed generation.
 
 ### v0.2.15 — H3 Continuum interoperability
@@ -226,7 +226,7 @@ Spectrum consumes versioned pure-data compatibility metadata from reviewed MiniM
 Two patch families are currently recognized:
 
 - **ComfyUI-DiffAid-Patches v1.0.6+** — `text_activation_modulation`, using `spectrum_h3_external_patch_contracts` plus `spectrum_h3_external_patch_runtime`.
-- **ComfyUI-Flux.2-Untwisting-RoPE MiniMax H3 integration** — `visual_reference_attention_modulation`, using `spectrum_h3_visual_reference_patch_profiles` plus `spectrum_h3_visual_reference_patch_runtime`.
+- [**ComfyUI-Untwisting-RoPE**](https://github.com/xmarre/ComfyUI-Untwisting-RoPE) MiniMax H3 integration — `visual_reference_attention_modulation`, using `spectrum_h3_visual_reference_patch_profiles` plus `spectrum_h3_visual_reference_patch_runtime`.
 
 The external descriptor contributes runtime identity and cache fingerprinting so patched/unpatched models and behaviorally different profiles cannot alias the same cached Spectrum model profile. Diff-Aid and Untwist retain distinct `kind` values when stacked; debug/model-aware telemetry can therefore report, for example:
 
