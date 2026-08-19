@@ -6,6 +6,27 @@ Spectrum reduces the number of expensive H3 transformer evaluations during sampl
 
 Spectrum is an **approximate accelerator**. Forecasted steps change the denoising trajectory, so output can differ from native H3 even with the same seed and workflow.
 
+## v0.2.16: Untwist compatibility and post-run crash containment
+
+v0.2.16 adds Spectrum-side recognition for the native MiniMax H3 integration in **ComfyUI-Flux.2-Untwisting-RoPE** and releases the post-run research isolation/hardening work merged after v0.2.15.
+
+Untwist publishes a separate visual-reference compatibility namespace:
+
+```text
+spectrum_h3_visual_reference_patch_profiles
+spectrum_h3_visual_reference_patch_runtime
+```
+
+Spectrum validates the producer identity, H3 block coverage, reference scope, active progress window, hard-boundary declarations, high/low scale endpoints, interpolation `beta`, temporal-axis mode, and scalar strength summary. The complete visual configuration participates in the external-patch fingerprint, so behaviorally different Untwist profiles cannot alias the same cached Spectrum profile.
+
+Untwist remains distinct from Diff-Aid's existing `text_activation_modulation` contract. Both patch kinds can be present in one run, remain separately visible in telemetry, and share Spectrum's transaction-level hard-boundary guard. A hard transition that lands on a forecast promotes that current step to one actual H3 evaluation; a transition on an already-actual step adds no duplicate NFE.
+
+The companion Untwist schedule is inclusive at both endpoints. With `end_percent=0.90`, progress exactly at `0.90` is still active; the first solver call after the boundary is the regime transition. Spectrum maps that contract with `normalized_sigma = 1 - progress`, preserving the same inclusive endpoint semantics.
+
+v0.2.16 also moves optional generic-correction post-run evaluation/report work into an isolated Python subprocess after core Spectrum runtime/history state has been released. A native crash in that optional research worker can no longer terminate the completed ComfyUI generation process. The follow-up lifetime hardening preserves CPython faulthandler fatal-signal diagnostics, isolates the POSIX worker process group, bounds timeout/pipe-drain cleanup, and preserves the Windows direct-process path.
+
+The release contains all runtime work merged after v0.2.15: PRs **#64**, **#66**, and **#65**. Current `main` also includes the post-release PR #69 review clarifications and parser regressions; that follow-up changes comments/tests only and does not alter v0.2.16 runtime behavior.
+
 ## v0.2.15: H3 Continuum interoperability
 
 v0.2.15 adds first-class interoperability with **H3 Continuum** through its optional API v1 actual-prefix request. Continuation chunks can require their initial solver steps to remain real H3 transformer evaluations; Spectrum treats that as a run-local scheduling constraint without adding a hard dependency on Continuum.
@@ -91,6 +112,8 @@ MiniMax H3 model loader
 -> Spectrum Apply MiniMax H3
 -> guider / sampler
 ```
+
+External H3 patch nodes that publish Spectrum compatibility metadata should be placed before Spectrum on the model chain. See [Deterministic external patches](#deterministic-external-patches) below.
 
 The current Python defaults are:
 
@@ -240,19 +263,50 @@ That is 11 actual evaluations and 9 forecasts. Fallbacks, model-aware scheduling
 
 The shipping full-mode generic controller uses signed coordinate transport with scalar RLS and a hard `±0.40` gain bound. More experimental reliability/regional controller options remain available for research/reproduction but are not the production default.
 
-## Deterministic external activation patches
+## Deterministic external patches
 
-Spectrum can consume a versioned, pure-data compatibility contract from recognized MiniMax H3 patches that deterministically modify transformer activations. The first supported producer is the MiniMax H3 node in **ComfyUI-DiffAid-Patches v1.0.6+**. The descriptor contributes external-runtime identity and cache fingerprinting so patched and unpatched models cannot alias the same cached profile. Recognized activation modulation is reported separately from LoRA/model-parameter patches.
+Spectrum consumes versioned pure-data compatibility metadata from reviewed MiniMax H3 patches that deterministically change transformer execution. These contracts are runtime metadata only; Spectrum does not import or hard-depend on the producing custom nodes.
 
-The raw structural magnitude of a recognized activation patch is telemetry, not a calibrated parameter-space perturbation metric. It is therefore retained as `external_patch_runtime_perturbation` / `external_patch_final_perturbation` but is not folded into Spectrum's model-aware `patch_risk` prior. Online trajectory evidence still participates normally in model-aware scheduling.
+Two patch families are currently recognized:
 
-For a nonzero external patch with a partial hard sigma window (`sigma_ramp=0`), Spectrum compares the exact normalized-sigma active/inactive state supplied by the producer against the last successfully completed solver step. If the current call is the first call in a new hard modulation regime and it was scheduled as a forecast, Spectrum promotes that **current step** to one actual H3 evaluation so the forecast history immediately receives an anchor from the new regime. The state is committed only after successful step finalization; abort/retry/rollback do not advance it early. Multiple contracts crossing on the same step still require only one actual evaluation.
+- **ComfyUI-DiffAid-Patches v1.0.6+** — `text_activation_modulation`, using `spectrum_h3_external_patch_contracts` plus `spectrum_h3_external_patch_runtime`.
+- **ComfyUI-Flux.2-Untwisting-RoPE MiniMax H3 integration** — `visual_reference_attention_modulation`, using `spectrum_h3_visual_reference_patch_profiles` plus `spectrum_h3_visual_reference_patch_runtime`.
 
-A full `[0,1]` window has no interior transition and adds no compatibility NFE. Smooth `sigma_ramp>0` modulation remains continuous and does not force refreshes solely because its gain changes. The hard-boundary guard remains active when `model_aware_mode=off` because it is a forecast-correctness rule rather than an optional scheduling heuristic.
+The external descriptor contributes runtime identity and cache fingerprinting so patched/unpatched models and behaviorally different profiles cannot alias the same cached Spectrum model profile. Diff-Aid and Untwist retain distinct `kind` values when stacked; debug/model-aware telemetry can therefore report, for example:
 
-This mechanism is independent of the native ER-SDE stochastic-state compensation described above. Diff-Aid is deterministic activation modulation; Spectrum does not reuse ER-SDE stochastic compensation for it. Spectrum also does **not** post-hoc multiply or otherwise scale the forecasted `[audio | video]` target feature to imitate Diff-Aid. The external modulation occurs before selected transformer blocks and is transformed nonlinearly by the remaining network, so the compatible action at a declared discontinuity is to acquire a real anchor.
+```text
+external_patch_kinds=text_activation_modulation,visual_reference_attention_modulation
+```
 
-Validated workflow order:
+Recognized deterministic activation/attention modulation is not treated as a LoRA/model-parameter patch for Spectrum's calibrated model-aware `patch_risk` prior. Diff-Aid's raw structural magnitude remains available as separate `external_patch_runtime_perturbation` / `external_patch_final_perturbation` telemetry, while normal online trajectory evidence continues to participate in scheduling.
+
+### Hard-boundary transaction guard
+
+For a producer-declared hard temporal window, Spectrum compares the current regime against the last successfully completed solver step. If the current call is the first call in a new hard regime and it was scheduled as a forecast, Spectrum promotes that **current step** to one actual H3 evaluation so forecast history immediately receives an anchor from the new regime.
+
+The state is committed only after successful step finalization; abort/retry/rollback do not advance it early. Multiple external contracts crossing on the same solver step still require only one actual evaluation. A transition landing on an already-actual step adds no NFE.
+
+Diff-Aid supplies normalized sigma directly. A full `[0,1]` window has no interior transition and adds no compatibility NFE. Smooth Diff-Aid modulation with `sigma_ramp>0` remains continuous and does not force refreshes solely because its gain changes.
+
+Untwist supplies actual sampler-schedule progress. Spectrum converts it with:
+
+```text
+normalized_sigma = 1 - schedule_progress
+```
+
+The Untwist producer's progress window is inclusive at both endpoints, and Spectrum's external descriptor uses inclusive sigma boundaries as well. `end_percent=0.90` therefore remains active at progress exactly `0.90`; the first call with progress greater than `0.90` is the hard end transition.
+
+The Untwist runtime `active` field is validated as part of the declared runtime shape but is intentionally not the temporal transaction-state input. The producer's value also includes per-call reference-range availability and mapping validity. Temporal regime ownership remains the declared static hard window plus exact schedule progress, preventing reference-selection state from advancing or suppressing the committed hard-boundary regime.
+
+The hard-boundary guard remains active when `model_aware_mode=off` because it is a forecast-correctness rule rather than an optional model-aware scheduling heuristic.
+
+Spectrum does **not** post-hoc multiply or otherwise scale forecasted `[audio | video]` target features to imitate either external patch. These interventions occur inside transformer execution and are transformed nonlinearly by later layers, so a real anchor at a declared discontinuity is the compatible action.
+
+### Workflow order
+
+Place the external patch node before Spectrum on the model chain.
+
+Diff-Aid:
 
 ```text
 Load Diffusion Model
@@ -261,7 +315,26 @@ Load Diffusion Model
 -> guider / scheduler
 ```
 
-In current real testing, a five-block Diff-Aid H3 patch (`1,13,25,37,50`) at strength `0.5` preserved Spectrum's 11-actual / 9-forecast ER-SDE schedule for both `sigma_end=1.0` and `sigma_end=0.95`, with zero model-aware extra NFEs. `sigma_end=0.95` also preserved the intended shot cut in the tested multi-shot prompt while retaining Diff-Aid's prompt-adherence enhancement.
+Untwisting RoPE:
+
+```text
+Load Diffusion Model
+-> MiniMax H3 Untwist RoPE
+-> Spectrum Apply MiniMax H3
+-> guider / scheduler
+```
+
+Stacked:
+
+```text
+Load Diffusion Model
+-> MiniMax H3 Diff-Aid Sparse Patch
+-> MiniMax H3 Untwist RoPE
+-> Spectrum Apply MiniMax H3
+-> guider / scheduler
+```
+
+In current real Diff-Aid testing, a five-block H3 patch (`1,13,25,37,50`) at strength `0.5` preserved Spectrum's 11-actual / 9-forecast ER-SDE schedule for both `sigma_end=1.0` and `sigma_end=0.95`, with zero model-aware extra NFEs. `sigma_end=0.95` also preserved the intended shot cut in the tested multi-shot prompt while retaining Diff-Aid's prompt-adherence enhancement.
 
 ## Offline smoothing replay
 
@@ -303,7 +376,13 @@ Multi-GPU parallel sampling remains native because distributed forecast-row tran
 
 Use `system_ram` for both unless you have a specific reason to keep history in VRAM. Large H3 hidden histories can consume multiple GiB at high resolution/duration.
 
-v0.2.11 also changes post-run diagnostics so generic-correction report persistence/evaluation runs only after core Spectrum history is released and cannot synchronously block a completed sampler result. Debug teardown logs expose calibration-export and runtime-release boundaries when diagnosing WSL/CUDA shutdown stalls.
+Core post-run ordering is:
+
+```text
+calibration export -> core Spectrum runtime/VRAM release -> optional research dispatch
+```
+
+Optional generic-correction evaluation/report work is dispatched only after core runtime/history state has been released. In v0.2.16 it runs in an isolated child process rather than in a Python thread inside ComfyUI. The parent keeps only a bounded watcher/lifetime boundary; one research worker can be active at a time, timeout cleanup is bounded, and native child fatal signals are reported without invalidating the completed sampler result.
 
 No speculative `torch.cuda.empty_cache()` or forced device synchronization is performed during normal teardown.
 
@@ -343,6 +422,8 @@ The package also contains research-only nodes under `sampling/spectrum/research`
 
 The sequential objective capture path is bounded and failure-contained so recoverable research/evaluation errors do not abort unrelated output nodes. True host/CUDA OOM conditions are still allowed to propagate normally.
 
+Separate optional generic-correction post-run analysis uses the v0.2.16 isolated subprocess boundary described above, so a native crash in that optional diagnostic worker is contained outside the ComfyUI generation process.
+
 See [OBJECTIVE_MEDIA_BENCHMARK.md](OBJECTIVE_MEDIA_BENCHMARK.md) for the current R/A/B workflow, metrics, provenance grouping and verdict rules.
 
 ## Debugging
@@ -360,7 +441,7 @@ Spectrum H3 ER-SDE dense output ...
 Spectrum H3 offline transition ... event=er_sde_replay_preview_bypass ...
 Spectrum H3 offline transition ... event=er_sde_callback_begin|er_sde_callback_end ...
 Spectrum H3 ER-SDE replay boundary event=noise_sampler_begin|noise_sampler_end ...
-Spectrum H3 run summary ... external_patch_transitions=... external_patch_forced_actuals=... external_patch_contract_failures=...
+Spectrum H3 run summary ... external_patch_kinds=... external_patch_transitions=... external_patch_forced_actuals=... external_patch_contract_failures=...
 Spectrum H3 teardown transition ...
 Spectrum H3 run teardown ...
 ```
