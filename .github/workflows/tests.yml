@@ -18,6 +18,7 @@ jobs:
           - 0dd9b154a1654fc699dcdc3af066c7cce096045a
           - 5599a05fea715cb2aff11f30f5b06e16d0dfa0c4
           - 27bca654eb9a70237d93f56a6ea336ab55f8925d
+          - ff6c8a8af144fc9e9e7bc436b1b202f9316848d8
         python_version:
           - "3.12"
         include:
@@ -78,6 +79,7 @@ jobs:
             comfyui_spectrum_h3/experiments.py \
             comfyui_spectrum_h3/er_sde_ksampler_contract.py \
             comfyui_spectrum_h3/er_sde_stochastic.py \
+            comfyui_spectrum_h3/minimax_h3.py \
             comfyui_spectrum_h3/objective_media.py \
             comfyui_spectrum_h3/objective_media_bounded.py \
             comfyui_spectrum_h3/objective_media_nodes.py \
@@ -96,6 +98,9 @@ jobs:
             tests/test_generic_correction_evaluator.py \
             tests/test_generic_correction_research.py \
             tests/test_generic_correction_research_regional_summary.py \
+            tests/test_h3_masked_forecast.py \
+            tests/test_h3_masked_native_equivalence.py \
+            tests/test_h3_masked_native_wrapper.py \
             tests/test_model_aware.py \
             tests/test_objective_media.py \
             tests/test_objective_media_bounded.py \
@@ -121,6 +126,9 @@ jobs:
             tests/test_external_patch_hardening.py \
             tests/test_external_patch_transaction_parity.py \
             tests/test_h3_wrapper.py \
+            tests/test_h3_masked_forecast.py \
+            tests/test_h3_masked_native_equivalence.py \
+            tests/test_h3_masked_native_wrapper.py \
             tests/test_runtime.py \
             tests/test_sampling.py \
             tests/test_model_aware.py \
@@ -137,6 +145,9 @@ jobs:
             --ignore=tests/test_external_patch_hardening.py \
             --ignore=tests/test_external_patch_transaction_parity.py \
             --ignore=tests/test_h3_wrapper.py \
+            --ignore=tests/test_h3_masked_forecast.py \
+            --ignore=tests/test_h3_masked_native_equivalence.py \
+            --ignore=tests/test_h3_masked_native_wrapper.py \
             --ignore=tests/test_runtime.py \
             --ignore=tests/test_sampling.py \
             --ignore=tests/test_model_aware.py \

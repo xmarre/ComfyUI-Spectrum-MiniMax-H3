@@ -183,8 +183,8 @@ def topology_signature(
 class _OutputState:
     layout: Any
     t_emb: torch.Tensor
-    video_timestep_row: int
-    audio_timestep_row: int
+    video_timestep_row: int | torch.Tensor
+    audio_timestep_row: int | torch.Tensor
     sigma_v: torch.Tensor
     shift_v: float
     shift_a: float
@@ -201,6 +201,8 @@ def _prepare_output_state(
     transformer_options: dict[str, Any],
     payload: dict[str, Any],
     layout: Any,
+    denoise_mask: torch.Tensor | None = None,
+    audio_denoise_mask: torch.Tensor | None = None,
 ) -> _OutputState:
     import comfy.model_management
 
@@ -214,14 +216,87 @@ def _prepare_output_state(
     t_a = float(1.0 - module.time_shift_sigma(sigma_v, shift_v, shift_a))
     visual_aug = float(payload.get("visual_cond_noise_aug", getattr(module, "VISUAL_COND_TIMESTEP", 0.999)))
     audio_aug = float(payload.get("audio_cond_noise_aug", getattr(module, "AUDIO_COND_TIMESTEP", 1.0)))
-    has_visual_condition = any(kind in ("cond", "ref_img") for _, _, kind in layout.segments)
-    has_audio_condition = any(kind == "ref_audio" for _, _, kind in layout.segments)
+    seg_t = {
+        "text": t_v,
+        "video": t_v,
+        "audio": t_a,
+        "cond": max(t_v, visual_aug),
+        "ref_img": max(t_v, visual_aug),
+        "cond_audio": max(t_a, audio_aug),
+        "ref_audio": max(t_a, audio_aug),
+    }
+
+    padded_t, padded_h, padded_w = _padded_shape(tuple(video_x.shape), tuple(inner.patch_size))
+    video_rows_t = None
+    audio_rows_t = None
+    if denoise_mask is not None:
+        mask_row_values = getattr(module, "mask_row_values", None)
+        if not callable(mask_row_values):
+            raise RuntimeError(
+                "native MiniMax H3 module does not expose mask_row_values for per-token VIDEO masks"
+            )
+        mask_rows = mask_row_values(
+            denoise_mask[0, 0].to(torch.float32),
+            padded_t,
+            padded_h,
+            padded_w,
+        )
+        if mask_rows is not None:
+            rows_t = (1.0 - mask_rows * sigma_v.to(mask_rows.device)).clamp(
+                max=max(t_v, getattr(module, "VISUAL_COND_TIMESTEP", 0.999))
+            )
+            if rows_t.unique().numel() == 1:
+                seg_t["video"] = float(rows_t[0])
+            else:
+                video_rows_t = rows_t
+
+    if audio_denoise_mask is not None:
+        mask_rows = audio_denoise_mask[0, 0].to(torch.float32).reshape(-1)
+        expected_audio_rows = int(audio_x.shape[-1]) * int(audio_x.shape[-2])
+        if int(mask_rows.numel()) != expected_audio_rows:
+            raise RuntimeError(
+                "native MiniMax H3 audio denoise mask row count does not match target AUDIO rows: "
+                f"expected {expected_audio_rows}, got {int(mask_rows.numel())}"
+            )
+        if not bool((mask_rows >= 1.0 - 1e-3).all()):
+            sigma_a = 1.0 - t_a
+            rows_t = (1.0 - mask_rows * sigma_a).clamp(
+                max=max(t_a, getattr(module, "AUDIO_COND_TIMESTEP", 1.0))
+            )
+            if rows_t.unique().numel() == 1:
+                seg_t["audio"] = float(rows_t[0])
+            else:
+                audio_rows_t = rows_t
+
     unique_t = sorted(
         {t_v, t_a}
-        | ({max(t_v, visual_aug)} if has_visual_condition else set())
-        | ({max(t_a, audio_aug)} if has_audio_condition else set())
+        | {seg_t[kind] for _, _, kind in layout.segments}
+        | (set(video_rows_t.unique().tolist()) if video_rows_t is not None else set())
+        | (set(audio_rows_t.unique().tolist()) if audio_rows_t is not None else set())
     )
     timestep_row = {value: index for index, value in enumerate(unique_t)}
+
+    def rows_to_timestep_index(rows_t: torch.Tensor) -> torch.Tensor:
+        levels = rows_t.unique()
+        base = torch.tensor(
+            [timestep_row[value] for value in levels.tolist()],
+            dtype=torch.long,
+            device=device,
+        )
+        positions = torch.searchsorted(levels, rows_t).to(device=device)
+        return base[positions]
+
+    video_timestep_row: int | torch.Tensor
+    audio_timestep_row: int | torch.Tensor
+    if video_rows_t is None:
+        video_timestep_row = timestep_row[seg_t["video"]]
+    else:
+        video_timestep_row = rows_to_timestep_index(video_rows_t)
+    if audio_rows_t is None:
+        audio_timestep_row = timestep_row[seg_t["audio"]]
+    else:
+        audio_timestep_row = rows_to_timestep_index(audio_rows_t)
+
     values = torch.tensor(unique_t, dtype=torch.float32, device=device)
     if inner.use_adaln_curves:
         table = comfy.model_management.cast_to(inner.adaln_t_table, device=device)
@@ -233,13 +308,13 @@ def _prepare_output_state(
     return _OutputState(
         layout=layout,
         t_emb=t_emb,
-        video_timestep_row=timestep_row[t_v],
-        audio_timestep_row=timestep_row[t_a],
+        video_timestep_row=video_timestep_row,
+        audio_timestep_row=audio_timestep_row,
         sigma_v=sigma_v,
         shift_v=shift_v,
         shift_a=shift_a,
         original_video_shape=tuple(int(v) for v in video_x.shape[-3:]),
-        padded_video_shape=_padded_shape(tuple(video_x.shape), tuple(inner.patch_size)),
+        padded_video_shape=(padded_t, padded_h, padded_w),
     )
 
 
@@ -330,6 +405,8 @@ def _execute_actual(
                 transformer_options,
                 minimax_payload or {},
                 layout,
+                denoise_mask=kwargs.get("denoise_mask"),
+                audio_denoise_mask=kwargs.get("audio_denoise_mask"),
             )
             output_head_started = time.perf_counter()
             try:
@@ -436,20 +513,6 @@ def diffusion_model_wrapper(
             minimax_payload=minimax_payload,
             **kwargs,
         )
-    if kwargs.get("denoise_mask") is not None or kwargs.get("audio_denoise_mask") is not None:
-        runtime.fallback_current_step(
-            int(run_id),
-            int(step_id),
-            "per-token denoise masks require native MiniMax H3 evaluation",
-        )
-        return executor(
-            x,
-            timestep,
-            context,
-            options,
-            minimax_payload=minimax_payload,
-            **kwargs,
-        )
     if not isinstance(x, (list, tuple)) or len(x) != 2:
         runtime.fallback_current_step(int(run_id), int(step_id), "native H3 input is not a video/audio latent pair")
         return executor(x, timestep, context, options, minimax_payload=minimax_payload, **kwargs)
@@ -508,6 +571,27 @@ def diffusion_model_wrapper(
             residual_probe,
         )
 
+    if kwargs.get("denoise_mask") is not None:
+        module = _native_module(inner)
+        if not callable(getattr(module, "mask_row_values", None)):
+            reason = "native MiniMax H3 core lacks mask_row_values for masked forecasting"
+            runtime.fallback_current_step(int(run_id), int(step_id), reason)
+            return _execute_actual(
+                executor,
+                inner,
+                runtime,
+                int(run_id),
+                int(step_id),
+                call_id,
+                layout,
+                x,
+                timestep,
+                context,
+                options,
+                minimax_payload,
+                kwargs,
+            )
+
     predicted = runtime.predict(
         int(run_id),
         int(step_id),
@@ -553,7 +637,18 @@ def diffusion_model_wrapper(
     if event is not None and runtime.config.debug:
         LOG.warning("Spectrum H3 forecast sanitized run_id=%s step=%s event=%s", run_id, step_id, event)
     try:
-        state = _prepare_output_state(inner, video_x, audio_x, timestep, context, options, payload, layout)
+        state = _prepare_output_state(
+            inner,
+            video_x,
+            audio_x,
+            timestep,
+            context,
+            options,
+            payload,
+            layout,
+            denoise_mask=kwargs.get("denoise_mask"),
+            audio_denoise_mask=kwargs.get("audio_denoise_mask"),
+        )
         output = _execute_forecast(inner, sanitized, state, video_x, audio_x)
     except torch.cuda.OutOfMemoryError:
         raise

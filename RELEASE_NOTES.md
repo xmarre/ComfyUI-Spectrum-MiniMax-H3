@@ -1,96 +1,55 @@
-# Spectrum MiniMax H3 v0.2.16
+# Spectrum MiniMax H3 v0.2.17
 
-v0.2.16 releases the MiniMax H3 Untwisting RoPE compatibility consumer from PR #65 together with the post-run research isolation and process-lifetime hardening already merged in PRs #64 and #66.
+v0.2.17 completes the current H3 Continuum interoperability work: native masked continuation can remain forecast-capable where the installed ComfyUI core exposes the required per-token H3 mask helper, and the learned-latent sampler-2 refinement path can use Spectrum without inheriting sampler-1's Continuum actual-prefix policy.
 
-The release does not change Spectrum's normal forecasting defaults, sampler cadence, generic-correction defaults, native ER-SDE stochastic ownership, or offline-replay policy.
+## Native Masked H3 forecasting
 
-## Untwisting RoPE visual-reference compatibility
+Spectrum now reconstructs native MiniMax H3 FinalLayer modulation for mixed VIDEO/AUDIO denoise masks instead of disabling forecasting for the entire masked continuation chunk.
 
-Spectrum now recognizes a separate versioned external-patch contract for deterministic MiniMax H3 visual-reference attention modulation produced by the H3 Untwisting RoPE integration.
+- Per-row VIDEO and AUDIO timestep selections follow native H3 mask semantics.
+- Scalar fully-generating paths retain the existing fast path.
+- Residual/shadow output-head evaluation uses the same reconstruction.
+- Per-row timestep index tensors are placed on the target latent device, avoiding CPU/CUDA index-device mismatches in FinalLayer implementations that use `index_select`.
+- On older reviewed ComfyUI cores that do not expose `mask_row_values`, a masked forecast fails closed to one native H3 transformer evaluation instead of raising during output-head reconstruction.
+- Malformed audio mask layouts continue to fail explicitly.
 
-The new producer namespace is intentionally separate from the existing Diff-Aid contract:
+## Short learned-latent refinement
 
-```text
-spectrum_h3_visual_reference_patch_profiles
-spectrum_h3_visual_reference_patch_runtime
-```
+The integrated MiniMax H3 latent upscaler/refiner supplies an explicit `h3_refinement` API-v1 marker on a clone of Continuum's exact per-chunk MODEL. Spectrum validates that contract and lets its sampler-2 actual-prefix policy override the generation-only Continuum prefix carried by sampler 1.
 
-This preserves the strict v0.2.12 Diff-Aid `text_activation_modulation` schema while allowing Untwist to declare `visual_reference_attention_modulation` without being misidentified as a Diff-Aid patch or rejected into the all-actual fail-safe.
-
-Spectrum validates the visual-reference profile's:
-
-- schema version, provider, architecture, patch kind, and unique instance identity;
-- H3 block count and zero-based block coverage;
-- reference scope;
-- active denoising-progress interval and producer-declared hard boundaries;
-- high/low frequency scale endpoints;
-- interpolation `beta`;
-- temporal-axis scaling mode;
-- scalar strength summary against the declared endpoint scales.
-
-The full visual strength/configuration metadata participates in the external profile fingerprint, so behaviorally different Untwist profiles cannot alias the same Spectrum model-profile cache entry.
-
-Per-call runtime progress is converted into Spectrum's existing normalized-sigma transaction guard. Only boundaries explicitly declared hard by the producer become compatibility transitions. If such a boundary is crossed on a step that Spectrum had scheduled as a forecast, that current step is promoted to one real H3 transformer evaluation. A transition landing on an already-actual step adds no duplicate NFE.
-
-The default companion Untwist window ending at `end_percent=0.90` is covered by regression tests: the first forecast after crossing the hard end boundary is promoted to an actual anchor.
-
-Diff-Aid and Untwist descriptors can be stacked in the same run. Their kinds remain distinct in runtime/model-aware telemetry, for example:
+Normal Continuum generation still preserves its two-step actual prefix. A valid three-step sampler-2 refinement can therefore use:
 
 ```text
-external_patch_kinds=text_activation_modulation,visual_reference_attention_modulation
+actual -> forecast -> actual
 ```
 
-Malformed or inconsistent declared metadata continues to use Spectrum's existing fail-safe behavior rather than allowing an ambiguous forecast transaction. The compatibility layer adds no hard dependency on the Untwisting RoPE custom node; Spectrum only consumes the declared pure-data contract when it is present.
+with the normal warmup/final-tail safety rules.
 
-## Post-run research process isolation
+Spectrum continues to honor genuine external-patch hard transitions. DiffAid v1.0.7 removes the artificial partial-denoise transition at its source by evaluating marked refinement against the full H3 sigma reference; Spectrum does not bypass a real model-function transition.
 
-PR #64 moves optional generic-correction post-run evaluation/report work out of the ComfyUI process and into an isolated Python subprocess.
+## Coordinated runtime validation
 
-The previous in-process daemon-thread boundary could not satisfy Spectrum's post-run safety invariant: a native SIGSEGV in any Python thread terminates the entire process and cannot be contained by `except Exception`. A completed generation could therefore be lost after sampling had already finished while optional research analysis was running.
+The complete real CUDA path was validated with:
 
-The isolated path now:
+- H3 Continuum exact `refine_state` handoff;
+- MiniMax H3 learned latent upscale + internal sampler-2 refinement;
+- DiffAid marked-refinement sigma semantics;
+- Untwisting RoPE external-patch metadata;
+- native ER-SDE;
+- Spectrum enabled on both the main Continuum generation and sampler 2.
 
-- releases core Spectrum runtime/history state before optional research dispatch;
-- starts the research worker through an isolated stdlib bootstrap with `-I` and `faulthandler`;
-- keeps only a lightweight watcher thread in the ComfyUI process for child I/O and lifetime management;
-- retains the single-worker bound so diagnostic jobs cannot accumulate;
-- caps stalled analysis and reports Python failures, timeouts, and fatal signals without invalidating the completed sampler result;
-- preserves the ordering invariant `calibration export -> core runtime/VRAM release -> optional research dispatch`.
+A three-step high-resolution refinement produced `2 actual + 1 forecast` per refined chunk, with no inherited Continuum-prefix force-actual and no artificial DiffAid middle-step transition. The resulting media quality was user-validated as impeccable.
 
-Forecasting math, native ER-SDE behavior, offline replay, generic-correction controller math, and downstream VAE/output execution are unchanged by this isolation.
+The tested 0.7 MP native -> 1.75x learned-upscale workflow reduced the Refine node from roughly 302.5 s with three native refinement NFEs to roughly 212.7 s with the middle NFE forecast, while preserving the tested output quality.
 
-## Fatal-signal and timeout teardown hardening
+## Validation and compatibility
 
-The first isolation implementation exposed a runner-specific process-lifetime race after PR #64 merged. A child could already have emitted CPython faulthandler's canonical `Fatal Python error: Segmentation fault` diagnostic while still failing to become reapable before the watcher's timeout. Killing it at that point could replace the useful native-signal diagnosis with the cleanup signal. The timeout cleanup also had an unbounded final `communicate()` path if descendants retained the worker's stdout/stderr pipes.
+The PR test matrix covers Python 3.10-3.13, the forecaster smoke test, Ruff/compileall, focused H3/external compatibility suites, and native MiniMax H3 fixtures across the reviewed ComfyUI revisions.
 
-PR #66 hardens that boundary by:
+This release is coordinated with:
 
-- recognizing only CPython faulthandler's canonical fatal-error markers and normalizing them to signal names such as `SIGSEGV`;
-- preserving an already-observed fatal-signal diagnosis even when the child has not become reapable by the deadline;
-- retaining direct negative-return-code signal reporting for normally reaped children;
-- best-effort disabling POSIX core dumps before the worker executes;
-- launching the worker in its own POSIX session/process group;
-- terminating the whole research process group on timeout so descendants cannot keep inherited pipes alive;
-- bounding the post-kill drain with a separate termination grace period and closing parent pipe handles if cleanup still cannot drain;
-- preserving the Windows direct-process termination path;
-- preserving the single-worker bound and non-blocking sampler teardown.
+- ComfyUI-DiffAid-Patches v1.0.7;
+- H3 Continuum v3.4.1;
+- the integrated MiniMax H3 Latent Upscaler + Refine release.
 
-This fixes the violated lifetime/diagnostic invariant without broadening the research worker's authority over the generation process.
-
-## Included merged work since v0.2.15
-
-This release contains all runtime work merged after v0.2.15:
-
-- **#64 — Isolate post-run generic-correction research from ComfyUI**
-- **#66 — Harden isolated research crash and timeout teardown**
-- **#65 — Recognize Untwist H3 visual-reference external patch profiles**
-
-The v0.2.15 H3 Continuum interoperability and native ER-SDE post-prefix solver-space fix remain included unchanged, along with the v0.2.14 replay-preview safety, v0.2.13 Python 3.13 provenance normalization, and v0.2.12 Diff-Aid compatibility layer.
-
-## Validation and release boundary
-
-PR #65 passed the repository `tests` workflow on its implementation head before merge. Its regression coverage checks stacked Diff-Aid/Untwist recognition, distinct runtime patch kinds, strength-profile fingerprinting, hard `end_percent=0.90` boundary promotion, and required runtime/static contract consistency.
-
-PR #64 added isolation coverage for non-blocking dispatch, worker-slot lifetime, child failures, package-entrypoint avoidance, and intentional child SIGSEGV containment. PR #66 added deterministic fatal-marker normalization, POSIX core-dump/bootstrap checks, delayed-reap SIGSEGV handling, process-group timeout cleanup, and descendant-pipe teardown coverage.
-
-The v0.2.16 release commit changes release metadata only. The exact combined runtime tree is the already-merged `main` state containing #64, #66, and #65. The release remains gated by the repository's existing CI workflow: after this version bump is merged to `main`, the Comfy Registry publish workflow is triggered by `pyproject.toml`, and the GitHub release workflow publishes `v0.2.16` only from a successful tested `main` commit.
+Existing Spectrum defaults, generic-correction defaults, normal 19-step Continuum forecasting policy, ER-SDE stochastic ownership, offline-replay policy, and real external-patch transition barriers remain unchanged.

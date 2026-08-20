@@ -9,6 +9,7 @@ from .generic_correction import install_generic_residual_correction
 from .minimax_h3 import locate_minimax_h3_inner, require_native_minimax_h3
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .postrun_safety import install_postrun_safety
+from .refinement_compat import install_refinement_compat
 from .replay_calibration import install_replay_calibration
 from .replay_calibration_provenance import install_replay_calibration_provenance
 from .replay_calibration_validation import install_replay_calibration_validation
@@ -34,6 +35,7 @@ install_replay_calibration()
 install_replay_calibration_validation()
 install_replay_calibration_provenance()
 install_er_sde_tail_policy()
+install_refinement_compat()
 install_external_patch_compat()
 install_visual_reference_patch_compat()
 install_external_patch_hardening()
