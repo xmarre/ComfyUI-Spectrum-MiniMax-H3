@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import importlib.abc
+import importlib.util
+import sys
 from dataclasses import dataclass
+from types import ModuleType
 from typing import ClassVar
 
 import torch
@@ -15,10 +19,85 @@ REFDELTA_INTEROP_CONTRACT = (
     "actual-anchor-history",
     "exact-gated-stochastic-increment",
 )
+_REFDELTA_CANONICAL_PACKAGE = "comfyui_refdelta_solver"
+_REFDELTA_ALIAS_METADATA = frozenset(
+    {
+        "__name__",
+        "__package__",
+        "__loader__",
+        "__spec__",
+        "__path__",
+        "__file__",
+        "__cached__",
+    }
+)
 
 
 class RefDeltaInteropError(RuntimeError):
     """The reviewed Spectrum/RefDelta interop state became inconsistent."""
+
+
+class _RefDeltaNamespaceAliasLoader(importlib.abc.Loader):
+    """Expose an already-loaded ComfyUI RefDelta module under its canonical name."""
+
+    def __init__(self, target: ModuleType) -> None:
+        self.target = target
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module: ModuleType) -> None:
+        target = self.target
+        for name, value in vars(target).items():
+            if name not in _REFDELTA_ALIAS_METADATA:
+                module.__dict__[name] = value
+        module.__doc__ = getattr(target, "__doc__", None)
+        target_file = getattr(target, "__file__", None)
+        if target_file is not None:
+            module.__file__ = target_file
+
+
+class _RefDeltaNamespaceAliasFinder(importlib.abc.MetaPathFinder):
+    """Resolve ComfyUI's package-relative RefDelta namespace without re-importing it."""
+
+    def find_spec(self, fullname: str, path=None, target=None):
+        if fullname != _REFDELTA_CANONICAL_PACKAGE and not fullname.startswith(
+            f"{_REFDELTA_CANONICAL_PACKAGE}."
+        ):
+            return None
+
+        suffix = fullname[len(_REFDELTA_CANONICAL_PACKAGE) :]
+        nested_suffix = f".{_REFDELTA_CANONICAL_PACKAGE}{suffix}"
+        candidates: dict[int, ModuleType] = {}
+        for module_name, module in tuple(sys.modules.items()):
+            if (
+                module is not None
+                and module_name != fullname
+                and module_name.endswith(nested_suffix)
+            ):
+                candidates[id(module)] = module
+        if len(candidates) != 1:
+            return None
+
+        target_module = next(iter(candidates.values()))
+        return importlib.util.spec_from_loader(
+            fullname,
+            _RefDeltaNamespaceAliasLoader(target_module),
+            is_package=hasattr(target_module, "__path__"),
+        )
+
+
+def _install_refdelta_namespace_alias_finder() -> None:
+    """Prefer the live ComfyUI-loaded RefDelta package when it has a nested namespace."""
+    if any(isinstance(finder, _RefDeltaNamespaceAliasFinder) for finder in sys.meta_path):
+        return
+    # ComfyUI imports custom nodes as package-relative modules. Put this narrow finder
+    # before PathFinder so the sampler currently wired into the workflow remains the
+    # provenance source even if another top-level RefDelta checkout is importable.
+    sys.meta_path.insert(0, _RefDeltaNamespaceAliasFinder())
+
+
+_install_refdelta_namespace_alias_finder()
 
 
 @dataclass(slots=True)
