@@ -955,9 +955,15 @@ def _run_tracked_er_sde(
     if not supported:
         assert reason is not None
         runtime.disable_forecasting_for_run(reason)
+        fallback = (
+            "RefDelta all-actual"
+            if sampler_name(executor.class_obj) == REFDELTA_SAMPLER_NAME
+            else "native all-actual"
+        )
         LOG.warning(
-            "Spectrum H3 disabled for this ER-SDE run; preserving all-actual "
+            "Spectrum H3 disabled for this ER-SDE run; preserving %s "
             "sampling because stochastic compensation is unavailable: %s",
+            fallback,
             reason,
         )
         return executor(
