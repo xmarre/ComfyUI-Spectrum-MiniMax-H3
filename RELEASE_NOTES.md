@@ -14,6 +14,7 @@ v0.2.18 adds explicit compatibility with MiniMax H3 RefDelta Solver v0.2.0+.
 ## Validation and failure policy
 
 The test matrix covers the shared API contract, exact gated-increment transfer, missing-publication rejection, actual/forecast/replay classification, native ComfyUI contracts, Python 3.12/3.13, Ruff, compileall, and wheel construction. Unreviewed RefDelta versions, options, stochastic callbacks, wrapper ordering, or bridge state disable forecasting or fail explicitly rather than silently changing stochastic ownership.
+The cross-repository jobs pin the exact RefDelta API-v1 commit reviewed for this release.
 
 Existing native ER-SDE, Euler, RES multistep, Turbo, Continuum, Diff-Aid, Untwisting RoPE, masked H3, refinement, model-aware, and offline-replay behavior remains unchanged.
 
