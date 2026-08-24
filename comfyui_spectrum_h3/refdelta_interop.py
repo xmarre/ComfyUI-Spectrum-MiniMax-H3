@@ -4,6 +4,7 @@ import importlib.abc
 import importlib.util
 import sys
 from dataclasses import dataclass
+from functools import wraps
 from types import ModuleType
 from typing import ClassVar
 
@@ -31,6 +32,7 @@ _REFDELTA_ALIAS_METADATA = frozenset(
         "__cached__",
     }
 )
+_REFDELTA_TRACKER_BRIDGE_MARKER = "__spectrum_refdelta_bridge__"
 
 
 class RefDeltaInteropError(RuntimeError):
@@ -110,6 +112,43 @@ class RefDeltaInteropBridge:
     )
     _descriptor: ERSDEStepDescriptor | None = None
 
+    def __post_init__(self) -> None:
+        """Observe the exact descriptor successfully consumed by stochastic tracking.
+
+        ComfyUI can reconstruct model-option dictionaries between the sampler and
+        PREDICT_NOISE layers. RefDelta keeps the bridge from the sampler's extra_args,
+        while Spectrum's stochastic tracker is the object that actually consumes the
+        post-model descriptor. Bind this bridge to that tracker instance so provenance
+        follows the successful consume operation instead of depending on a second
+        model-options lookup finding the bridge object after the model call.
+        """
+        tracker = self.tracker
+        if tracker is None:
+            return
+        consume = tracker.consume
+        consume_function = getattr(consume, "__func__", consume)
+        owner = getattr(consume_function, _REFDELTA_TRACKER_BRIDGE_MARKER, None)
+        if owner is not None and owner is not self:
+            raise RefDeltaInteropError(
+                "ER-SDE tracker is already bound to another Spectrum RefDelta bridge"
+            )
+
+        @wraps(consume)
+        def consume_with_refdelta_provenance(
+            denoised: torch.Tensor,
+            descriptor: ERSDEStepDescriptor,
+        ) -> torch.Tensor:
+            result = consume(denoised, descriptor)
+            self.note_model_result(descriptor)
+            return result
+
+        setattr(
+            consume_with_refdelta_provenance,
+            _REFDELTA_TRACKER_BRIDGE_MARKER,
+            self,
+        )
+        tracker.consume = consume_with_refdelta_provenance
+
     def note_model_result(self, descriptor: ERSDEStepDescriptor) -> None:
         if descriptor.run_id != self.run_id:
             raise RefDeltaInteropError("stale Spectrum RefDelta run descriptor")
@@ -118,8 +157,10 @@ class RefDeltaInteropBridge:
     def model_result_is_actual(self, step_id: int) -> bool:
         descriptor = self._descriptor
         if descriptor is None or descriptor.step_id != int(step_id):
+            current = "none" if descriptor is None else str(descriptor.step_id)
             raise RefDeltaInteropError(
-                "RefDelta requested a model-result classification for the wrong step"
+                "RefDelta requested a model-result classification for the wrong step "
+                f"(requested={int(step_id)}, observed={current})"
             )
         if descriptor.mode == "actual":
             return True
@@ -138,8 +179,10 @@ class RefDeltaInteropBridge:
     ) -> None:
         descriptor = self._descriptor
         if descriptor is None or descriptor.step_id != int(source_step_id):
+            current = "none" if descriptor is None else str(descriptor.step_id)
             raise RefDeltaInteropError(
-                "RefDelta published a stochastic increment for the wrong step"
+                "RefDelta published a stochastic increment for the wrong step "
+                f"(source={int(source_step_id)}, observed={current})"
             )
         if self.tracker is None:
             raise RefDeltaInteropError(
