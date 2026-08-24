@@ -1,4 +1,24 @@
-# Spectrum MiniMax H3 v0.2.18
+# Spectrum MiniMax H3 v0.2.19
+
+v0.2.19 fixes RefDelta Solver discovery in the actual ComfyUI custom-node loading layout.
+
+## RefDelta custom-node namespace discovery
+
+- Fixes the runtime failure `RefDelta interop API is unavailable: No module named 'comfyui_refdelta_solver'` that could occur even though the RefDelta sampler itself was already loaded and usable by ComfyUI.
+- Spectrum now recognizes the already-loaded RefDelta implementation when ComfyUI has placed it under a package-relative custom-node namespace instead of exposing `comfyui_refdelta_solver` as a top-level package.
+- Canonical RefDelta imports reuse the exact live config class, sampler function, and interop contract objects instead of importing the same files a second time under a different module identity.
+- The existing strict RefDelta API-v1 checks remain unchanged: function identity, config provenance, interop version, option allowlist, stochastic ownership, and wrapper ordering still fail closed on drift.
+- No `PYTHONPATH` changes, pip installation, duplicated model path, or workflow changes are required.
+
+## Validation
+
+PR #76 adds a regression for the exact nested ComfyUI package layout that produced the failure. The complete six-lane Spectrum ComfyUI/Python matrix passes, including Ruff, compileall, focused external compatibility tests, and native MiniMax H3 fixtures. CodeRabbit reported no actionable findings on the substantive compatibility change.
+
+This patch changes discovery only. RefDelta solver behavior, Spectrum forecasting policy, stochastic compensation, Continuum interoperability, Diff-Aid handling, Untwisting RoPE handling, and offline replay semantics remain unchanged.
+
+---
+
+## v0.2.18
 
 v0.2.18 adds explicit compatibility with MiniMax H3 RefDelta Solver v0.2.0+.
 
