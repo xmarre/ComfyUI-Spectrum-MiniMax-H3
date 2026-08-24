@@ -1,0 +1,1 @@
+Regression coverage note: test_refdelta_interop.py exercises the actual ComfyUI package-relative RefDelta namespace, where the implementation is loaded below the custom-node package and no top-level comfyui_refdelta_solver package exists.
