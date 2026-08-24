@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from types import ModuleType
+
 import pytest
 import torch
 
@@ -7,7 +10,10 @@ from comfyui_spectrum_h3.er_sde_stochastic import (
     ERSDEStepDescriptor,
     ERSDEStochasticTracker,
 )
-from comfyui_spectrum_h3.refdelta_interop import RefDeltaInteropBridge
+from comfyui_spectrum_h3.refdelta_interop import (
+    REFDELTA_INTEROP_CONTRACT,
+    RefDeltaInteropBridge,
+)
 from comfyui_spectrum_h3.sampling import _refdelta_sampler_contract
 
 
@@ -48,6 +54,73 @@ def test_refdelta_native_equivalence_uses_native_increment_tracking():
 
     assert accepted, reason
     assert not external_increment
+
+
+def test_comfyui_nested_refdelta_namespace_is_resolved_without_top_level_package():
+    nested_package = "custom_nodes.synthetic_refdelta.comfyui_refdelta_solver"
+    canonical_names = (
+        "comfyui_refdelta_solver",
+        "comfyui_refdelta_solver.config",
+        "comfyui_refdelta_solver.sampler",
+        "comfyui_refdelta_solver.spectrum_interop",
+    )
+    nested_names = (
+        nested_package,
+        f"{nested_package}.config",
+        f"{nested_package}.sampler",
+        f"{nested_package}.spectrum_interop",
+    )
+    previous = {name: sys.modules.get(name) for name in canonical_names}
+
+    package_module = ModuleType(nested_package)
+    package_module.__path__ = []
+    config_module = ModuleType(nested_names[1])
+    sampler_module = ModuleType(nested_names[2])
+    interop_module = ModuleType(nested_names[3])
+
+    class RefDeltaSamplerConfig:
+        is_native_equivalence_mode = False
+
+        def validate(self):
+            return None
+
+    def sample_refdelta_er_sde():
+        return None
+
+    sample_refdelta_er_sde.__spectrum_interop_contract__ = REFDELTA_INTEROP_CONTRACT
+    config_module.RefDeltaSamplerConfig = RefDeltaSamplerConfig
+    sampler_module.sample_refdelta_er_sde = sample_refdelta_er_sde
+    interop_module.SPECTRUM_INTEROP_CONTRACT = REFDELTA_INTEROP_CONTRACT
+
+    try:
+        for name in canonical_names:
+            sys.modules.pop(name, None)
+        sys.modules[nested_names[0]] = package_module
+        sys.modules[nested_names[1]] = config_module
+        sys.modules[nested_names[2]] = sampler_module
+        sys.modules[nested_names[3]] = interop_module
+
+        config = RefDeltaSamplerConfig()
+        accepted, reason, external_increment = _refdelta_sampler_contract(
+            sample_refdelta_er_sde,
+            {"config": config, "s_noise": 1.0, "max_stage": 3},
+        )
+
+        assert accepted, reason
+        assert external_increment
+        assert sys.modules["comfyui_refdelta_solver.config"].RefDeltaSamplerConfig is RefDeltaSamplerConfig
+        assert (
+            sys.modules["comfyui_refdelta_solver.sampler"].sample_refdelta_er_sde
+            is sample_refdelta_er_sde
+        )
+    finally:
+        for name in canonical_names:
+            sys.modules.pop(name, None)
+        for name in nested_names:
+            sys.modules.pop(name, None)
+        for name, module in previous.items():
+            if module is not None:
+                sys.modules[name] = module
 
 
 def test_bridge_and_tracker_transfer_exact_gated_increment_end_to_end():
