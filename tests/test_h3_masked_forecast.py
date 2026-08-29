@@ -22,6 +22,41 @@ class _FakeFinalLayer:
         )
 
 
+class _FakePDDFinalLayer:
+    def __init__(self):
+        self.calls = []
+
+    def forward(
+        self,
+        compact,
+        t_emb,
+        video_segment,
+        audio_segment,
+        sigma,
+        sample_sigmas,
+        shifts,
+    ):
+        self.calls.append(
+            (
+                compact.clone(),
+                t_emb.clone(),
+                video_segment,
+                audio_segment,
+                sigma,
+                sample_sigmas,
+                shifts,
+            )
+        )
+        video_rows = video_segment[1] - video_segment[0]
+        audio_rows = audio_segment[1] - audio_segment[0]
+        return (
+            torch.zeros((video_rows, 96), dtype=torch.float32),
+            torch.zeros((audio_rows, 32), dtype=torch.float32),
+        )
+
+    __call__ = forward
+
+
 def _fake_module(monkeypatch):
     def time_shift_sigma(sigma, from_shift, to_shift):
         base = sigma / (from_shift + sigma * (1.0 - from_shift))
@@ -53,6 +88,7 @@ def _fake_module(monkeypatch):
         "comfyui_spectrum_h3.minimax_h3._native_module",
         lambda _inner: module,
     )
+    return module
 
 
 def _inner():
@@ -134,6 +170,34 @@ def test_masked_forecast_passes_vector_timestep_rows_to_native_final_layer(monke
     assert audio_segment[:2] == (0, 4)
     assert torch.equal(video_segment[2], state.video_timestep_row)
     assert torch.equal(audio_segment[2], state.audio_timestep_row)
+
+
+def test_pdd_final_layer_receives_sigma_schedule_and_stream_shifts(monkeypatch):
+    module = _fake_module(monkeypatch)
+    module.FinalLayer = _FakePDDFinalLayer
+    inner = _inner()
+    inner.final_layer = _FakePDDFinalLayer()
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.0])
+    video_x = torch.zeros((1, 24, 2, 4, 4))
+    audio_x = torch.zeros((1, 32, 2, 2))
+    state = _prepare_output_state(
+        inner,
+        video_x,
+        audio_x,
+        torch.tensor([500.0]),
+        torch.zeros((1, 2, 4)),
+        {"sample_sigmas": sample_sigmas},
+        {},
+        _layout(),
+    )
+
+    _execute_forecast(inner, torch.zeros((1, 12, 4)), state, video_x, audio_x)
+
+    assert len(inner.final_layer.calls) == 1
+    _, _, _, _, sigma, forwarded_sigmas, shifts = inner.final_layer.calls[0]
+    torch.testing.assert_close(sigma, state.sigma_v)
+    assert forwarded_sigmas is sample_sigmas
+    assert shifts == (state.shift_v, state.shift_a)
 
 
 def test_fully_generating_masks_keep_scalar_fast_path(monkeypatch):

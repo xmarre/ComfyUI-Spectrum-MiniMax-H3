@@ -24,6 +24,10 @@ jobs:
         include:
           - comfy_ref: 27bca654eb9a70237d93f56a6ea336ab55f8925d
             python_version: "3.13"
+          - comfy_ref: 2504e68d4d9dedb514e172692f13436623f25aed
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.31"
+            comfy_aimdo_version: "0.4.15"
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
@@ -54,10 +58,13 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
+        env:
+          COMFY_KITCHEN_VERSION: ${{ matrix.comfy_kitchen_version || '0.2.26' }}
+          COMFY_AIMDO_VERSION: ${{ matrix.comfy_aimdo_version || '0.4.13' }}
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install pytest ruff numpy psutil safetensors einops tqdm pyyaml pillow packaging comfy-kitchen==0.2.26 comfy-aimdo==0.4.13
+          python -m pip install pytest ruff numpy psutil safetensors einops tqdm pyyaml pillow packaging "comfy-kitchen==${COMFY_KITCHEN_VERSION}" "comfy-aimdo==${COMFY_AIMDO_VERSION}"
           python -m pip wheel --no-deps --wheel-dir /tmp/spectrum-h3-wheel .
 
       - name: Run forecaster smoke test
