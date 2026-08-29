@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import time
 from dataclasses import dataclass
@@ -190,6 +191,8 @@ class _OutputState:
     shift_a: float
     original_video_shape: tuple[int, int, int]
     padded_video_shape: tuple[int, int, int]
+    # sampler sigma schedule, consumed by FinalLayer on ComfyUI >= 0.34 (PDD LoRA)
+    sample_sigmas: Any = None
 
 
 def _prepare_output_state(
@@ -315,6 +318,7 @@ def _prepare_output_state(
         shift_a=shift_a,
         original_video_shape=tuple(int(v) for v in video_x.shape[-3:]),
         padded_video_shape=(padded_t, padded_h, padded_w),
+        sample_sigmas=transformer_options.get("sample_sigmas"),
     )
 
 
@@ -449,12 +453,25 @@ def _execute_forecast(
         raise RuntimeError("forecasted MiniMax H3 target feature has an invalid compact shape")
     audio_segment = (0, audio_rows, state.audio_timestep_row)
     video_segment = (audio_rows, audio_rows + video_rows, state.video_timestep_row)
-    video_projected, audio_projected = inner.final_layer(
-        compact,
-        state.t_emb,
-        video_segment,
-        audio_segment,
-    )
+    # ComfyUI >= 0.34 (PDD LoRA support) added required
+    # sigma/sample_sigmas/shifts arguments to FinalLayer.forward
+    if "sample_sigmas" in inspect.signature(type(inner.final_layer).forward).parameters:
+        video_projected, audio_projected = inner.final_layer(
+            compact,
+            state.t_emb,
+            video_segment,
+            audio_segment,
+            state.sigma_v,
+            state.sample_sigmas,
+            (state.shift_v, state.shift_a),
+        )
+    else:
+        video_projected, audio_projected = inner.final_layer(
+            compact,
+            state.t_emb,
+            video_segment,
+            audio_segment,
+        )
     latent_t, latent_h, latent_w = state.padded_video_shape
     video_out = module.unpatchify_video(
         video_projected,
