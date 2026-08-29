@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import time
 from dataclasses import dataclass
@@ -186,6 +187,7 @@ class _OutputState:
     video_timestep_row: int | torch.Tensor
     audio_timestep_row: int | torch.Tensor
     sigma_v: torch.Tensor
+    sample_sigmas: torch.Tensor | None
     shift_v: float
     shift_a: float
     original_video_shape: tuple[int, int, int]
@@ -311,6 +313,7 @@ def _prepare_output_state(
         video_timestep_row=video_timestep_row,
         audio_timestep_row=audio_timestep_row,
         sigma_v=sigma_v,
+        sample_sigmas=transformer_options.get("sample_sigmas"),
         shift_v=shift_v,
         shift_a=shift_a,
         original_video_shape=tuple(int(v) for v in video_x.shape[-3:]),
@@ -433,6 +436,24 @@ def _execute_actual(
     return result
 
 
+def _final_layer_uses_pdd_contract(final_layer: Any) -> bool:
+    forward = getattr(final_layer, "forward", None)
+    if not callable(forward):
+        raise RuntimeError("native MiniMax H3 final_layer does not expose a callable forward()")
+    try:
+        parameters = inspect.signature(forward).parameters
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("unable to inspect native MiniMax H3 final-layer contract") from exc
+
+    pdd_parameters = ("sigma", "sample_sigmas", "shifts")
+    present = tuple(name in parameters for name in pdd_parameters)
+    if all(present):
+        return True
+    if any(present):
+        raise RuntimeError("native MiniMax H3 final-layer contract has incomplete PDD parameters")
+    return False
+
+
 def _execute_forecast(
     inner: Any,
     predicted: torch.Tensor,
@@ -449,12 +470,23 @@ def _execute_forecast(
         raise RuntimeError("forecasted MiniMax H3 target feature has an invalid compact shape")
     audio_segment = (0, audio_rows, state.audio_timestep_row)
     video_segment = (audio_rows, audio_rows + video_rows, state.video_timestep_row)
-    video_projected, audio_projected = inner.final_layer(
-        compact,
-        state.t_emb,
-        video_segment,
-        audio_segment,
-    )
+    if _final_layer_uses_pdd_contract(inner.final_layer):
+        video_projected, audio_projected = inner.final_layer(
+            compact,
+            state.t_emb,
+            video_segment,
+            audio_segment,
+            state.sigma_v,
+            state.sample_sigmas,
+            (state.shift_v, state.shift_a),
+        )
+    else:
+        video_projected, audio_projected = inner.final_layer(
+            compact,
+            state.t_emb,
+            video_segment,
+            audio_segment,
+        )
     latent_t, latent_h, latent_w = state.padded_video_shape
     video_out = module.unpatchify_video(
         video_projected,
