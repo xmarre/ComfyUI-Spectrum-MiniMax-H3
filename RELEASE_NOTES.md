@@ -1,3 +1,64 @@
+# Spectrum MiniMax H3 v0.2.22
+
+v0.2.22 adds reviewed native Spectrum support for ComfyUI **SEEDS-2, SEEDS-3, and SA-Solver**, including the stochastic MiniMax H3 paths that required sampler-specific state handling rather than ordinary one-call forecasting.
+
+## Native SEEDS-2 / SEEDS-3 support
+
+Spectrum now understands the native multistage SEEDS solver geometry instead of treating each H3 model call as an independent diffusion step.
+
+For stochastic SEEDS:
+
+- native stochastic increments, noise draws, stage equations, and callback ordering remain untouched;
+- Spectrum forecasts the H3 **transformer residual** while rebuilding the exact current-state target input embedding from the native solver latent;
+- stochastic stages share one residual history over the true interleaved model-call coordinates;
+- the outer SEEDS stage remains exact, while supported internal stages may be forecast;
+- one-point bootstrap remains disabled;
+- hard external-patch transitions, Continuum prefix requirements, warmup/readiness, and final-tail exactness remain authoritative;
+- the ordinary model-aware scheduler veto is advisory on the sampler-specific stochastic internal-stage path, while model-aware telemetry, adaptive fit/blend, and generic correction remain active;
+- stochastic SEEDS does not use offline smoothing replay because replaying the model-call sequence independently of the native noise-conditioned stage trajectory would break solver geometry.
+
+The final real SEEDS-2 validation completed cleanly with DiffAid, Untwist-RoPE, and H3 Continuum:
+
+- initial chunk: **11 actual / 8 forecast**, **0 fallbacks**;
+- Continuum chunk: **12 actual / 7 forecast**, **0 fallbacks**;
+- stage 0 stayed exact throughout;
+- the previously observed delayed heavy-noise pattern did not recur.
+
+SEEDS-3 is supported under the same reviewed state-conditioned residual architecture, but remains more conservative because its two consecutive internal stages do not have an exact outer-stage anchor between them.
+
+## Native SA-Solver support
+
+Spectrum now supports native SA-Solver without allowing approximate H3 denoisers to become recursive persistent Adams observations.
+
+The stochastic SA integration uses:
+
+- **actual-only persistent Adams history**;
+- forecast values only as bounded solver-local/ephemeral inputs;
+- causal solver-space dense output built from exact H3 anchors during stochastic intervals;
+- exact native tau/noise draws, predictor/corrector equations, callback ordering, sigma schedule, and final denoising semantics;
+- a one-forecast maximum streak with an exact H3 re-anchor after each skipped transformer call;
+- fail-closed/native behavior for unsupported active PECE corrector configurations.
+
+For H3 Continuum continuation chunks, every SA forecast coordinate uses a latest-exact solver-space hold and ignores the raw Spectrum hidden-feature denoised value at the SA boundary. This removes the remaining continuation-specific instability while preserving the 11/8 NFE target.
+
+Final real-media SA validation completed with:
+
+- initial chunk: **11 actual / 8 forecast**, **0 fallbacks**;
+- Continuum chunk: **11 actual / 8 forecast**, **0 fallbacks**;
+- all eight Continuum forecast coordinates using the reviewed all-forecast latest-exact isolation path;
+- no recurrence of the delayed heavy-noise corruption;
+- no recurrence of the later whole-frame vertical shake/flashing artifact.
+
+## Validation and compatibility
+
+PR #86 is the reviewed SEEDS-2/3 implementation and passed Actions **#495** across all seven supported ComfyUI/Python lanes. PR #87 is the stacked SA-Solver implementation and passed Actions **#511** on its final one-commit head.
+
+Both PRs were additionally validated with real MiniMax H3 media using the production workflow with DiffAid, Untwist-RoPE, H3 Continuum, runtime LoRA hooks, and the current PDD-capable ComfyUI H3 path.
+
+Existing Euler, RES multistep, ER-SDE, RefDelta, Continuum, generic-correction defaults, trust-shrinkage default-off behavior, and ordinary sampler scheduling remain unchanged outside the new sampler-specific paths.
+
+---
+
 # Spectrum MiniMax H3 v0.2.21
 
 v0.2.21 restores Spectrum forecast execution with current ComfyUI MiniMax H3 after the PDD LoRA update changed the native output-head contract.
