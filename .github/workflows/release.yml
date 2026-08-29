@@ -52,6 +52,12 @@ jobs:
             HEAD
           (cd dist && sha256sum "${archive}" > SHA256SUMS)
 
+      - name: Extract current release notes
+        shell: bash
+        run: |
+          awk '/^---$/ { exit } { print }' RELEASE_NOTES.md > CURRENT_RELEASE_NOTES.md
+          test -s CURRENT_RELEASE_NOTES.md
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -69,4 +75,4 @@ jobs:
             dist/SHA256SUMS \
             --target "${RELEASE_SHA}" \
             --title "Spectrum MiniMax H3 ${TAG}" \
-            --notes-file RELEASE_NOTES.md
+            --notes-file CURRENT_RELEASE_NOTES.md
