@@ -10,6 +10,13 @@ Spectrum is an **approximate accelerator**. Forecasted steps change the denoisin
 
 Full release details are kept in [RELEASE_NOTES.md](RELEASE_NOTES.md) and the GitHub release pages.
 
+### v0.2.22 — Native SEEDS-2/3 and SA-Solver support
+
+- Adds reviewed native Spectrum support for stochastic SEEDS-2/3 using exact-current-state input reconstruction plus transformer-residual forecasting, with the outer stochastic SEEDS stage kept exact.
+- Adds reviewed native SA-Solver PEC support with actual-only persistent Adams history and causal solver-space dense output so forecast error cannot recursively contaminate the solver.
+- H3 Continuum continuation chunks use latest-exact SA dense output on every forecast coordinate; active PECE corrector configurations remain fail-closed/native.
+- Final real-media validation passed with DiffAid, Untwist-RoPE and H3 Continuum: SEEDS-2 reached 11/8 on the initial chunk and 12/7 on the Continuum chunk; SA-Solver reached 11/8 on both chunks, all with zero fallbacks and clean decoded output.
+
 ### v0.2.18 — RefDelta Solver compatibility
 
 - Added a versioned, fail-closed interop contract for MiniMax H3 RefDelta Solver v0.2.0+.
@@ -190,127 +197,80 @@ Forecasting is fail-closed and allowlisted for reviewed sampler contracts.
 | MiniMax H3 Turbo | `_turbo_sampler` | Reviewed deterministic single-call contract. |
 | RES multistep | `sample_res_multistep` | Conservative cadence with protected native tail. |
 | RES multistep CFG++ | `sample_res_multistep_cfg_pp` | Same RES safeguards. |
-| SEEDS-2 | `sample_seeds_2` | Reviewed two-stage topology with state-conditioned residual forecasting for stochastic internal stages. |
-| SEEDS-3 | `sample_seeds_3` | Reviewed three-stage topology with state-conditioned residual forecasting for stochastic internal stages. |
-| SA-Solver PEC | `sample_sa_solver` | Reviewed one-call-per-outer-step Stochastic Adams path with state-conditioned residual forecasting when native stochasticity is active. |
-| SA-Solver PECE | `sample_sa_solver` / `sample_sa_solver_pece` | Supported only with `corrector_order=0`; active corrected-state PECE remains native/fail-closed. |
+| SEEDS-2 | `sample_seeds_2` | Stochastic outer stage stays exact; internal stage uses exact-current-state + transformer-residual forecasting with shared interleaved history. |
+| SEEDS-3 | `sample_seeds_3` | Same state-conditioned residual architecture; more conservative because two internal stages occur between exact outer anchors. |
+| SA-Solver PEC | `sample_sa_solver` | Actual-only persistent Adams history plus causal solver-space dense output; isolated forecasts re-anchor on the next exact H3 evaluation. |
+| SA-Solver PECE | `sample_sa_solver` / `sample_sa_solver_pece` | Accepted only when no live corrected-state H3 evaluation is required (`corrector_order=0`); active PECE correctors remain native/fail-closed. |
 
 Unknown or changed sampler contracts fall back to native execution rather than guessing.
 
-For SEEDS-2/3, every internal denoiser stage is a real MiniMax H3 model evaluation opportunity and therefore a Spectrum logical model call. A terminal-zero schedule contains `2N - 1` model evaluations for SEEDS-2 and `3N - 2` for SEEDS-3 when the outer sampler has `N` sigma intervals. Continuum's actual-prefix contract remains expressed in outer sampler steps; stochastic SEEDS applies that prefix in outer-step space while deterministic SEEDS retains the expanded logical-call mapping.
+For SEEDS-2/3, every denoiser stage is a real MiniMax H3 model-evaluation opportunity and therefore a Spectrum logical model call. A terminal-zero schedule contains `2N - 1` H3 evaluations for SEEDS-2 and `3N - 2` for SEEDS-3 when the outer sampler has `N` sigma intervals.
 
-Native SEEDS is stochastic by default (`eta > 0` and `s_noise > 0`). Its higher-stage construction deliberately evaluates the denoiser on intermediate states after correlated noise has been injected. The SEEDS paper identifies the dependence of noise on overlapping subintervals as essential to the Markov-preserving solver construction, and its ablation shows that naive noise substitutions sharply degrade sampling quality.
-
-Spectrum therefore does **not** subtract, rescale, reorder, regenerate, or approximate SEEDS' stochastic increments. Instead, stochastic SEEDS uses a state-conditioned feature geometry:
-
-```text
-final H3 target hidden = exact current-state input embedding
-                       + transformer residual
-```
-
-The current-state term is kept exact for every SEEDS stage. On actual H3 calls Spectrum captures the exact target input hidden state immediately before the first transformer block and stores only `final_hidden - input_hidden`. On a forecast call it recomputes the native target audio/video input projections from the exact current stochastic latent, forecasts only the transformer residual, then adds the exact current-state embedding back before the native H3 final layer.
-
-Stochastic SEEDS now uses one **shared residual history across the true interleaved model-call coordinates** instead of isolated per-stage histories. This is important for efficiency once stage 0 is protected: every exact outer-stage H3 evaluation becomes a fresh anchor for the following internal-stage forecast. The residual forecaster therefore sees the actual continuous SEEDS trajectory rather than discarding the nearest exact outer anchors and forcing an otherwise unnecessary same-lane refresh.
-
-The normal no-back-to-back forecast guard still applies. For SEEDS-2, an internal forecast is immediately followed by the next exact outer stage, which satisfies that refresh naturally. Stochastic SEEDS still suppresses Spectrum's one-point bootstrap, so the shared trajectory must first contain the normal minimum fit history before internal forecasting starts.
-
-The model-aware controller remains active on internal forecasts for risk telemetry, degree/ridge adaptation, blend confidence, and generic correction. Its ordinary `force_actual` veto is not used for stochastic SEEDS internal stages. That scheduler veto was calibrated for ordinary one-lane trajectories; on the shared interleaved SEEDS residual trajectory it can treat the intended outer/internal stage alternation as excess trajectory curvature. The exact outer-stage mask, hard external-patch transitions, Continuum prefix, warmup/tail rules, readiness checks, and transactional fallbacks remain authoritative actual-step boundaries.
-
-The native **outer stage (stage 0) is always actual** for stochastic SEEDS. Native ComfyUI emits its sampler callback immediately after this first model evaluation, and real H3 testing showed that forecasting this noise-conditioned outer evaluation produced the characteristic delayed heavy-noise preview artifact. The state-conditioned residual decomposition preserves the current noisy input exactly, but the transformer residual itself is still a nonlinear response to that specific fresh stochastic state; a time-only residual forecast cannot reconstruct that response reliably. Spectrum therefore forecasts only the internal SEEDS stages (stage 1 for SEEDS-2; stages 1 and 2 for SEEDS-3). This preserves every outer/callback denoiser evaluation exactly while still skipping internal transformer evaluations.
-
-A subsequent real SEEDS-2 run confirmed why the scheduling ownership matters. With stage 0 already exact and shared history active, the first chunk still finished at 15 actual / 4 forecast and the Continuum chunk at 16 / 3 because model-aware risk vetoed internal steps 11 and 15. Those combined risks were only marginally above the ordinary 0.65 threshold, while the interleaved stage geometry already supplied exact outer anchors between internal candidates. The stochastic-SEEDS policy now keeps those model-aware signals advisory instead of spending extra H3 transformer NFEs on top of the explicit sampler safety boundaries.
-
-This specifically addresses the failure mode found during real H3 testing: forecasting the absolute final hidden state ignored the fresh stochastic internal latent, while sampler-space noise subtraction and outer-stage denoised extrapolation both changed the SEEDS trajectory and produced visible corruption. The state-residual path leaves the native SEEDS Markov-preserving noise path untouched and conditions every skipped transformer evaluation on the actual latent produced by that path.
-
-Deterministic SEEDS remains supported as before. Setting either `eta=0` or `s_noise=0` disables native SEEDS stochastic injection, so the ordinary expanded logical-call forecast geometry remains valid. Offline smoothing replay remains available only for deterministic SEEDS. If replay is requested with stochastic SEEDS, Spectrum performs one causal state-residual pass instead; it never replays away the noise-conditioned stage structure.
-
-The `SamplerSEEDS2` node can emulate exponential-Heun variants with `r=1`. Spectrum leaves that endpoint-stage configuration native because the intermediate model call lands on the next outer sigma, producing duplicate timestep coordinates for different solver states. Reviewed Spectrum tracking therefore requires `0 < r < 1` for SEEDS-2 and `0 < r_1 < r_2 < 1` for SEEDS-3.
-
-### SA-Solver compatibility details
-
-Spectrum supports the reviewed native Stochastic Adams `sample_sa_solver` PEC topology and the PECE wrappers only when `corrector_order=0`, where no second corrected-state H3 evaluation occurs. For `N = len(sigmas) - 1`, those accepted forms perform exactly `N` H3 model calls and `N` native callback events.
-
-Native SA-Solver may inject noise after a predictor when `tau > 0` and `s_noise > 0`. That stochastic increment is part of `x_pred`, and the **next outer H3 evaluation and callback consume that exact freshly perturbed state**. Real H3 testing showed delayed heavy-noise corruption on forecasted SA evaluations. Calls that consume a fresh stochastic increment are therefore treated as a directly identified high-risk subset: preserving the exact input embedding alone does not reproduce the transformer's nonlinear response to that new random realization.
-
-Spectrum therefore protects SA's native stochastic interval explicitly. For reviewed `tau_func` configurations it resolves the interval without speculative callback execution:
-
-- `tau_func=None` uses the exact native default bounds from `model_sampling.percent_to_sigma(0.2)` and `percent_to_sigma(0.8)`;
-- the reviewed native `get_tau_interval_func` closure is inspected for `start_sigma`, `end_sigma`, and `eta`;
-- effective `s_noise` includes the model's native `noise_scale`.
-
-Every outer step whose input `x_pred` contains a fresh SA stochastic increment is forced actual. Spectrum does not pre-roll this mask through the Adams memory: forecasted denoisers before the interval are already part of the accelerated trajectory, while the exactness requirement identified by the stochastic failure is the H3 evaluation of the freshly perturbed current state itself. Native `pred_list` remains untouched.
-
-Outside that protected stochastic region, SA may still use state-conditioned residual forecasting:
+Native stochastic SEEDS is not treated like an ordinary one-call sampler. Its intermediate stages are evaluated after correlated stochastic increments have changed the latent, so Spectrum leaves the native SEEDS noise process untouched and forecasts only the expensive transformer response:
 
 ```text
 final H3 target hidden = exact current-state input embedding
                        + forecasted transformer residual
 ```
 
-For stochastic PEC, Spectrum now uses a solver-aware Adams-history adapter rather than trying to make generic forecast scheduling safe by forcing most of the stochastic interval actual. That previous direction was fundamentally wrong for acceleration: protecting steps 6 through 13 and then protecting the terminal tail could only converge toward 15/4 or worse.
+On every stochastic SEEDS call, the current-state target audio/video input embedding is rebuilt from the exact latent produced by the native solver. Actual H3 calls capture `final_hidden - input_hidden`; eligible internal-stage forecasts predict only that transformer residual and add it back to the exact current-state embedding before the native H3 final layer.
 
-The key invariant is that a Spectrum forecast is **not an SA observation**. Native SA normally appends every denoised result to `pred_list` and reuses that list in later corrector and predictor equations. Treating a forecasted denoiser as an ordinary persistent entry makes forecast error recursive. The rejected 13/6 real-media run demonstrated the failure directly: four consecutive tail forecasts filled the active Adams stencil with forecasted values and completely corrupted the decoded result.
+The stochastic policy is deliberately asymmetric:
 
-The Spectrum SA adapter therefore separates persistent and ephemeral solver evidence:
+- **stage 0 is always actual**;
+- one-point bootstrap is disabled;
+- stochastic SEEDS uses one shared residual history over the true interleaved model-call coordinates;
+- exact outer-stage evaluations refresh that shared history for the following internal-stage forecast;
+- native noise draws, stochastic increments, stage equations, callback ordering, and RNG order are unchanged;
+- hard external-patch transitions, Continuum prefix requirements, warmup/readiness, final-tail rules, and transactional fallbacks remain authoritative actual boundaries;
+- the generic model-aware scheduler veto is advisory for eligible stochastic internal stages, while risk/confidence telemetry, fit/blend adaptation, and generic correction remain active;
+- stochastic SEEDS never uses offline smoothing replay. A replay request falls back to one causal state-conditioned Spectrum pass instead of reconstructing the noise-conditioned stage trajectory.
+
+Keeping stage 0 exact is a tested correctness boundary. Real H3 validation showed that forecasting the callback-visible outer stage produced the delayed heavy-noise pattern; preserving that stage exactly removed the failure while still allowing the internal transformer evaluations to be skipped.
+
+SEEDS-2 requires `0 < r < 1`. The `r=1` exponential-Heun endpoint creates duplicate timestep coordinates for different solver states and therefore remains native/fail-closed. SEEDS-3 requires `0 < r_1 < r_2 < 1`.
+
+Final real-media SEEDS-2 validation used the production stacked workflow with DiffAid, Untwist-RoPE and H3 Continuum:
+
+- initial chunk: **11 actual / 8 forecast**, **0 fallbacks**;
+- Continuum chunk: **12 actual / 7 forecast**, **0 fallbacks**;
+- stage 0 remained exact throughout;
+- no recurrence of the delayed heavy-noise artifact.
+
+SEEDS-3 uses the same reviewed state-conditioned residual architecture but remains more conservative because two internal stages occur between exact outer anchors.
+
+### SA-Solver compatibility details
+
+Spectrum supports the reviewed native Stochastic Adams `sample_sa_solver` PEC topology. Active PECE configurations that require a second corrected-state H3 evaluation remain fail-closed to untouched native execution because they need a separate predictor/corrector stage identity.
+
+The central SA invariant is:
 
 ```text
 persistent Adams history = exact H3 denoisers only
-forecasted denoiser      = current corrector + predictor only
-forecast-step corrector  = native PEC, ephemeral current endpoint
+forecasted denoiser      = solver-local / ephemeral only
 next exact H3 call       = re-anchor Spectrum + Adams history
 ```
 
-Exact denoisers retain their real lambda coordinates. When an intervening step is forecast, the next exact corrector uses an irregular-time stencil of actual observations rather than pretending the forecast was measured data. The native SA coefficient routine already accepts arbitrary lambda nodes, so the predictor/corrector equations, stochastic noise draw, tau schedule, callback order, sigma schedule, and final denoising semantics remain the reviewed native equations.
+Native SA normally appends every denoised result to its Adams history. Doing that with an approximate Spectrum denoiser makes the forecast error recursive. Spectrum therefore maintains persistent Adams evidence from exact H3 evaluations only. A forecast can participate in the current solver interval, but it is not promoted into persistent solver history.
 
-This also removes the blanket fresh-noise exact block. `sa_stochastic_input_steps` remains logged because those states are still important diagnostics, but they are no longer forced actual merely because they contain a fresh stochastic increment. State-conditioned Spectrum forecasting sees the current `x_pred`, while the solver adapter prevents any forecast made there from becoming persistent Adams memory.
+For stochastic SA, the raw hidden-feature forecast is also not used directly at the SA numerical boundary during the active stochastic interval. Native SA can add a fresh stochastic increment to `x_pred`; although Spectrum can rebuild the exact input embedding of that state, a skipped transformer does not reproduce the transformer's nonlinear response to the new random realization. The final adapter therefore supplies **causal solver-space dense output built only from exact H3 anchors**:
 
-Stochastic SA is intentionally scheduled around **isolated forecasts** with `max_consecutive_forecasts=1`. With the default 19-call trace, one warmup/readiness pair and one final actual tail naturally target **11 actual / 8 forecast**, not 15/4:
+- one trustworthy actual anchor -> latest-exact hold;
+- consecutive actual anchors -> latest-exact hold;
+- otherwise -> bounded two-anchor extrapolation in SA lambda space;
+- invalid, reversed, nonfinite, or overlong geometry -> latest-exact hold.
 
-```text
-A A F A F A F A F A F A F A F A F A A
-    2   4   6   8  10  12  14  16
-```
+The native SA tau schedule, stochastic noise draw, predictor/corrector equations, coefficient routine, callback order, sigma schedule, final denoising semantics, and RNG order remain untouched. Spectrum only substitutes the skipped H3 denoiser value that SA consumes.
 
-A hard external-patch transition can convert its candidate forecast into an actual call, but because stochastic SA carries no post-forecast actual debt, the alternating phase resumes on the next eligible call rather than permanently losing the forecast budget. In the current DiffAid/Untwist workflow this shifts the step-8 candidate to step 9 and still leaves an eight-forecast target.
+Stochastic SA uses isolated forecasts with `max_consecutive_forecasts=1`. The next exact H3 call re-anchors both Spectrum and the actual-only Adams history. The generic model-aware scheduler veto is advisory on this sampler-specific stochastic path so the controller cannot silently collapse the intended NFE reduction; telemetry, adaptive fit/blend, and generic correction remain active.
 
-Real 11/8 validation confirmed that this NFE target is reachable and that removing forecasted values from persistent Adams history eliminates the catastrophic full-video corruption. It also exposed a second, narrower bug: visible delayed-noise artifacts appeared on actual steps 10, 12, 14, and 16, immediately after forecast steps 9, 11, 13, and 15. The adapter was excluding the forecast from persistent history **and also skipping the current PEC corrector**. That left `x = x_pred` across every forecasted interval, so the approximation error was carried directly into the next exact H3 input and appeared one step late.
+H3 Continuum continuation chunks use a stricter variant: **every forecast coordinate** uses a latest-exact solver-space hold, including coordinates outside the active stochastic-tau interval. Spectrum still executes its cheap hidden-feature forecast for transaction accounting and telemetry, but that raw denoised value is ignored by SA for the entire continuation chunk.
 
-Restoring the current PEC corrector was a useful falsification step but did **not** remove the delayed-noise artifacts in real media. The follow-up run positively confirmed that the current-corrector revision was active, yet the same one-step-late corruption remained after stochastic forecasts.
+The validated 19-call production cadence is **11 actual / 8 forecast**. Final real-media validation with DiffAid, Untwist-RoPE and H3 Continuum completed at 11/8 in both the initial and continuation chunks with zero fallbacks. The earlier delayed heavy-noise corruption and the later Continuum-only whole-frame shake/flashing were both absent in the final decoded output.
 
-The next real-media test also falsified a simpler output-space fix. The adapter subtracted the exact pending stochastic increment from the forecasted denoised result on every active-tau forecast, and the log confirmed that compensation executed at steps 4, 6, 9, 11, 13, and 15. The delayed-noise artifacts still remained. The direct `+q` term by itself is therefore not the root cause.
+Deterministic SA keeps the ordinary conservative behavior because the stochastic solver-space adaptation is not needed. Offline smoothing replay is intentionally disabled for SA-Solver: replaying changed denoiser values would change Stochastic Adams history even with a reproducible random stream, so reviewed SA runs use one causal Spectrum pass.
 
-The surviving mismatch is the **partial stochastic response inside the feature forecast**. MiniMax H3 is FLOW_AV and the Spectrum stochastic geometry reconstructs `final_hidden = exact_current_input_embedding + forecasted_transformer_residual`. For a native SA actual call, the transformer evaluates the full noisy `x_pred = x_base + q` and can respond nonlinearly to `q`. On a Spectrum forecast, rebuilding only the exact input embedding of that noisy state injects `q` into the hidden/output path without the transformer response that should accompany it. Subtracting `q` after the output cannot undo that partial hidden-space response.
-
-Repeated real runs showed that the split-input experiment was spending validation time on an unreliable cross-layer `q` handoff rather than the actual SA quality problem: the adapter announced split ownership, but the mandatory split breadcrumb never appeared. CI #507 and #508 also rejected the focused transport tests. That path has been removed completely rather than asking for another media run of a transport mechanism that is not proven.
-
-Active stochastic SA forecasts now use **solver-space causal dense output**. Spectrum still performs the cheap feature forecast so the normal runtime transaction, telemetry, and scheduler semantics remain intact, but the resulting hidden-feature denoised tensor is **not fed into SA's corrector/predictor while the current model input contains fresh stochastic predictor noise**. Instead SA receives a denoised estimate built only from exact H3 actual anchors:
-
-- with one trustworthy anchor, hold the latest exact denoised value;
-- after consecutive exact anchors (warmup, hard transition, forced refresh), hold the latest value rather than invent a slope;
-- otherwise extrapolate the exact denoised trajectory in SA lambda space using the two newest actual anchors;
-- clamp the extrapolation horizon to one previous anchor interval; invalid, reversed, nonfinite, or overlong geometry degenerates to a latest-actual hold.
-
-The first full real-media run of this design removed the delayed heavy-noise corruption at 11/8. It exposed a separate Continuum-only artifact in chunk 2: brief whole-frame vertical oscillation and flashing. The distinguishing runtime condition is the active Continuum continuation contract; chunk 1 has no Continuum interop request, while chunk 2 reports `accepted H3 Continuum API v1, actual prefix=2`.
-
-A follow-up run removed secant extrapolation from every **stochastic** Continuum forecast (steps 4, 6, 9, 11, 13, and 15) by holding the latest exact denoised anchor. The artifact was unchanged. That falsifies stochastic secant extrapolation as the cause, but the run still had two Continuum forecast coordinates whose raw hidden-feature denoisers entered SA because tau was zero: the early step 2 forecast and late step 17 forecast.
-
-Continuation chunks now use the latest-exact hold for **every forecast coordinate**, including non-stochastic steps 2 and 17. Spectrum still executes the cheap hidden-feature forecast to preserve its runtime transaction and telemetry, but no forecasted hidden-feature denoised value is allowed into the SA numerical trajectory anywhere in a Continuum chunk. This keeps the 11/8 schedule and adds no H3 NFEs. It is a deliberately narrow diagnostic/fix: if the oscillation/flashing remains, hidden-feature forecast value error is ruled out for Continuum and the next target is the modified Adams/corrector trajectory itself.
-
-Outside Continuum, bounded lambda-space dense output remains restricted to stochastic SA forecasts. Native SA still owns the untouched stochastic `x_pred`, the exact noise draw, tau, corrector, predictor equations, and RNG order. Persistent Adams history remains actual-only.
-
-The model-aware controller remains active for telemetry, confidence, adaptive fit/blend, and generic correction, but its ordinary scheduler `force_actual` veto is advisory on stochastic SA. NFE reduction is a first-class contract here; risk should influence how a forecast is used, not silently collapse an 11/8 target into 15/4. The rejected 13/6 run is retained as negative evidence against **persistent forecast history**, not as justification for restoring a high-NFE exact mask.
-
-Deterministic SA (`s_noise=0` or reviewed `eta=0`) does not receive that stochastic exact-block credit, retains the ordinary model-aware scheduler veto, and keeps the conservative full-Adams-memory refresh until its independent aggressive cadence is validated.
-
-The native SA noise sampler, tau evaluation, Adams coefficients, stochastic increment, and predictor/corrector equations remain unchanged. The only stochastic adaptation is the model input presented to a skipped H3 evaluation: active-tau forecasts see `x_pred - q`, while actual calls see native `x_pred`. Spectrum does not add a second solver-space extrapolator on top of Stochastic Adams.
-
-The state-conditioned feature geometry and solver topology are separate runtime concepts. Stochastic SEEDS uses a shared residual history across its interleaved model-call coordinates while retaining explicit stage identity for the exact-stage mask; SA PEC uses one residual history plus the sampler-required exact-step mask above. Sequential SA and SEEDS runs tear those histories and masks down independently so one sampler cannot inherit another sampler's state.
-
-Active PECE (`corrector_order > 0`) remains fail-closed to untouched native execution. From the second outer interval onward it performs a callback-invisible corrected-state H3 evaluation at the same sigma as the predictor evaluation but on a different latent, producing `2N - 1` true H3 evaluations. That requires an explicit predictor/corrector stage identity rather than the single-coordinate runtime contract used by PEC.
-
-Supported tau configuration is `tau_func=None` or the exact closure produced by native `get_tau_interval_func`; arbitrary callables fail closed and are never invoked during validation. Custom callable `noise_sampler` values are accepted without inspection or speculative draws. `simple_order_2` changes only the Adams coefficient calculation and does not alter the reviewed call topology.
-
-Offline smoothing replay is intentionally disabled for SA-Solver because replaying changed denoiser values changes the solver's Adams history even if the random stream is reproducible. With the normal Spectrum default `offline_smoothing_replay=true`, reviewed SA-Solver therefore runs one **causal Spectrum pass** rather than bypassing Spectrum.
+Supported tau configuration is the native default or the exact reviewed closure produced by native `get_tau_interval_func`. Arbitrary tau callables fail closed and are never invoked speculatively during validation. Custom callable `noise_sampler` values are accepted without inspection or pre-drawing. `simple_order_2` changes the Adams coefficient calculation but not the reviewed model-call topology.
 
 ### ER-SDE compatibility details
 
