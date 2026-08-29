@@ -1,4 +1,24 @@
-# Spectrum MiniMax H3 v0.2.20
+# Spectrum MiniMax H3 v0.2.21
+
+v0.2.21 restores Spectrum forecast execution with current ComfyUI MiniMax H3 after the PDD LoRA update changed the native output-head contract.
+
+## ComfyUI 0.34 PDD final-layer compatibility
+
+- Fixes `FinalLayer.forward() missing 3 required positional arguments: 'sigma', 'sample_sigmas', and 'shifts'` on the first eligible Spectrum forecast with ComfyUI 0.34.0 and later PDD-capable H3 cores.
+- Spectrum now detects the reviewed native FinalLayer contract and forwards the same current sigma, exact sampler sigma schedule, and video/audio sigma shifts used by native H3.
+- Reviewed older ComfyUI revisions retain the existing four-argument FinalLayer path.
+- An incomplete future PDD argument contract fails explicitly instead of guessing.
+- No H3 Continuum-side workaround is required; Continuum exposed the stale Spectrum forecast output-head call.
+
+## Validation
+
+PR #84 adds focused regression coverage for the PDD projection call and adds ComfyUI commit `2504e68d4d9dedb514e172692f13436623f25aed` to the compatibility matrix with its required `comfy-kitchen` and `comfy-aimdo` versions. All seven ComfyUI/Python lanes pass, including the historical legacy FinalLayer contracts. CodeRabbit reported no actionable code finding.
+
+PR #84 supersedes #83; thanks to @bun-dev for independently identifying the same Core contract break and proposing the compatible call shape.
+
+---
+
+## v0.2.20
 
 v0.2.20 fixes the RefDelta API-v1 step-provenance handoff after a tracked ER-SDE model call.
 
