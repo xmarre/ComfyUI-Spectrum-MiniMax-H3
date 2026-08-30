@@ -16,6 +16,7 @@ Full release details are kept in [RELEASE_NOTES.md](RELEASE_NOTES.md) and the Gi
 - Makes **`balanced` the default PECE forecast policy** after matched production testing; `max_speed` remains the higher-speed option and `stable_start` the more conservative option.
 - Adds Spectrum composition for RefDelta Solver v0.6.0 SEEDS-2/3, SA-Solver PEC, and SA-Solver PECE backends while preserving RefDelta's actual-only evidence ownership.
 - Final production testing with DiffAid, Untwist-RoPE and H3 Continuum produced acceptable decoded media with both balanced and max-speed PECE; balanced was perceptually preferred in the tested workflow.
+- Clarifies that sampler `steps` are outer sigma intervals, while SEEDS-2/3 and active PECE expose additional logical H3 model-call opportunities.
 
 ### v0.2.22 — Native SEEDS-2/3 and SA-Solver support
 
@@ -54,6 +55,38 @@ Full release details are kept in [RELEASE_NOTES.md](RELEASE_NOTES.md) and the Gi
 
 - Fixed native ER-SDE forecast "confetti" corruption with solver-space denoised interpolation while preserving the native stochastic trajectory and RNG stream.
 - Hardened post-run teardown so optional generic-correction research work cannot block a completed generation from reaching decode/save.
+
+## Step counts vs. H3 model-call opportunities
+
+The ComfyUI **steps** value is the number of outer sigma intervals. It is **not**
+necessarily the number of logical MiniMax-H3 model-call opportunities. Multi-stage
+solvers and active SA-Solver PECE can expose multiple H3 calls inside one outer interval.
+
+For the usual terminal-zero schedule, with `N = len(sigmas) - 1` outer steps:
+
+| Sampler topology | H3 model-call opportunities | 10 outer steps | 19 outer steps |
+| --- | ---: | ---: | ---: |
+| Ordinary one-call samplers (for example Euler, RES multistep, ER-SDE) | `N` | 10 | 19 |
+| SA-Solver PEC / inactive PECE (`use_pece = false` or `corrector_order = 0`) | `N` | 10 | 19 |
+| SEEDS-2 | `2N - 1` | 19 | 37 |
+| SEEDS-3 | `3N - 2` | 28 | 55 |
+| Active SA-Solver PECE (`use_pece = true`, `corrector_order > 0`) | `2N - 1` | 19 | 37 |
+
+The final SEEDS interval terminates directly at sigma zero, so it does not expose its
+internal stage calls; that is why the usual counts are `2N - 1` and `3N - 2` rather than
+`2N` and `3N`. The active-PECE `2N - 1` formula additionally assumes
+`corrector_order > 0`; with `corrector_order = 0`, PECE reduces to `N` logical H3
+model-call opportunities.
+
+Spectrum's `actual / forecast` accounting is over these **logical H3 model-call
+opportunities**, not over the UI step count. For example, a clean 10-outer-step
+SA-Solver PECE run has 19 logical H3 calls: `balanced` is nominally **11 actual / 8
+forecast**, while `max_speed` is **10 / 9**. Continuum prefixes, hard external-patch
+transitions, warmup, fallbacks, and other force-actual conditions can change that split,
+but they do not change the underlying outer-step count.
+
+This matters when comparing speed across samplers: a 10-step SEEDS-2 or PECE run is not
+an NFE-equivalent comparison with a 10-step Euler/RES/ER-SDE run.
 
 ## Installation
 

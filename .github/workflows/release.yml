@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.event.workflow_run.head_sha }}
+  group: release-${{ github.repository }}-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 jobs:
@@ -58,7 +58,7 @@ jobs:
           awk '/^---$/ { exit } { print }' RELEASE_NOTES.md > CURRENT_RELEASE_NOTES.md
           test -s CURRENT_RELEASE_NOTES.md
 
-      - name: Publish GitHub release
+      - name: Publish or refresh GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -67,9 +67,52 @@ jobs:
         shell: bash
         run: |
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists; leaving it unchanged."
+            current_main="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+            if [[ "${RELEASE_SHA}" != "${current_main}" ]]; then
+              echo "Tested commit ${RELEASE_SHA} is no longer current main (${current_main}); refusing to refresh an existing release from a stale workflow run."
+              exit 0
+            fi
+
+            if ! git fetch --force --no-tags --depth=1 origin "refs/tags/${TAG}:refs/tags/${TAG}"; then
+              echo "Failed to fetch existing release tag ${TAG}; refusing to refresh release notes." >&2
+              exit 1
+            fi
+            if ! existing_target="$(git rev-parse "${TAG}^{commit}")"; then
+              echo "Failed to resolve ${TAG} to a commit; refusing to refresh release notes." >&2
+              exit 1
+            fi
+
+            if [[ "${existing_target}" != "${RELEASE_SHA}" ]]; then
+              changed_file_list="$(mktemp)"
+              if ! git diff --name-only "${existing_target}" "${RELEASE_SHA}" > "${changed_file_list}"; then
+                echo "Failed to compare existing release commit ${existing_target} with tested commit ${RELEASE_SHA}; refusing to refresh release notes." >&2
+                rm -f "${changed_file_list}"
+                exit 1
+              fi
+              mapfile -t changed_files < "${changed_file_list}"
+              rm -f "${changed_file_list}"
+
+              docs_only=true
+              for path in "${changed_files[@]}"; do
+                case "${path}" in
+                  README.md|RELEASE_NOTES.md|.github/workflows/release.yml) ;;
+                  *) docs_only=false ;;
+                esac
+              done
+
+              if [[ "${docs_only}" != "true" ]]; then
+                echo "Release ${TAG} already exists and the tested commit contains non-documentation changes; leaving the published release unchanged."
+                exit 0
+              fi
+            fi
+
+            gh release edit "${TAG}" \
+              --title "Spectrum MiniMax H3 ${TAG}" \
+              --notes-file CURRENT_RELEASE_NOTES.md
+            echo "Refreshed release notes for ${TAG}; existing tag target and assets were preserved."
             exit 0
           fi
+
           gh release create "${TAG}" \
             dist/ComfyUI-Spectrum-MiniMax-H3-v${VERSION}.zip \
             dist/SHA256SUMS \

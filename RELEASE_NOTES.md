@@ -2,6 +2,32 @@
 
 v0.2.23 completes the SA-Solver PECE and RefDelta multi-backend integration and makes **`balanced` the default active-PECE forecast policy** after matched MiniMax-H3 production testing.
 
+## Important: outer steps are not H3 model-call counts
+
+The ComfyUI scheduler's **steps** value counts outer sigma intervals. Some of the newly
+supported solvers expose additional logical H3 model-call opportunities inside those
+intervals, so raw step counts are not NFE-equivalent across sampler families.
+
+For the usual terminal-zero schedule, with `N = len(sigmas) - 1`:
+
+| Sampler topology | Native H3 model-call opportunities | 10 outer steps | 19 outer steps |
+| --- | ---: | ---: | ---: |
+| Euler / RES multistep / ER-SDE | `N` | 10 | 19 |
+| SA-Solver PEC / inactive PECE (`use_pece = false` or `corrector_order = 0`) | `N` | 10 | 19 |
+| SEEDS-2 | `2N - 1` | 19 | 37 |
+| SEEDS-3 | `3N - 2` | 28 | 55 |
+| Active SA-Solver PECE (`use_pece = true`, `corrector_order > 0`) | `2N - 1` | 19 | 37 |
+
+SEEDS omits its internal stage calls on the final sigma-to-zero interval. Active PECE
+with `corrector_order > 0` executes `P0`, then predicted/corrected pairs
+`P1/C1, P2/C2, ...`, giving `N` predicted opportunities plus `N - 1` corrected
+opportunities. With `corrector_order = 0`, PECE collapses to `N`.
+
+Spectrum's actual/forecast ratios are therefore counted over logical H3 model-call opportunities.
+A clean 10-outer-step PECE run contains **19** logical H3 calls: `balanced` is nominally
+**11 actual / 8 forecast** and `max_speed` **10 / 9**. Production safety boundaries may
+promote forecasts to actual, changing the split without changing the 10 outer steps.
+
 ## Active SA-Solver PECE
 
 Spectrum now models native ComfyUI PECE as explicit predicted/corrected evaluations:
