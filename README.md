@@ -200,7 +200,7 @@ Forecasting is fail-closed and allowlisted for reviewed sampler contracts.
 | SEEDS-2 | `sample_seeds_2` | Stochastic outer stage stays exact; internal stage uses exact-current-state + transformer-residual forecasting with shared interleaved history. |
 | SEEDS-3 | `sample_seeds_3` | Same state-conditioned residual architecture; more conservative because two internal stages occur between exact outer anchors. |
 | SA-Solver PEC | `sample_sa_solver` | Actual-only persistent Adams history plus causal solver-space dense output; isolated forecasts re-anchor on the next exact H3 evaluation. |
-| SA-Solver PECE | `sample_sa_solver` / `sample_sa_solver_pece` | Accepted only when no live corrected-state H3 evaluation is required (`corrector_order=0`); active PECE correctors remain native/fail-closed. |
+| SA-Solver PECE | `sample_sa_solver` / `sample_sa_solver_pece` | Active correctors use explicit predicted/corrected phases; P0 plus exact corrected endpoints own shared persistent history, while later predicted phases are solver-space forecasts unless a correctness boundary promotes them. |
 
 Unknown or changed sampler contracts fall back to native execution rather than guessing.
 
@@ -241,7 +241,14 @@ SEEDS-3 uses the same reviewed state-conditioned residual architecture but remai
 
 ### SA-Solver compatibility details
 
-Spectrum supports the reviewed native Stochastic Adams `sample_sa_solver` PEC topology. Active PECE configurations that require a second corrected-state H3 evaluation remain fail-closed to untouched native execution because they need a separate predictor/corrector stage identity.
+Spectrum supports native Stochastic Adams PEC and active PECE. The original SA-Solver method is formulated in data-prediction space: preceding data-prediction evaluations form the predictor stencil, the predicted endpoint is evaluated, and that endpoint extends the current corrector stencil. Current ComfyUI PECE adds another evaluation after correction. At every corrected outer interval, ComfyUI therefore has two real H3 opportunities at the same sigma and different latent states:
+
+```text
+predicted phase: model(x_pred, sigma_i)   -> callback-visible
+corrected phase: model(x_corr, sigma_i)   -> callback-invisible
+```
+
+With `N = len(sigmas) - 1`, ordinary PEC and PECE with `corrector_order=0` have `N` H3 opportunities and `N` callbacks. Active PECE has `N` predicted opportunities, `N - 1` corrected opportunities, `2N - 1` total H3 opportunities, and still only `N` callbacks.
 
 The central SA invariant is:
 
@@ -253,22 +260,45 @@ next exact H3 call       = re-anchor Spectrum + Adams history
 
 Native SA normally appends every denoised result to its Adams history. Doing that with an approximate Spectrum denoiser makes the forecast error recursive. Spectrum therefore maintains persistent Adams evidence from exact H3 evaluations only. A forecast can participate in the current solver interval, but it is not promoted into persistent solver history.
 
-For stochastic SA, the raw hidden-feature forecast is also not used directly at the SA numerical boundary during the active stochastic interval. Native SA can add a fresh stochastic increment to `x_pred`; although Spectrum can rebuild the exact input embedding of that state, a skipped transformer does not reproduce the transformer's nonlinear response to the new random realization. The final adapter therefore supplies **causal solver-space dense output built only from exact H3 anchors**:
+Active PECE uses an endpoint-owned policy that mirrors native ComfyUI PECE:
 
-- one trustworthy actual anchor -> latest-exact hold;
-- consecutive actual anchors -> latest-exact hold;
-- otherwise -> bounded two-anchor extrapolation in SA lambda space;
-- invalid, reversed, nonfinite, or overlong geometry -> latest-exact hold.
+- predicted and corrected calls retain distinct logical identities; no epsilon is added to sigma and no fake solver coordinate is created;
+- outer step 0 has no corrected evaluation, so P0 is the first exact persistent endpoint;
+- for every later outer step, the exact corrected evaluation C_i replaces P_i as native PECE's persistent Adams endpoint and is also the Spectrum feature-history owner for that coordinate;
+- P_i for i > 0 is never retained in Spectrum persistent feature history, even when a hard boundary promotes that predicted call to exact, because C_i supersedes it at the same outer coordinate;
+- the shared feature history therefore contains exactly P0, C1, C2, ... rather than two different latent states at the same scalar coordinate;
+- every corrected phase remains an actual H3 evaluation and every persistent Adams entry remains an actual H3 observation;
+- a corrected-phase forecast and a both-phases-forecast pair remain prohibited by construction.
 
-The native SA tau schedule, stochastic noise draw, predictor/corrector equations, coefficient routine, callback order, sigma schedule, final denoising semantics, and RNG order remain untouched. Spectrum only substitutes the skipped H3 denoiser value that SA consumes.
+This removes the old predicted-lane refresh debt without pretending that a corrected hidden state is the predicted hidden state. The feature-history ownership follows the solver's endpoint replacement semantics instead: after a forecasted P_i is consumed by the current corrector, exact C_i arrives before the next predictor and becomes the next trustworthy endpoint anchor.
 
-Stochastic SA uses isolated forecasts with `max_consecutive_forecasts=1`. The next exact H3 call re-anchors both Spectrum and the actual-only Adams history. The generic model-aware scheduler veto is advisory on this sampler-specific stochastic path so the controller cannot silently collapse the intended NFE reduction; telemetry, adaptive fit/blend, and generic correction remain active.
+For **every active-PECE predicted forecast**, the raw hidden-feature forecast is transaction-only and is not used as SA's denoised value. The adapter supplies causal solver-space dense output built only from exact persistent PECE endpoints:
 
-H3 Continuum continuation chunks use a stricter variant: **every forecast coordinate** uses a latest-exact solver-space hold, including coordinates outside the active stochastic-tau interval. Spectrum still executes its cheap hidden-feature forecast for transaction accounting and telemetry, but that raw denoised value is ignored by SA for the entire continuation chunk.
+- P1, with only P0 available -> latest-exact hold;
+- with two trustworthy endpoints -> bounded two-anchor secant extrapolation in SA lambda space, including consecutive C endpoints;
+- invalid, reversed, nonfinite, or excessive extrapolation geometry -> latest-exact hold;
+- H3 Continuum -> latest-exact hold on every forecast coordinate.
 
-The validated 19-call production cadence is **11 actual / 8 forecast**. Final real-media validation with DiffAid, Untwist-RoPE and H3 Continuum completed at 11/8 in both the initial and continuation chunks with zero fallbacks. The earlier delayed heavy-noise corruption and the later Continuum-only whole-frame shake/flashing were both absent in the final decoded output.
+The native SA tau schedule, stochastic noise draw, predictor/corrector equations, coefficient routine, callback order, sigma schedule, final denoising semantics, and RNG order remain untouched. A forecasted predicted endpoint may affect only its current corrector; it is never inserted into persistent Adams history.
 
-Deterministic SA keeps the ordinary conservative behavior because the stochastic solver-space adaptation is not needed. Offline smoothing replay is intentionally disabled for SA-Solver: replaying changed denoiser values would change Stochastic Adams history even with a reproducible random stream, so reviewed SA runs use one causal Spectrum pass.
+A declared hard external-patch transition still promotes the affected predicted phase to an exact H3 evaluation before the corrector consumes it. After that exact corrected endpoint lands, the PECE dense-output interpolation anchors restart from the post-transition endpoint so the secant bridge does not extrapolate across a transformer discontinuity. Native Adams history is **not** reset or rewritten.
+
+H3 Continuum's protected prefix remains defined in native outer-step coordinates and still protects both predicted and corrected phases inside each protected outer interval. Outside the prefix, corrected phases are exact and each predicted forecast uses the latest exact corrected endpoint as its solver-space hold. Spectrum still executes its cheap hidden-feature forecast for accounting/model-wrapper continuity, but that raw forecast is ignored by SA.
+
+Because every forecasted predicted phase is followed by an exact corrected H3 call, active PECE no longer needs a separate predicted-phase H3 refresh before forecasting the next outer interval. It also uses a solver-owned one-anchor bootstrap for P1 and stage-aware tail protection: the final corrected endpoint stays exact while the final predicted phase may forecast unless another correctness boundary requires it to be actual.
+
+The validated 19-call PEC production cadence is **11 actual / 8 forecast**. Final PEC real-media validation with DiffAid, Untwist-RoPE and H3 Continuum completed at 11/8 in both the initial and continuation chunks with zero fallbacks. The earlier delayed heavy-noise corruption and the later Continuum-only whole-frame shake/flashing were both absent in the final decoded output.
+
+For active PECE with no additional hard boundary, Continuum prefix, fallback, or force-actual override, the endpoint-owned schedule has one predicted actual (P0) and forecasts every later predicted phase. Therefore:
+
+- **10 outer intervals** -> 19 H3 opportunities -> predicted **1 actual / 9 forecast** + corrected **9 actual / 0 forecast** -> **10 actual / 9 forecast** total;
+- **19 outer intervals** -> 37 H3 opportunities -> predicted **1 actual / 18 forecast** + corrected **18 actual / 0 forecast** -> **19 actual / 18 forecast** total.
+
+These are nominal topology counts, not promises that every production stack will hit them. H3 Continuum's protected prefix and hard external transitions such as DiffAid/Untwist remain authoritative and can promote specific predicted forecasts to actual. Those safety NFEs are intentionally not traded away merely to preserve the headline ratio.
+
+The earlier real-media PECE validation at **16/3** for 10 outer intervals and **29/8** for 19 outer intervals belongs to the previous conservative predicted-lane-refresh implementation. It established that the phase isolation and exact-corrected persistence design was artifact-free, but fresh decoded-media validation is required for the more aggressive corrected-endpoint bridge before it is treated as production-validated.
+
+Deterministic PEC keeps the ordinary conservative behavior because the stochastic solver-space adaptation is not needed. Active PECE retains the phase-specific predicted/exact-corrected topology even when tau or `s_noise` disables stochastic injection. Offline smoothing replay is intentionally disabled for SA-Solver: replaying changed denoiser values would change Stochastic Adams history even with a reproducible random stream, so reviewed SA runs use one causal Spectrum pass.
 
 Supported tau configuration is the native default or the exact reviewed closure produced by native `get_tau_interval_func`. Arbitrary tau callables fail closed and are never invoked speculatively during validation. Custom callable `noise_sampler` values are accepted without inspection or pre-drawing. `simple_order_2` changes the Adams coefficient calculation but not the reviewed model-call topology.
 
@@ -287,7 +317,7 @@ ComfyUI-TiledDiffusion's current `KSAMPLER.sample(*args, **kwargs)` passthrough 
 
 Warmup and tail constraints are always actual. Reviewed samplers also limit the causal forecast horizon and require actual refreshes.
 
-For ordinary one-lane samplers, the default degree-1 bootstrap can reuse step 0 as a one-point hold for step 1. Step 2 then runs actual before normal two-anchor degree-1 forecasting begins. State-conditioned stochastic samplers deliberately suppress that bootstrap. Stochastic SEEDS uses its exact outer stages as fresh anchors for the shared residual history; SA-Solver uses its sampler-specific stochastic interval and Adams-memory safeguards described above.
+For ordinary one-lane samplers, the default degree-1 bootstrap can reuse step 0 as a one-point hold for step 1. Step 2 then runs actual before normal two-anchor degree-1 forecasting begins. State-conditioned stochastic SEEDS deliberately suppresses that bootstrap and uses exact outer stages as fresh anchors for its shared residual history. Active PECE is the deliberate exception: because the raw feature forecast is never solver-consumed and exact C1 arrives immediately afterward, P1 may use a solver-owned one-anchor hold before corrected-endpoint history takes over.
 
 Typical 20-step Euler/ER-SDE single-pass cadence is approximately:
 

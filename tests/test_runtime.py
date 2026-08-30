@@ -5,7 +5,11 @@ import torch
 
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.model_aware import ModelForecastabilityProfile, ProfileLookup
-from comfyui_spectrum_h3.runtime import ForecastRetryActual, SpectrumH3Runtime
+from comfyui_spectrum_h3.runtime import (
+    ForecastRetryActual,
+    SolverCallDescriptor,
+    SpectrumH3Runtime,
+)
 
 TOPOLOGY = (
     ("video", (1, 24, 2, 4, 4)),
@@ -123,6 +127,259 @@ def _complete_step(runtime, timestep, *, labels=LABEL):
     runtime.finalize_step(decision["run_id"], decision["step_id"])
     return decision
 
+
+
+def test_explicit_pece_topology_separates_same_sigma_phases_and_outer_policy():
+    runtime = _runtime(warmup_steps=0, tail_actual_steps=1)
+    sigmas = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0])
+    topology = (
+        SolverCallDescriptor(0, 0, "predicted"),
+        SolverCallDescriptor(1, 0, "predicted"),
+        SolverCallDescriptor(1, 1, "corrected"),
+        SolverCallDescriptor(2, 0, "predicted"),
+        SolverCallDescriptor(2, 1, "corrected"),
+        SolverCallDescriptor(3, 0, "predicted"),
+        SolverCallDescriptor(3, 1, "corrected"),
+    )
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_sa_solver_pece",
+        supported_sampler=True,
+        expected_model_calls=len(topology),
+        stage_count=2,
+        logical_call_topology=topology,
+        state_conditioned_residual=True,
+        separate_stage_histories=False,
+        forecastable_stage_indices=(0,),
+        history_stage_indices=(0, 1),
+        history_step_ids=(0, 2, 4, 6),
+        tail_actual_stage_indices=(1,),
+        allow_state_conditioned_bootstrap=True,
+        min_actual_prefix_steps=2,
+        min_actual_steps_after_forecast=0,
+        max_consecutive_forecasts=1,
+        model_aware_can_force_actual=False,
+    )
+
+    decisions = [
+        _complete_step(runtime, sigma)
+        for sigma in (1.0, 0.75, 0.75, 0.5, 0.5, 0.25, 0.25)
+    ]
+
+    assert [decision["phase"] for decision in decisions] == [
+        "predicted",
+        "predicted",
+        "corrected",
+        "predicted",
+        "corrected",
+        "predicted",
+        "corrected",
+    ]
+    assert [decision["policy_step_id"] for decision in decisions] == [
+        0,
+        1,
+        1,
+        2,
+        2,
+        3,
+        3,
+    ]
+    assert [decision["actual"] for decision in decisions] == [
+        True,
+        True,
+        True,
+        False,
+        True,
+        False,
+        True,
+    ]
+    assert runtime.stats.phase_actual_steps == {"predicted": 2, "corrected": 3}
+    assert runtime.stats.phase_forecast_steps == {"predicted": 2}
+    assert runtime.forecaster.history_length == 4
+    assert runtime.forecaster.latest_anchor_ids(4) == (0, 2, 4, 6)
+    assert runtime._stage_forecasters == {}
+    runtime.end_run(run_id)
+
+
+def test_active_pece_corrected_phase_owns_shared_endpoint_history():
+    runtime = _runtime(force_actual=True, warmup_steps=0, tail_actual_steps=0)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+    topology = (
+        SolverCallDescriptor(0, 0, "predicted"),
+        SolverCallDescriptor(1, 0, "predicted"),
+        SolverCallDescriptor(1, 1, "corrected"),
+    )
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_sa_solver_pece",
+        supported_sampler=True,
+        expected_model_calls=3,
+        stage_count=2,
+        logical_call_topology=topology,
+        state_conditioned_residual=True,
+        separate_stage_histories=False,
+        forecastable_stage_indices=(0,),
+        history_stage_indices=(0, 1),
+        history_step_ids=(0, 2),
+        tail_actual_stage_indices=(1,),
+        allow_state_conditioned_bootstrap=True,
+    )
+
+    _complete_step(runtime, 1.0)
+    _complete_step(runtime, 0.5)
+    assert runtime.forecaster.history_length == 1
+    assert runtime.forecaster.latest_anchor_ids(1) == (0,)
+
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    assert decision["phase"] == "corrected"
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert actual
+    runtime.observe_actual(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        torch.full((1, 3, 4), 123.0),
+    )
+    assert runtime._step is not None
+    assert runtime._step.calls[0].observed_actual
+    assert len(runtime._step.actual_records) == 1
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert runtime.stats.actual_transformer_calls == 3
+    assert runtime.forecaster.history_length == 2
+    assert runtime.forecaster.latest_anchor_ids(2) == (0, 2)
+    assert runtime._stage_forecasters == {}
+    runtime.end_run(run_id)
+
+
+def test_active_pece_default_19_interval_cadence_counts_true_h3_opportunities():
+    runtime = _runtime(warmup_steps=1, tail_actual_steps=1)
+    sigmas = torch.cat((torch.linspace(1.0, 0.1, 19), torch.zeros(1)))
+    topology = [SolverCallDescriptor(0, 0, "predicted")]
+    for outer_step in range(1, 19):
+        topology.extend(
+            (
+                SolverCallDescriptor(outer_step, 0, "predicted"),
+                SolverCallDescriptor(outer_step, 1, "corrected"),
+            )
+        )
+    topology = tuple(topology)
+    history_step_ids = tuple(
+        step_id
+        for step_id, descriptor in enumerate(topology)
+        if step_id == 0 or descriptor.phase == "corrected"
+    )
+
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_sa_solver_pece",
+        supported_sampler=True,
+        expected_model_calls=len(topology),
+        stage_count=2,
+        logical_call_topology=topology,
+        state_conditioned_residual=True,
+        separate_stage_histories=False,
+        forecastable_stage_indices=(0,),
+        history_stage_indices=(0, 1),
+        history_step_ids=history_step_ids,
+        tail_actual_stage_indices=(1,),
+        allow_state_conditioned_bootstrap=True,
+        min_actual_steps_after_forecast=0,
+        max_consecutive_forecasts=1,
+        model_aware_can_force_actual=False,
+    )
+
+    decisions = [
+        _complete_step(runtime, float(sigmas[descriptor.outer_step]))
+        for descriptor in topology
+    ]
+    predicted = [
+        decision for decision in decisions if decision["phase"] == "predicted"
+    ]
+    corrected = [
+        decision for decision in decisions if decision["phase"] == "corrected"
+    ]
+
+    assert len(decisions) == 37
+    assert len(predicted) == 19
+    assert len(corrected) == 18
+    assert sum(decision["actual"] for decision in predicted) == 1
+    assert sum(not decision["actual"] for decision in predicted) == 18
+    assert all(decision["actual"] for decision in corrected)
+    assert runtime.stats.actual_steps == 19
+    assert runtime.stats.forecast_steps == 18
+    assert runtime.stats.actual_steps + runtime.stats.forecast_steps == 37
+    assert runtime.stats.actual_transformer_calls == 19
+    assert runtime.stats.phase_actual_steps == {"predicted": 1, "corrected": 18}
+    assert runtime.stats.phase_forecast_steps == {"predicted": 18}
+    assert runtime.forecaster.latest_anchor_ids(4) == history_step_ids[-4:]
+    summary = runtime.debug_summary()
+    assert "outer_steps=19" in summary
+    assert "h3_logical_calls=37" in summary
+    assert "phase_counts=corrected:a18/f0,predicted:a1/f18" in summary
+    runtime.end_run(run_id)
+
+
+def test_active_pece_10_interval_nominal_cadence_reaches_10_actual_9_forecast():
+    runtime = _runtime(warmup_steps=1, tail_actual_steps=1)
+    sigmas = torch.cat((torch.linspace(1.0, 0.1, 10), torch.zeros(1)))
+    topology = [SolverCallDescriptor(0, 0, "predicted")]
+    for outer_step in range(1, 10):
+        topology.extend(
+            (
+                SolverCallDescriptor(outer_step, 0, "predicted"),
+                SolverCallDescriptor(outer_step, 1, "corrected"),
+            )
+        )
+    topology = tuple(topology)
+    history_step_ids = tuple(
+        step_id
+        for step_id, descriptor in enumerate(topology)
+        if step_id == 0 or descriptor.phase == "corrected"
+    )
+
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_sa_solver_pece",
+        supported_sampler=True,
+        expected_model_calls=len(topology),
+        stage_count=2,
+        logical_call_topology=topology,
+        state_conditioned_residual=True,
+        separate_stage_histories=False,
+        forecastable_stage_indices=(0,),
+        history_stage_indices=(0, 1),
+        history_step_ids=history_step_ids,
+        tail_actual_stage_indices=(1,),
+        allow_state_conditioned_bootstrap=True,
+        min_actual_steps_after_forecast=0,
+        max_consecutive_forecasts=1,
+        model_aware_can_force_actual=False,
+    )
+
+    decisions = [
+        _complete_step(runtime, float(sigmas[descriptor.outer_step]))
+        for descriptor in topology
+    ]
+    predicted = [d for d in decisions if d["phase"] == "predicted"]
+    corrected = [d for d in decisions if d["phase"] == "corrected"]
+
+    assert len(decisions) == 19
+    assert [d["actual"] for d in predicted] == [True] + [False] * 9
+    assert all(d["actual"] for d in corrected)
+    assert runtime.stats.actual_steps == 10
+    assert runtime.stats.forecast_steps == 9
+    assert runtime.stats.actual_transformer_calls == 10
+    assert runtime.stats.phase_actual_steps == {"predicted": 1, "corrected": 9}
+    assert runtime.stats.phase_forecast_steps == {"predicted": 9}
+    assert runtime.forecaster.latest_anchor_ids(4) == history_step_ids[-4:]
+    runtime.end_run(run_id)
 
 def test_model_aware_off_never_enters_controller_and_keeps_legacy_forecast_path(
     monkeypatch,
@@ -442,7 +699,7 @@ def test_separate_stage_histories_validation():
             separate_stage_histories=1,
         )
 
-    with pytest.raises(ValueError, match="requires multistage"):
+    with pytest.raises(ValueError, match="requires an explicit multistage topology"):
         runtime.start_run(
             sigmas,
             "sample_sa_solver",
@@ -731,6 +988,80 @@ def test_sa_and_seeds_state_conditioned_runs_do_not_leak_stage_histories():
     assert runtime.stochastic_multistage is False
     runtime.end_run(sa_again)
 
+
+
+@pytest.mark.parametrize(
+    ("middle_sampler", "middle_stage_count", "middle_calls"),
+    (
+        ("sample_sa_solver", 1, 3),
+        ("sample_seeds_2", 2, 6),
+        ("sample_seeds_3", 3, 9),
+    ),
+)
+def test_active_pece_runtime_isolation_across_pec_and_seeds(
+    middle_sampler,
+    middle_stage_count,
+    middle_calls,
+):
+    runtime = _runtime(
+        model_aware_mode="off",
+        force_actual=True,
+        warmup_steps=0,
+        tail_actual_steps=0,
+    )
+    sigmas = torch.tensor([1.0, 0.6, 0.3, 0.0])
+    pece_topology = (
+        SolverCallDescriptor(0, 0, "predicted"),
+        SolverCallDescriptor(1, 0, "predicted"),
+        SolverCallDescriptor(1, 1, "corrected"),
+        SolverCallDescriptor(2, 0, "predicted"),
+        SolverCallDescriptor(2, 1, "corrected"),
+    )
+    pece_history_step_ids = (0, 2, 4)
+
+    def run_pece():
+        run_id = runtime.start_run(
+            sigmas,
+            "sample_sa_solver_pece",
+            supported_sampler=True,
+            expected_model_calls=len(pece_topology),
+            stage_count=2,
+            logical_call_topology=pece_topology,
+            state_conditioned_residual=True,
+            separate_stage_histories=False,
+            forecastable_stage_indices=(0,),
+            history_stage_indices=(0, 1),
+            history_step_ids=pece_history_step_ids,
+            tail_actual_stage_indices=(1,),
+            allow_state_conditioned_bootstrap=True,
+        )
+        assert runtime.prediction_history_length == 0
+        assert runtime.stochastic_multistage is False
+        for timestep in (1.0, 0.6, 0.6, 0.3, 0.3):
+            _complete_step(runtime, timestep)
+        assert runtime.forecaster.history_length == 3
+        assert runtime.forecaster.latest_anchor_ids(3) == pece_history_step_ids
+        assert runtime._stage_forecasters == {}
+        runtime.end_run(run_id)
+
+    run_pece()
+    middle_run = runtime.start_run(
+        sigmas,
+        middle_sampler,
+        supported_sampler=True,
+        expected_model_calls=middle_calls,
+        stage_count=middle_stage_count,
+        state_conditioned_residual=True,
+        separate_stage_histories=middle_stage_count > 1,
+    )
+    assert runtime.prediction_history_length == 0
+    assert runtime._run is not None
+    assert runtime._run.logical_call_topology is None
+    assert runtime.stochastic_multistage is (middle_stage_count > 1)
+    for call_id in range(middle_calls):
+        _complete_step(runtime, float(sigmas[min(call_id // middle_stage_count, 2)]))
+    runtime.end_run(middle_run)
+    run_pece()
 
 def test_legacy_stochastic_multistage_keyword_maps_to_generic_state_conditioning():
     runtime = _runtime(force_actual=True)

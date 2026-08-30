@@ -29,7 +29,12 @@ from .refdelta_interop import (
     RefDeltaInteropError,
 )
 from .rollback import run_selective_rollback_euler
-from .runtime import ForecastRetryActual, OfflineReplayAbort, SpectrumH3Runtime
+from .runtime import (
+    ForecastRetryActual,
+    OfflineReplayAbort,
+    SolverCallDescriptor,
+    SpectrumH3Runtime,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -37,6 +42,8 @@ BINDING_KEY = "spectrum_h3_binding"
 RUNTIME_KEY = "spectrum_h3_runtime"
 RUN_ID_KEY = "spectrum_h3_run_id"
 STEP_ID_KEY = "spectrum_h3_step_id"
+OUTER_STEP_ID_KEY = "spectrum_h3_outer_step_id"
+SOLVER_PHASE_KEY = "spectrum_h3_solver_phase"
 COORDINATE_KEY = "spectrum_h3_coordinate"
 ACTUAL_KEY = "spectrum_h3_actual"
 REASON_KEY = "spectrum_h3_reason"
@@ -234,6 +241,44 @@ def _sa_solver_expected_model_calls(sampler: Any, sigmas: Any) -> int | None:
     return 2 * outer_steps - 1
 
 
+def _sa_solver_call_topology(
+    sampler: Any,
+    sigmas: Any,
+) -> tuple[SolverCallDescriptor, ...] | None:
+    """Describe every native SA model call without inventing phase time offsets."""
+    expected = _sa_solver_expected_model_calls(sampler, sigmas)
+    if expected is None:
+        return None
+    name = sampler_name(sampler)
+    options = getattr(sampler, "extra_options", {}) or {}
+    if not isinstance(options, dict):
+        return None
+    corrector_order = options.get("corrector_order", 4)
+    use_pece = name == "sample_sa_solver_pece" or options.get("use_pece", False) is True
+    active_pece = bool(use_pece and corrector_order > 0)
+    outer_steps = max(0, int(sigmas.numel()) - 1)
+    topology: list[SolverCallDescriptor] = []
+    for outer_step in range(outer_steps):
+        topology.append(
+            SolverCallDescriptor(
+                outer_step=outer_step,
+                stage_index=0,
+                phase="predicted",
+            )
+        )
+        if active_pece and outer_step > 0:
+            topology.append(
+                SolverCallDescriptor(
+                    outer_step=outer_step,
+                    stage_index=1,
+                    phase="corrected",
+                )
+            )
+    if len(topology) != expected:
+        return None
+    return tuple(topology)
+
+
 def _sa_solver_prefix_model_calls(
     sampler: Any,
     sigmas: Any,
@@ -320,6 +365,19 @@ def _sa_solver_is_stochastic(sampler: Any) -> bool:
     if values is None:
         return True
     return values["eta"] > 0.0
+
+
+def _sa_solver_is_active_pece(sampler: Any) -> bool:
+    """Return whether native SA performs the corrected-state PECE evaluation."""
+    name = sampler_name(sampler)
+    if name not in SA_SOLVER_SAMPLERS:
+        return False
+    options = getattr(sampler, "extra_options", {}) or {}
+    if not isinstance(options, dict):
+        return False
+    use_pece = name == "sample_sa_solver_pece" or options.get("use_pece", False) is True
+    corrector_order = options.get("corrector_order", 4)
+    return bool(use_pece and type(corrector_order) is int and corrector_order > 0)
 
 
 def _sa_solver_stochastic_protection(
@@ -418,18 +476,10 @@ def _sa_solver_option_contract(name: str, options: Any) -> str | None:
     if type(options.get("simple_order_2", False)) is not bool:
         return "SA-Solver simple_order_2 must be boolean"
 
-    use_pece = name == "sample_sa_solver_pece"
     if name == "sample_sa_solver":
         configured_use_pece = options.get("use_pece", False)
         if type(configured_use_pece) is not bool:
             return "SA-Solver use_pece must be boolean"
-        use_pece = configured_use_pece
-    if use_pece and options.get("corrector_order", 4) > 0:
-        return (
-            "SA-Solver PECE with an active corrector has duplicate-sigma "
-            "predicted/corrected states and is not reviewed for Spectrum forecasting"
-        )
-
     noise_sampler = options.get("noise_sampler")
     if noise_sampler is not None and not callable(noise_sampler):
         return "SA-Solver noise_sampler must be callable or None"
@@ -762,15 +812,20 @@ def _sa_predict_causal_denoised(
     target_lambda: torch.Tensor,
     target_step: int,
     continuum_active: bool = False,
+    allow_consecutive_extrapolation: bool = False,
 ) -> tuple[torch.Tensor, str, tuple[int, ...], torch.Tensor]:
     """Predict SA's denoised variable directly from exact actual anchors.
 
     Fresh SA predictor noise changes the model input in a direction that cannot be
-    reconstructed exactly when the H3 transformer is skipped. During an active
-    stochastic interval, do not feed the hidden-feature forecast into SA's Adams
-    equations. Instead extrapolate the solver-space denoised trajectory from exact
-    H3 anchors only. The extrapolation is causal and bounded to one previous
-    anchor interval; any untrusted geometry degenerates to a latest-actual hold.
+    reconstructed exactly when the H3 transformer is skipped. Solver-space dense
+    output therefore uses exact H3 anchors only. The extrapolation is causal and
+    bounded to one previous anchor interval; any untrusted geometry degenerates to
+    a latest-actual hold.
+
+    Ordinary stochastic PEC keeps the conservative rule that consecutive exact
+    anchors imply a hold. Active PECE may opt into consecutive-anchor secant
+    extrapolation because every forecasted predicted phase is immediately followed
+    by an exact corrected endpoint before the next predictor.
     """
     if not (
         len(actual_preds) == len(actual_lambdas) == len(actual_steps)
@@ -819,10 +874,10 @@ def _sa_predict_causal_denoised(
     ):
         raise RuntimeError("stochastic SA dense-output actual anchors are incompatible")
 
-    # Consecutive exact anchors usually mean warmup, a hard transition, or an
-    # externally forced refresh. There is no crossed forecast interval to justify
-    # a secant extrapolation yet, so hold the newest exact denoised value.
-    if latest_step - previous_step == 1:
+    # Ordinary stochastic PEC treats consecutive exact anchors as a conservative
+    # hold boundary. Active PECE can instead use the exact corrected endpoints as
+    # a one-step secant because each endpoint is native persistent Adams evidence.
+    if latest_step - previous_step == 1 and not allow_consecutive_extrapolation:
         return (
             latest_value.clone(memory_format=torch.contiguous_format),
             "latest_actual_hold_consecutive_anchors",
@@ -855,6 +910,400 @@ def _sa_predict_causal_denoised(
         (previous_step, latest_step),
         weight,
     )
+
+
+def _sample_sa_solver_pece_forecast_isolated(
+    runtime: SpectrumH3Runtime,
+    model: Any,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    extra_args: dict[str, Any] | None = None,
+    callback: Any = None,
+    disable: bool = False,
+    tau_func: Any = None,
+    s_noise: float = 1.0,
+    noise_sampler: Any = None,
+    predictor_order: int = 3,
+    corrector_order: int = 4,
+    simple_order_2: bool = False,
+    continuum_active: bool = False,
+) -> torch.Tensor:
+    """Run active PECE with forecastable predicted phases and exact corrected phases.
+
+    ComfyUI evaluates the predicted state first, uses that endpoint in the current
+    corrector, then evaluates the corrected state at the same sigma. The corrected
+    evaluation replaces the predicted endpoint before the next predictor. Spectrum
+    preserves that ownership explicitly:
+
+    * a predicted-phase forecast is ephemeral and can affect only the current
+      corrector state;
+    * the corrected phase is always an actual H3 evaluation;
+    * only the corrected actual becomes the persistent endpoint for that outer
+      sigma (the initial predicted actual is retained when no corrector exists).
+
+    Spectrum feature history mirrors native PECE endpoint ownership: the initial
+    predicted actual is the first anchor, then each exact corrected evaluation
+    replaces the same-coordinate predicted phase as the persistent feature anchor.
+    Predicted phases after outer zero never enter persistent feature history, even
+    if a hard boundary forces them exact.
+
+    Every predicted-phase forecast is solver-owned. The raw hidden-feature
+    forecast completes the cheap Spectrum transaction but is never consumed by
+    SA. Instead the corrector receives a causal solver-space estimate built only
+    from exact persistent PECE endpoints. Continuum keeps its stricter latest-exact
+    hold policy for every forecast coordinate.
+    """
+    if corrector_order <= 0:
+        raise ValueError("active PECE requires corrector_order > 0")
+    if len(sigmas) <= 1:
+        return x
+
+    import comfy.k_diffusion.sa_solver as native_sa_solver
+    import comfy.k_diffusion.sampling as native_sampling
+    from tqdm.auto import trange
+
+    extra_args = {} if extra_args is None else extra_args
+    seed = extra_args.get("seed", None)
+    noise_sampler = (
+        native_sampling.default_noise_sampler(x, seed=seed)
+        if noise_sampler is None
+        else noise_sampler
+    )
+    s_in = x.new_ones([x.shape[0]])
+
+    model_sampling = model.inner_model.model_patcher.get_model_object("model_sampling")
+    s_noise = s_noise * getattr(model_sampling, "noise_scale", 1.0)
+    sigmas = native_sampling.offset_first_sigma_for_snr(sigmas, model_sampling)
+    lambdas = native_sampling.sigma_to_half_log_snr(
+        sigmas,
+        model_sampling=model_sampling,
+    )
+
+    if tau_func is None:
+        start_sigma = model_sampling.percent_to_sigma(0.2)
+        end_sigma = model_sampling.percent_to_sigma(0.8)
+        tau_func = native_sa_solver.get_tau_interval_func(
+            start_sigma,
+            end_sigma,
+            eta=1.0,
+        )
+
+    max_used_order = max(predictor_order, corrector_order)
+    x_pred = x
+    h = 0.0
+    tau_t = 0.0
+    noise = 0.0
+
+    # One exact endpoint per completed outer coordinate. For outer step zero it
+    # is the predicted evaluation; for every active corrector step it is the
+    # corrected-state evaluation that native PECE assigns to pred_list[-1].
+    persistent_preds: list[torch.Tensor] = []
+    persistent_lambdas: list[torch.Tensor] = []
+    persistent_outer_steps: list[int] = []
+
+    # Dense-output anchors mirror the exact persistent PECE endpoint stream.
+    # They are kept separate from the native Adams lists only so a declared
+    # transformer discontinuity can reset interpolation geometry without changing
+    # native Adams persistence/order.
+    dense_endpoint_preds: list[torch.Tensor] = []
+    dense_endpoint_lambdas: list[torch.Tensor] = []
+    dense_endpoint_outer_steps: list[int] = []
+
+    lower_order_to_end = sigmas[-1].item() == 0
+
+    def append_bounded(
+        values: list[torch.Tensor],
+        coordinates: list[torch.Tensor],
+        outer_steps: list[int],
+        value: torch.Tensor,
+        coordinate: torch.Tensor,
+        outer_step: int,
+    ) -> None:
+        values.append(value)
+        coordinates.append(coordinate)
+        outer_steps.append(outer_step)
+        if len(values) > max_used_order:
+            del values[:-max_used_order]
+            del coordinates[:-max_used_order]
+            del outer_steps[:-max_used_order]
+
+    for i in trange(len(sigmas) - 1, disable=disable):
+        raw_predicted = model(
+            x_pred,
+            sigmas[i] * s_in,
+            **extra_args,
+        )
+        predicted_mode = runtime.last_completed_mode
+        predicted_step_id = 0 if i == 0 else 2 * i - 1
+        if runtime.last_completed_step_id not in {None, predicted_step_id}:
+            raise RuntimeError(
+                "Spectrum PECE predicted-state call arrived at the wrong logical "
+                f"coordinate (outer={i}, expected={predicted_step_id}, "
+                f"observed={runtime.last_completed_step_id})"
+            )
+        if predicted_mode not in {"actual", "forecast"}:
+            raise RuntimeError(
+                "Spectrum PECE adapter could not classify the predicted-state "
+                f"evaluation at outer step {i}"
+            )
+        predicted_actual = predicted_mode == "actual"
+        predicted_reason = getattr(runtime, "last_completed_reason", None)
+        predicted = raw_predicted
+        solver_value_source = "actual_h3" if predicted_actual else "feature_forecast"
+        if not predicted_actual:
+            predicted, dense_mode, anchor_steps, dense_alpha = (
+                _sa_predict_causal_denoised(
+                    dense_endpoint_preds,
+                    dense_endpoint_lambdas,
+                    dense_endpoint_outer_steps,
+                    target_lambda=lambdas[i],
+                    target_step=i,
+                    continuum_active=continuum_active,
+                    allow_consecutive_extrapolation=True,
+                )
+            )
+            solver_value_source = dense_mode
+            if runtime.config.debug:
+                alpha_value = float(dense_alpha.detach().to(device="cpu").item())
+                LOG.warning(
+                    "Spectrum H3 SA PECE dense output sa_outer=%s sa_phase=predicted "
+                    "scope=%s mode=%s anchor_outer_steps=%s alpha=%.8f "
+                    "raw_feature_forecast=ignored "
+                    "history_lane=persistent_endpoint_actual_only",
+                    i,
+                    (
+                        "continuum_all_forecasts"
+                        if continuum_active
+                        else "pece_all_forecasts"
+                    ),
+                    dense_mode,
+                    anchor_steps,
+                    alpha_value,
+                )
+
+        if callback is not None:
+            callback(
+                {
+                    "x": x_pred,
+                    "i": i,
+                    "sigma": sigmas[i],
+                    "sigma_hat": sigmas[i],
+                    "denoised": predicted,
+                }
+            )
+
+        # The current predicted endpoint is valid input to this corrector even
+        # when it is forecast. It is deliberately absent from persistent_preds
+        # until native PECE resolves the endpoint through the corrected phase.
+        corrector_preds = [*persistent_preds, predicted]
+        corrector_lambdas = [*persistent_lambdas, lambdas[i]]
+        if len(corrector_preds) > max_used_order:
+            corrector_preds = corrector_preds[-max_used_order:]
+            corrector_lambdas = corrector_lambdas[-max_used_order:]
+
+        predictor_order_used = min(predictor_order, len(corrector_preds))
+        corrector_order_used = 0 if i == 0 else min(
+            corrector_order,
+            len(corrector_preds),
+        )
+        if lower_order_to_end:
+            predictor_order_used = min(
+                predictor_order_used,
+                len(sigmas) - 2 - i,
+            )
+            corrector_order_used = min(
+                corrector_order_used,
+                len(sigmas) - 1 - i,
+            )
+
+        if corrector_order_used == 0:
+            x = x_pred
+            if not predicted_actual:
+                raise RuntimeError(
+                    "active PECE cannot begin without an actual initial endpoint"
+                )
+            append_bounded(
+                persistent_preds,
+                persistent_lambdas,
+                persistent_outer_steps,
+                predicted,
+                lambdas[i],
+                i,
+            )
+            append_bounded(
+                dense_endpoint_preds,
+                dense_endpoint_lambdas,
+                dense_endpoint_outer_steps,
+                predicted,
+                lambdas[i],
+                i,
+            )
+            endpoint = predicted
+            predicted_persistent = True
+        else:
+            curr_lambdas = torch.stack(
+                corrector_lambdas[-corrector_order_used:]
+            )
+            b_coeffs = native_sa_solver.compute_stochastic_adams_b_coeffs(
+                sigmas[i],
+                curr_lambdas,
+                lambdas[i - 1],
+                lambdas[i],
+                tau_t,
+                simple_order_2,
+                is_corrector_step=True,
+            )
+            pred_mat = torch.stack(
+                corrector_preds[-corrector_order_used:],
+                dim=1,
+            )
+            corr_res = torch.tensordot(
+                pred_mat,
+                b_coeffs,
+                dims=([1], [0]),
+            )
+            x = (
+                sigmas[i]
+                / sigmas[i - 1]
+                * (-(tau_t**2) * h).exp()
+                * x
+                + corr_res
+            )
+            if tau_t > 0 and s_noise > 0:
+                x = x + noise
+
+            corrected = model(
+                x,
+                sigmas[i] * s_in,
+                **extra_args,
+            )
+            corrected_mode = runtime.last_completed_mode
+            corrected_step_id = 2 * i
+            if runtime.last_completed_step_id not in {None, corrected_step_id}:
+                raise RuntimeError(
+                    "Spectrum PECE corrected-state call arrived at the wrong logical "
+                    f"coordinate (outer={i}, expected={corrected_step_id}, "
+                    f"observed={runtime.last_completed_step_id})"
+                )
+            if corrected_mode != "actual":
+                raise RuntimeError(
+                    "Spectrum PECE corrected-state phase violated its exact reanchor policy "
+                    f"at outer step {i} (mode={corrected_mode!r})"
+                )
+            append_bounded(
+                persistent_preds,
+                persistent_lambdas,
+                persistent_outer_steps,
+                corrected,
+                lambdas[i],
+                i,
+            )
+            if predicted_reason == "external patch hard sigma transition":
+                dense_endpoint_preds.clear()
+                dense_endpoint_lambdas.clear()
+                dense_endpoint_outer_steps.clear()
+                if runtime.config.debug:
+                    LOG.warning(
+                        "Spectrum H3 SA PECE dense history reset sa_outer=%s "
+                        "reason=external_patch_hard_transition "
+                        "native_adams_history=preserved",
+                        i,
+                    )
+            append_bounded(
+                dense_endpoint_preds,
+                dense_endpoint_lambdas,
+                dense_endpoint_outer_steps,
+                corrected,
+                lambdas[i],
+                i,
+            )
+            endpoint = corrected
+            predicted_persistent = False
+            if runtime.config.debug:
+                LOG.warning(
+                    "Spectrum H3 SA PECE opportunity logical_step=%s "
+                    "sa_outer=%s sa_phase=corrected sigma=%.9g "
+                    "actual_model_evaluation=1 forecast=0 "
+                    "reason=pece_exact_reanchor adams_persistent=1 "
+                    "solver_value_source=actual_h3 continuum=%s",
+                    corrected_step_id,
+                    i,
+                    float(sigmas[i].detach().to(device="cpu").item()),
+                    int(continuum_active),
+                )
+
+        if runtime.config.debug:
+            LOG.warning(
+                "Spectrum H3 SA PECE opportunity logical_step=%s "
+                "sa_outer=%s sa_phase=predicted sigma=%.9g "
+                "actual_model_evaluation=%s forecast=%s reason=%s "
+                "adams_persistent=%s solver_value_source=%s continuum=%s",
+                predicted_step_id,
+                i,
+                float(sigmas[i].detach().to(device="cpu").item()),
+                int(predicted_actual),
+                int(not predicted_actual),
+                "predicted_actual_h3" if predicted_actual else "predicted_forecast_ephemeral",
+                int(predicted_persistent),
+                solver_value_source,
+                int(continuum_active),
+            )
+
+        if sigmas[i + 1] == 0:
+            x_pred = endpoint
+            continue
+
+        if not persistent_preds:
+            raise RuntimeError("active PECE has no exact endpoint for its predictor")
+        predictor_order_used = min(predictor_order_used, len(persistent_preds))
+        tau_t = tau_func(sigmas[i + 1])
+        curr_lambdas = torch.stack(
+            persistent_lambdas[-predictor_order_used:]
+        )
+        b_coeffs = native_sa_solver.compute_stochastic_adams_b_coeffs(
+            sigmas[i + 1],
+            curr_lambdas,
+            lambdas[i],
+            lambdas[i + 1],
+            tau_t,
+            simple_order_2,
+            is_corrector_step=False,
+        )
+        pred_mat = torch.stack(
+            persistent_preds[-predictor_order_used:],
+            dim=1,
+        )
+        pred_res = torch.tensordot(
+            pred_mat,
+            b_coeffs,
+            dims=([1], [0]),
+        )
+        h = lambdas[i + 1] - lambdas[i]
+        x_pred = (
+            sigmas[i + 1]
+            / sigmas[i]
+            * (-(tau_t**2) * h).exp()
+            * x
+            + pred_res
+        )
+        if tau_t > 0 and s_noise > 0:
+            noise = (
+                noise_sampler(sigmas[i], sigmas[i + 1])
+                * sigmas[i + 1]
+                * (-2 * tau_t**2 * h).expm1().neg().sqrt()
+                * s_noise
+            )
+            x_pred = x_pred + noise
+
+    expected_last_step = 2 * (len(sigmas) - 1) - 2
+    if runtime.last_completed_step_id not in {None, expected_last_step}:
+        raise RuntimeError(
+            "Spectrum PECE completed with an unexpected logical model-call count "
+            f"(expected_last={expected_last_step}, "
+            f"observed={runtime.last_completed_step_id})"
+        )
+    return x_pred
 
 
 def _sample_sa_solver_forecast_isolated(
@@ -905,7 +1354,22 @@ def _sample_sa_solver_forecast_isolated(
     equations, and RNG draws remain unchanged.
     """
     if use_pece and corrector_order > 0:
-        raise RuntimeError("active SA-Solver PECE is not supported by the isolated-history adapter")
+        return _sample_sa_solver_pece_forecast_isolated(
+            runtime,
+            model,
+            x,
+            sigmas,
+            extra_args=extra_args,
+            callback=callback,
+            disable=disable,
+            tau_func=tau_func,
+            s_noise=s_noise,
+            noise_sampler=noise_sampler,
+            predictor_order=predictor_order,
+            corrector_order=corrector_order,
+            simple_order_2=simple_order_2,
+            continuum_active=continuum_active,
+        )
     if len(sigmas) <= 1:
         return x
 
@@ -1180,10 +1644,7 @@ def _run_solver_aware_sa(
     continuum_active = _continuum_actual_prefix(
         (extra_args or {}).get("model_options")
     ) > 0
-    if use_pece and int(options.get("corrector_order", 4)) > 0:
-        raise RuntimeError(
-            "active SA-Solver PECE reached the isolated-history adapter after preflight"
-        )
+    active_pece = bool(use_pece and int(options.get("corrector_order", 4)) > 0)
 
     def spectrum_sa_function(
         model,
@@ -1194,6 +1655,16 @@ def _run_solver_aware_sa(
         disable=False,
         **run_options,
     ):
+        # Native `sample_sa_solver` exposes `use_pece` through KSAMPLER
+        # extra_options. Consume that reviewed option here before forwarding the
+        # remaining solver kwargs; otherwise the adapter would pass use_pece
+        # twice when the generic SA entry point is configured for PECE.
+        run_options = dict(run_options)
+        forwarded_use_pece = run_options.pop("use_pece", use_pece)
+        if type(forwarded_use_pece) is not bool or forwarded_use_pece != use_pece:
+            raise RuntimeError(
+                "SA isolated-history adapter observed a changed use_pece option"
+            )
         return _sample_sa_solver_forecast_isolated(
             runtime,
             model,
@@ -1219,10 +1690,13 @@ def _run_solver_aware_sa(
     if runtime.config.debug:
         LOG.warning(
             "Spectrum H3 SA adapter mode=isolated_adams_history "
-            "persistent=actual_only forecast_use=current_corrector+predictor_ephemeral "
-            "forecast_corrector=ephemeral_current_only "
+            "topology=%s persistent=actual_only "
+            "predicted_forecast=current_corrector_ephemeral "
+            "corrected_phase=%s "
             "stochastic_forecast=solver_space_causal_dense_output "
             "continuum_dense_mode=%s continuum_dense_scope=%s",
+            "predicted+corrected" if active_pece else "predicted",
+            "exact_reanchor" if active_pece else "none",
             "latest_actual_hold" if continuum_active else "lambda_bounded_extrapolation",
             "all_forecasts" if continuum_active else "stochastic_only",
         )
@@ -1390,6 +1864,11 @@ def max_consecutive_forecasts(sampler: Any) -> int | None:
 def min_actual_steps_after_forecast(sampler: Any) -> int:
     name = sampler_name(sampler)
     if name in SA_SOLVER_SAMPLERS:
+        if _sa_solver_is_active_pece(sampler):
+            # Every forecastable predicted phase is followed by an exact
+            # corrected-state H3 reanchor in the same outer interval. The
+            # predicted feature lane still enforces its own one-anchor refresh.
+            return 0
         if _sa_solver_is_stochastic(sampler):
             return 0
         options = getattr(sampler, "extra_options", {}) or {}
@@ -1461,6 +1940,8 @@ def copy_model_options_with_step(
     transformer_options[RUNTIME_KEY] = runtime
     transformer_options[RUN_ID_KEY] = int(decision["run_id"])
     transformer_options[STEP_ID_KEY] = int(decision["step_id"])
+    transformer_options[OUTER_STEP_ID_KEY] = int(decision["policy_step_id"])
+    transformer_options[SOLVER_PHASE_KEY] = str(decision["phase"])
     transformer_options[COORDINATE_KEY] = float(decision["coordinate"])
     transformer_options[ACTUAL_KEY] = bool(decision["actual"])
     transformer_options[REASON_KEY] = str(decision["reason"])
@@ -1517,13 +1998,19 @@ def outer_sample_wrapper(
     runtime = binding.runtime
     name = sampler_name(sampler)
     expected_model_calls = None
+    sa_call_topology = None
     if name in SA_SOLVER_SAMPLERS:
         preflight_reason = _native_sa_solver_preflight_reason(
             sampler,
             getattr(guider, "model_options", None),
         )
         expected_model_calls = _sa_solver_expected_model_calls(sampler, sigmas)
-        if preflight_reason is not None or expected_model_calls is None:
+        sa_call_topology = _sa_solver_call_topology(sampler, sigmas)
+        if (
+            preflight_reason is not None
+            or expected_model_calls is None
+            or sa_call_topology is None
+        ):
             reason = preflight_reason or "SA-Solver model-call topology is unavailable"
             LOG.warning(
                 "Spectrum H3 disabled for this SA-Solver run; running the untouched "
@@ -1608,7 +2095,8 @@ def outer_sample_wrapper(
     continuum_log_emitted = False
     stochastic_seeds = name in SEEDS_SAMPLERS and _seeds_is_stochastic(sampler)
     stochastic_sa = name in SA_SOLVER_SAMPLERS and _sa_solver_is_stochastic(sampler)
-    state_conditioned_residual = stochastic_seeds or stochastic_sa
+    active_pece = name in SA_SOLVER_SAMPLERS and _sa_solver_is_active_pece(sampler)
+    state_conditioned_residual = stochastic_seeds or stochastic_sa or active_pece
     sa_forced_actual_steps: tuple[int, ...] = ()
     sa_stochastic_input_steps: tuple[int, ...] = ()
     if name in SA_SOLVER_SAMPLERS:
@@ -1718,6 +2206,19 @@ def outer_sample_wrapper(
             if expanded_prefix is None:
                 raise RuntimeError("SEEDS prefix model-call topology became unavailable")
             phase_prefix = expanded_prefix
+        pece_history_step_ids = (
+            tuple(
+                logical_step
+                for logical_step, descriptor in enumerate(sa_call_topology or ())
+                if descriptor.phase == "corrected"
+                or (
+                    descriptor.outer_step == 0
+                    and descriptor.phase == "predicted"
+                )
+            )
+            if active_pece
+            else None
+        )
         run_id = runtime.start_run(
             run_sigmas,
             name,
@@ -1727,21 +2228,34 @@ def outer_sample_wrapper(
             min_tail_actual_steps=min_tail_actual_steps(sampler),
             min_actual_prefix_steps=phase_prefix,
             expected_model_calls=expected_model_calls,
-            stage_count=SEEDS_STAGE_COUNTS.get(name, 1),
+            stage_count=(
+                2 if active_pece else SEEDS_STAGE_COUNTS.get(name, 1)
+            ),
+            logical_call_topology=sa_call_topology,
             state_conditioned_residual=state_conditioned_residual,
-            separate_stage_histories=False if stochastic_seeds else None,
+            separate_stage_histories=(
+                False if active_pece or stochastic_seeds else None
+            ),
             forecastable_stage_indices=(
-                tuple(range(1, SEEDS_STAGE_COUNTS[name]))
+                (0,)
+                if active_pece
+                else tuple(range(1, SEEDS_STAGE_COUNTS[name]))
                 if stochastic_seeds
                 else None
             ),
+            history_stage_indices=(0, 1) if active_pece else None,
+            history_step_ids=pece_history_step_ids,
+            tail_actual_stage_indices=(1,) if active_pece else None,
+            allow_state_conditioned_bootstrap=active_pece,
             forced_actual_step_ids=(
                 sa_forced_actual_steps if name in SA_SOLVER_SAMPLERS else None
             ),
             forced_actual_steps_advance_window=bool(
                 name in SA_SOLVER_SAMPLERS and stochastic_sa
             ),
-            model_aware_can_force_actual=not (stochastic_seeds or stochastic_sa),
+            model_aware_can_force_actual=not (
+                stochastic_seeds or stochastic_sa or active_pece
+            ),
         )
         if phase_prefix > 0 and runtime.supported_sampler and not continuum_log_emitted:
             LOG.warning(
@@ -1767,11 +2281,12 @@ def outer_sample_wrapper(
         if runtime.config.debug:
             LOG.warning(
                 "Spectrum H3 run start phase=%s run_id=%s sampler=%s steps=%s supported=%s "
-                "seeds_stochastic=%s sa_stochastic=%s stage_count=%s feature_geometry=%s "
+                "seeds_stochastic=%s sa_stochastic=%s sa_active_pece=%s "
+                "stage_count=%s feature_geometry=%s "
                 "stage_histories=%s sa_stochastic_input_steps=%s "
                 "sa_forced_actual_steps=%s sa_post_forecast_refresh=%s "
                 "sa_max_forecast_streak=%s sa_exact_window_credit=%s "
-                "sa_adams_history=%s "
+                "sa_adams_history=%s sa_feature_history=%s "
                 "model_aware_force_actual=%s",
                 phase,
                 run_id,
@@ -1780,15 +2295,22 @@ def outer_sample_wrapper(
                 runtime.supported_sampler,
                 stochastic_seeds,
                 stochastic_sa,
-                SEEDS_STAGE_COUNTS.get(name, 1),
+                active_pece,
+                2 if active_pece else SEEDS_STAGE_COUNTS.get(name, 1),
                 (
-                    "state_conditioned_residual_shared_history"
+                    "state_conditioned_residual_endpoint_history"
+                    if active_pece
+                    else "state_conditioned_residual_shared_history"
                     if stochastic_seeds
                     else "state_conditioned_residual"
                     if state_conditioned_residual
                     else "absolute_hidden"
                 ),
-                "shared" if stochastic_seeds else "single",
+                "shared_endpoint"
+                if active_pece
+                else "shared"
+                if stochastic_seeds
+                else "single",
                 sa_stochastic_input_steps,
                 sa_forced_actual_steps,
                 min_actual_steps_after_forecast(sampler) if name in SA_SOLVER_SAMPLERS else 0,
@@ -1799,7 +2321,12 @@ def outer_sample_wrapper(
                     if name in SA_SOLVER_SAMPLERS
                     else "-"
                 ),
-                not (stochastic_seeds or stochastic_sa),
+                (
+                    "initial_predicted+corrected_actual_endpoints"
+                    if active_pece
+                    else "-"
+                ),
+                not (stochastic_seeds or stochastic_sa or active_pece),
             )
         started = time.perf_counter()
         try:
@@ -2052,9 +2579,13 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
     decision = runtime.begin_step(timestep)
     if runtime.config.debug:
         LOG.warning(
-            "Spectrum H3 step run_id=%s step=%s coordinate=%.6f decision=%s reason=%s history=%s window=%.3f",
+            "Spectrum H3 step run_id=%s step=%s outer_step=%s stage=%s phase=%s "
+            "coordinate=%.6f decision=%s reason=%s history=%s window=%.3f",
             decision["run_id"],
             decision["step_id"],
+            decision["policy_step_id"],
+            decision["stage_index"],
+            decision["phase"],
             decision["coordinate"],
             "actual" if decision["actual"] else "forecast",
             decision["reason"],

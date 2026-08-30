@@ -16,11 +16,14 @@ from comfyui_spectrum_h3.sampling import (
     BINDING_KEY,
     SpectrumH3Binding,
     _sa_solver_expected_model_calls,
+    _sa_solver_call_topology,
+    _sa_solver_is_active_pece,
     _sa_solver_is_stochastic,
     _sa_solver_option_contract,
     _sa_solver_prefix_model_calls,
     _sa_solver_sampler_contract,
     _sa_solver_tau_values,
+    _run_solver_aware_sa,
     outer_sample_wrapper,
     sampler_supports_seeded_replay,
 )
@@ -55,28 +58,7 @@ def _native_sa_functions():
         function.decorator_list = []
         functions.append(function)
 
-    def coefficients(
-        _sigma_next,
-        curr_lambdas,
-        _lambda_s,
-        _lambda_t,
-        _tau_t,
-        _simple_order_2=False,
-        is_corrector_step=False,
-    ):
-        scale = 0.15 if is_corrector_step else 0.2
-        return torch.full_like(curr_lambdas, scale / curr_lambdas.numel())
-
-    def interval_factory(start_sigma, end_sigma, eta=1.0):
-        def tau_func(sigma):
-            value = (
-                float(sigma.detach().cpu().item())
-                if torch.is_tensor(sigma)
-                else float(sigma)
-            )
-            return float(eta) if float(start_sigma) >= value >= float(end_sigma) else 0.0
-
-        return tau_func
+    import comfy.k_diffusion.sa_solver as native_sa_solver
 
     namespace = {
         "torch": torch,
@@ -92,8 +74,10 @@ def _native_sa_functions():
         "offset_first_sigma_for_snr": lambda sigmas, _sampling: sigmas,
         "sigma_to_half_log_snr": lambda sigma, model_sampling: -torch.log(sigma),
         "sa_solver": SimpleNamespace(
-            compute_stochastic_adams_b_coeffs=coefficients,
-            get_tau_interval_func=interval_factory,
+            compute_stochastic_adams_b_coeffs=(
+                native_sa_solver.compute_stochastic_adams_b_coeffs
+            ),
+            get_tau_interval_func=native_sa_solver.get_tau_interval_func,
         ),
     }
     module = ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[]))
@@ -121,10 +105,12 @@ def _run_native(
     function_name="sample_sa_solver",
     sigmas=(0.9, 0.7, 0.5, 0.3, 0.0),
     use_pece=False,
+    predictor_order=3,
     corrector_order=4,
     simple_order_2=False,
     tau_func="piecewise",
     s_noise=0.7,
+    noise_scale=1.0,
 ):
     native = _native_sa_functions()[function_name]
     generator = torch.Generator(device="cpu").manual_seed(8675309)
@@ -155,8 +141,12 @@ def _run_native(
     else:
         raise AssertionError(f"unknown tau fixture {tau_func!r}")
 
+    model_sampling = _ModelSampling()
+    model_sampling.noise_scale = noise_scale
+    patcher = SimpleNamespace(get_model_object=lambda _name: model_sampling)
+
     class Model:
-        inner_model = SimpleNamespace(model_patcher=_Patcher())
+        inner_model = SimpleNamespace(model_patcher=patcher)
 
         def __call__(self, x, sigma, **_extra_args):
             coordinate = float(sigma.detach().cpu().item())
@@ -169,7 +159,9 @@ def _run_native(
         callback=lambda state: callbacks.append(
             {
                 "x": state["x"].detach().clone(),
+                "i": state["i"],
                 "sigma": float(state["sigma"]),
+                "sigma_hat": float(state["sigma_hat"]),
                 "denoised": state["denoised"].detach().clone(),
             }
         ),
@@ -177,7 +169,7 @@ def _run_native(
         tau_func=configured_tau,
         s_noise=s_noise,
         noise_sampler=noise_sampler,
-        predictor_order=3,
+        predictor_order=predictor_order,
         corrector_order=corrector_order,
         simple_order_2=simple_order_2,
     )
@@ -196,6 +188,7 @@ def _run_native(
         noise_draws=noise_draws,
         noise_args=noise_args,
         tau_args=tau_args,
+        rng_state=generator.get_state().clone(),
     )
 
 
@@ -207,7 +200,13 @@ def _run_isolated(
     s_noise=0.7,
     predictor_order=3,
     corrector_order=4,
+    simple_order_2=False,
     continuum_active=False,
+    use_pece=False,
+    forecast_offset=0.0,
+    noise_scale=1.0,
+    debug=False,
+    reasons=None,
 ):
     generator = torch.Generator(device="cpu").manual_seed(8675309)
     noise_draws = []
@@ -215,8 +214,14 @@ def _run_isolated(
     callbacks = []
     model_events = []
     tau_args = []
-    runtime = SimpleNamespace(last_completed_mode=None)
+    runtime = SimpleNamespace(
+        last_completed_mode=None,
+        last_completed_step_id=None,
+        last_completed_reason=None,
+        config=SimpleNamespace(debug=bool(debug)),
+    )
     mode_iter = iter(modes)
+    reason_iter = iter(reasons) if reasons is not None else None
 
     def noise_sampler(sigma, sigma_next):
         noise_args.append((float(sigma), float(sigma_next)))
@@ -239,14 +244,23 @@ def _run_isolated(
     else:
         raise AssertionError(f"unknown tau fixture {tau_func!r}")
 
+    model_sampling = _ModelSampling()
+    model_sampling.noise_scale = noise_scale
+    patcher = SimpleNamespace(get_model_object=lambda _name: model_sampling)
+
     class Model:
-        inner_model = SimpleNamespace(model_patcher=_Patcher())
+        inner_model = SimpleNamespace(model_patcher=patcher)
 
         def __call__(self, x, sigma, **_extra_args):
             coordinate = float(sigma.detach().cpu().item())
             model_events.append((x.detach().clone(), coordinate))
             runtime.last_completed_mode = next(mode_iter)
-            return torch.full_like(x, 0.25 + 0.5 * coordinate)
+            runtime.last_completed_step_id = len(model_events) - 1
+            runtime.last_completed_reason = (
+                next(reason_iter) if reason_iter is not None else None
+            )
+            offset = forecast_offset if runtime.last_completed_mode == "forecast" else 0.0
+            return torch.full_like(x, 0.25 + 0.5 * coordinate + offset)
 
     sigma_tensor = torch.tensor(sigmas, dtype=torch.float32)
     result = sampling_module._sample_sa_solver_forecast_isolated(
@@ -258,7 +272,9 @@ def _run_isolated(
         callback=lambda state: callbacks.append(
             {
                 "x": state["x"].detach().clone(),
+                "i": state["i"],
                 "sigma": float(state["sigma"]),
+                "sigma_hat": float(state["sigma_hat"]),
                 "denoised": state["denoised"].detach().clone(),
             }
         ),
@@ -268,7 +284,8 @@ def _run_isolated(
         noise_sampler=noise_sampler,
         predictor_order=predictor_order,
         corrector_order=corrector_order,
-        simple_order_2=False,
+        use_pece=use_pece,
+        simple_order_2=simple_order_2,
         continuum_active=continuum_active,
     )
     return SimpleNamespace(
@@ -279,6 +296,7 @@ def _run_isolated(
         noise_args=noise_args,
         tau_args=tau_args,
         runtime=runtime,
+        rng_state=generator.get_state().clone(),
     )
 
 
@@ -356,6 +374,29 @@ def test_sa_dense_output_holds_after_consecutive_actual_refreshes():
     assert float(alpha) == pytest.approx(0.0)
 
 
+
+def test_sa_dense_output_allows_consecutive_pece_endpoint_extrapolation():
+    previous = torch.tensor([[1.0, 3.0]], dtype=torch.float32)
+    latest = torch.tensor([[2.0, 4.0]], dtype=torch.float32)
+    predicted, mode, anchors, alpha = sampling_module._sa_predict_causal_denoised(
+        [previous, latest],
+        [torch.tensor(0.2), torch.tensor(0.3)],
+        [7, 8],
+        target_lambda=torch.tensor(0.4),
+        target_step=9,
+        allow_consecutive_extrapolation=True,
+    )
+
+    torch.testing.assert_close(
+        predicted,
+        torch.tensor([[3.0, 5.0]], dtype=torch.float32),
+        rtol=0,
+        atol=1e-6,
+    )
+    assert mode == "lambda_bounded_extrapolation"
+    assert anchors == (7, 8)
+    assert float(alpha) == pytest.approx(1.0)
+
 def test_sa_dense_output_uses_bounded_lambda_extrapolation_from_actuals():
     previous = torch.tensor([[1.0, 3.0]], dtype=torch.float32)
     latest = torch.tensor([[2.0, 5.0]], dtype=torch.float32)
@@ -404,9 +445,27 @@ def test_isolated_sa_adapter_is_exact_native_parity_when_every_call_is_actual():
     assert torch.allclose(isolated.result, native.result, atol=0.0, rtol=0.0)
     assert isolated.noise_args == pytest.approx(native.noise_args)
     assert isolated.tau_args == pytest.approx(native.tau_args)
+    assert len(isolated.noise_draws) == len(native.noise_draws)
+    for candidate, expected in zip(
+        isolated.noise_draws,
+        native.noise_draws,
+        strict=True,
+    ):
+        torch.testing.assert_close(candidate, expected, rtol=0, atol=0)
+    torch.testing.assert_close(isolated.rng_state, native.rng_state, rtol=0, atol=0)
+    assert len(isolated.model_events) == len(native.model_events)
+    for candidate, expected in zip(
+        isolated.model_events,
+        native.model_events,
+        strict=True,
+    ):
+        assert candidate[1] == pytest.approx(expected[1])
+        torch.testing.assert_close(candidate[0], expected[0], rtol=0, atol=0)
     assert len(isolated.callbacks) == len(native.callbacks)
     for candidate, expected in zip(isolated.callbacks, native.callbacks, strict=True):
+        assert candidate["i"] == expected["i"]
         assert candidate["sigma"] == pytest.approx(expected["sigma"])
+        assert candidate["sigma_hat"] == pytest.approx(expected["sigma_hat"])
         assert torch.allclose(candidate["x"], expected["x"], atol=0.0, rtol=0.0)
         assert torch.allclose(
             candidate["denoised"],
@@ -414,6 +473,337 @@ def test_isolated_sa_adapter_is_exact_native_parity_when_every_call_is_actual():
             atol=0.0,
             rtol=0.0,
         )
+
+
+def test_active_pece_adapter_is_exact_native_parity_when_every_phase_is_actual():
+    pytest.importorskip("scipy")
+    native = _run_native(use_pece=True)
+    isolated = _run_isolated(["actual"] * 7, use_pece=True)
+
+    torch.testing.assert_close(isolated.result, native.result, rtol=0, atol=0)
+    assert isolated.noise_args == pytest.approx(native.noise_args)
+    assert isolated.tau_args == pytest.approx(native.tau_args)
+    assert len(isolated.noise_draws) == len(native.noise_draws)
+    for candidate, expected in zip(
+        isolated.noise_draws,
+        native.noise_draws,
+        strict=True,
+    ):
+        torch.testing.assert_close(candidate, expected, rtol=0, atol=0)
+    torch.testing.assert_close(isolated.rng_state, native.rng_state, rtol=0, atol=0)
+    assert len(isolated.model_events) == len(native.model_events) == 7
+    for candidate, expected in zip(
+        isolated.model_events,
+        native.model_events,
+        strict=True,
+    ):
+        assert candidate[1] == pytest.approx(expected[1])
+        torch.testing.assert_close(candidate[0], expected[0], rtol=0, atol=0)
+    assert len(isolated.callbacks) == len(native.callbacks) == 4
+    for candidate, expected in zip(isolated.callbacks, native.callbacks, strict=True):
+        assert candidate["i"] == expected["i"]
+        assert candidate["sigma"] == pytest.approx(expected["sigma"])
+        assert candidate["sigma_hat"] == pytest.approx(expected["sigma_hat"])
+        torch.testing.assert_close(candidate["x"], expected["x"], rtol=0, atol=0)
+        torch.testing.assert_close(
+            candidate["denoised"],
+            expected["denoised"],
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("predictor_order", "corrector_order", "tau_func", "s_noise", "simple_order_2"),
+    (
+        (1, 1, "piecewise", 0.7, False),
+        (1, 4, "zero", 0.7, False),
+        (2, 1, "piecewise", 0.7, False),
+        (2, 2, "piecewise", 0.7, True),
+        (3, 2, "piecewise", 0.0, False),
+        (3, 3, "zero", 0.7, False),
+        (3, 4, "piecewise", 0.0, False),
+        (3, 4, None, 0.7, False),
+    ),
+)
+def test_active_pece_all_actual_parity_across_order_and_stochasticity(
+    predictor_order,
+    corrector_order,
+    tau_func,
+    s_noise,
+    simple_order_2,
+):
+    pytest.importorskip("scipy")
+    native = _run_native(
+        use_pece=True,
+        predictor_order=predictor_order,
+        corrector_order=corrector_order,
+        tau_func=tau_func,
+        s_noise=s_noise,
+        simple_order_2=simple_order_2,
+    )
+    isolated = _run_isolated(
+        ["actual"] * 7,
+        use_pece=True,
+        predictor_order=predictor_order,
+        corrector_order=corrector_order,
+        tau_func=tau_func,
+        s_noise=s_noise,
+        simple_order_2=simple_order_2,
+    )
+
+    torch.testing.assert_close(isolated.result, native.result, rtol=0, atol=0)
+    assert isolated.noise_args == pytest.approx(native.noise_args)
+    assert isolated.tau_args == pytest.approx(native.tau_args)
+
+
+
+def test_active_pece_continuum_predicted_forecast_uses_corrected_endpoint_hold():
+    pytest.importorskip("scipy")
+    run = _run_isolated(
+        ["actual", "actual", "actual", "forecast", "actual", "actual", "actual"],
+        use_pece=True,
+        tau_func="zero",
+        s_noise=0.0,
+        continuum_active=True,
+        forecast_offset=50.0,
+    )
+
+    # P2's raw feature forecast would be 50.5. Continuum instead holds C1,
+    # the exact persistent PECE endpoint at outer step 1. In this fixture C1's
+    # exact denoiser is 0.25 + 0.5*0.7 = 0.6.
+    torch.testing.assert_close(
+        run.callbacks[2]["denoised"],
+        torch.full((1, 2), 0.6),
+        rtol=0,
+        atol=1e-6,
+    )
+
+
+def test_active_pece_debug_telemetry_exposes_phase_value_and_persistence(caplog):
+    pytest.importorskip("scipy")
+    with caplog.at_level("WARNING"):
+        _run_isolated(
+            ["actual", "actual", "actual", "forecast", "actual", "actual", "actual"],
+            use_pece=True,
+            tau_func="zero",
+            s_noise=0.0,
+            forecast_offset=25.0,
+            debug=True,
+        )
+
+    text = caplog.text
+    assert "logical_step=3 sa_outer=2 sa_phase=predicted" in text
+    assert "actual_model_evaluation=0 forecast=1" in text
+    assert "reason=predicted_forecast_ephemeral" in text
+    assert "adams_persistent=0 solver_value_source=lambda_bounded_extrapolation" in text
+    assert "scope=pece_all_forecasts mode=lambda_bounded_extrapolation" in text
+    assert "raw_feature_forecast=ignored" in text
+    assert "history_lane=persistent_endpoint_actual_only" in text
+    assert "logical_step=4 sa_outer=2 sa_phase=corrected" in text
+    assert "reason=pece_exact_reanchor adams_persistent=1" in text
+    assert "solver_value_source=actual_h3" in text
+
+def test_active_pece_all_actual_parity_preserves_model_noise_scale():
+    pytest.importorskip("scipy")
+    native = _run_native(use_pece=True, noise_scale=1.75)
+    isolated = _run_isolated(
+        ["actual"] * 7,
+        use_pece=True,
+        noise_scale=1.75,
+    )
+
+    torch.testing.assert_close(isolated.result, native.result, rtol=0, atol=0)
+    assert isolated.noise_args == pytest.approx(native.noise_args)
+    assert isolated.tau_args == pytest.approx(native.tau_args)
+
+
+def test_active_pece_all_actual_parity_without_terminal_zero():
+    pytest.importorskip("scipy")
+    sigmas = (0.9, 0.7, 0.5, 0.3, 0.1)
+    native = _run_native(use_pece=True, sigmas=sigmas)
+    isolated = _run_isolated(
+        ["actual"] * 7,
+        use_pece=True,
+        sigmas=sigmas,
+    )
+
+    torch.testing.assert_close(isolated.result, native.result, rtol=0, atol=0)
+    assert isolated.noise_args == pytest.approx(native.noise_args)
+    assert isolated.tau_args == pytest.approx(native.tau_args)
+
+
+
+def test_active_pece_predicted_forecast_is_current_corrector_only(monkeypatch):
+    """The solver-owned predicted estimate may enter C and cannot persist past C."""
+    pytest.importorskip("scipy")
+    import comfy.k_diffusion.sa_solver as native_sa_solver
+
+    original_coefficients = native_sa_solver.compute_stochastic_adams_b_coeffs
+    original_tensordot = torch.tensordot
+    pending_kind = None
+    integrations = []
+    bridge_sentinel = 37.5
+
+    def fake_dense_output(
+        actual_preds,
+        actual_lambdas,
+        actual_steps,
+        *,
+        target_lambda,
+        target_step,
+        continuum_active=False,
+        allow_consecutive_extrapolation=False,
+    ):
+        assert actual_preds
+        assert allow_consecutive_extrapolation
+        return (
+            torch.full_like(actual_preds[-1], bridge_sentinel),
+            "test_endpoint_bridge",
+            (actual_steps[-1],),
+            target_lambda.new_zeros(()),
+        )
+
+    def capture_coefficients(*args, **kwargs):
+        nonlocal pending_kind
+        pending_kind = "corrector" if kwargs.get("is_corrector_step") else "predictor"
+        return original_coefficients(*args, **kwargs)
+
+    def capture_tensordot(input_tensor, other, *args, **kwargs):
+        nonlocal pending_kind
+        integrations.append((pending_kind, input_tensor.detach().clone()))
+        pending_kind = None
+        return original_tensordot(input_tensor, other, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sampling_module,
+        "_sa_predict_causal_denoised",
+        fake_dense_output,
+    )
+    monkeypatch.setattr(
+        native_sa_solver,
+        "compute_stochastic_adams_b_coeffs",
+        capture_coefficients,
+    )
+    monkeypatch.setattr(torch, "tensordot", capture_tensordot)
+
+    # P2 is the only forecast. Its raw hidden forecast would produce 50.5, but
+    # active PECE must ignore that solver value and use the endpoint bridge.
+    _run_isolated(
+        ["actual", "actual", "actual", "forecast", "actual", "actual", "actual"],
+        use_pece=True,
+        tau_func="zero",
+        s_noise=0.0,
+        forecast_offset=50.0,
+    )
+
+    bridge_integrations = [
+        (kind, matrix)
+        for kind, matrix in integrations
+        if bool(torch.isclose(matrix, torch.tensor(bridge_sentinel)).any().item())
+    ]
+    assert len(bridge_integrations) == 1
+    assert bridge_integrations[0][0] == "corrector"
+
+    raw_feature_sentinel = 50.5
+    assert not any(
+        bool(torch.isclose(matrix, torch.tensor(raw_feature_sentinel)).any().item())
+        for _, matrix in integrations
+    )
+
+
+def test_active_pece_supports_forecasted_predicted_phase_every_outer_step_after_p0():
+    pytest.importorskip("scipy")
+    run = _run_isolated(
+        ["actual", "forecast", "actual", "forecast", "actual", "forecast", "actual"],
+        use_pece=True,
+        tau_func="zero",
+        s_noise=0.0,
+        forecast_offset=100.0,
+    )
+
+    assert len(run.model_events) == 7
+    assert len(run.callbacks) == 4
+    # Raw feature forecasts are ~100.x in this fixture. Solver-visible callback
+    # denoisers must come only from exact persistent PECE endpoint anchors.
+    for callback in run.callbacks[1:]:
+        assert float(callback["denoised"].abs().max()) < 10.0
+
+
+
+def test_active_pece_hard_transition_restarts_dense_endpoint_interpolation():
+    pytest.importorskip("scipy")
+    run = _run_isolated(
+        ["actual", "forecast", "actual", "actual", "actual", "forecast", "actual"],
+        use_pece=True,
+        tau_func="zero",
+        s_noise=0.0,
+        forecast_offset=100.0,
+        reasons=[
+            None,
+            None,
+            None,
+            "external patch hard sigma transition",
+            None,
+            None,
+            None,
+        ],
+    )
+
+    # P2 is exact because it crosses the hard transformer boundary. Once C2
+    # becomes the exact endpoint, the dense secant history is restarted there.
+    # P3 must therefore hold C2 rather than extrapolate across pre-transition C1.
+    torch.testing.assert_close(
+        run.callbacks[3]["denoised"],
+        torch.full((1, 2), 0.5),
+        rtol=0,
+        atol=1e-6,
+    )
+
+
+def test_active_pece_rejects_a_forecasted_corrected_phase():
+    pytest.importorskip("scipy")
+    with pytest.raises(RuntimeError, match="exact reanchor policy"):
+        _run_isolated(
+            ["actual", "actual", "forecast"],
+            sigmas=(0.9, 0.7, 0.0),
+            use_pece=True,
+            tau_func="zero",
+            s_noise=0.0,
+        )
+
+
+def test_active_pece_rejects_forecasting_both_phases():
+    pytest.importorskip("scipy")
+    with pytest.raises(RuntimeError, match="exact reanchor policy"):
+        _run_isolated(
+            ["actual", "actual", "actual", "forecast", "forecast"],
+            sigmas=(0.9, 0.7, 0.5, 0.0),
+            use_pece=True,
+            tau_func="zero",
+            s_noise=0.0,
+        )
+
+
+def test_active_pece_forecast_preserves_native_tau_and_noise_call_order():
+    pytest.importorskip("scipy")
+    native = _run_native(use_pece=True)
+    accelerated = _run_isolated(
+        ["actual", "actual", "actual", "forecast", "actual", "actual", "actual"],
+        use_pece=True,
+        forecast_offset=25.0,
+    )
+
+    assert accelerated.tau_args == pytest.approx(native.tau_args)
+    assert accelerated.noise_args == pytest.approx(native.noise_args)
+    assert len(accelerated.noise_draws) == len(native.noise_draws)
+    for candidate, expected in zip(
+        accelerated.noise_draws,
+        native.noise_draws,
+        strict=True,
+    ):
+        torch.testing.assert_close(candidate, expected, rtol=0, atol=0)
+    torch.testing.assert_close(accelerated.rng_state, native.rng_state, rtol=0, atol=0)
 
 
 def test_isolated_sa_adapter_uses_forecast_in_current_corrector_but_not_next_history(monkeypatch):
@@ -456,7 +846,10 @@ def test_isolated_sa_adapter_uses_forecast_in_current_corrector_but_not_next_his
         "compute_stochastic_adams_b_coeffs",
         capture,
     )
-    sigmas = torch.tensor([0.9, 0.7, 0.5, 0.3, 0.0], dtype=torch.float32)
+    # Keep the following exact endpoint non-terminal so native PEC executes
+    # its current corrector there; a terminal zero intentionally suppresses the
+    # PEC corrector.
+    sigmas = torch.tensor([0.9, 0.7, 0.5, 0.3, 0.1], dtype=torch.float32)
     lambdas = native_sampling.sigma_to_half_log_snr(
         sigmas,
         model_sampling=_ModelSampling(),
@@ -695,6 +1088,30 @@ def test_sa_model_call_accounting_tracks_pec_and_pece(
     assert _sa_solver_expected_model_calls(sampler, torch.tensor(sigmas)) == expected
 
 
+def test_active_pece_call_topology_has_explicit_same_coordinate_phase_identity():
+    sampler = _sampler(
+        "sample_sa_solver_pece",
+        {"corrector_order": 4},
+    )
+    topology = _sa_solver_call_topology(
+        sampler,
+        torch.tensor([0.9, 0.7, 0.5, 0.0]),
+    )
+
+    assert topology is not None
+    assert [
+        (entry.outer_step, entry.stage_index, entry.phase)
+        for entry in topology
+    ] == [
+        (0, 0, "predicted"),
+        (1, 0, "predicted"),
+        (1, 1, "corrected"),
+        (2, 0, "predicted"),
+        (2, 1, "corrected"),
+    ]
+    assert _sa_solver_is_active_pece(sampler)
+
+
 def test_sa_continuum_prefix_is_outer_step_identity_for_reviewed_pec():
     sampler = _sampler("sample_sa_solver")
 
@@ -711,8 +1128,6 @@ def test_sa_continuum_prefix_is_outer_step_identity_for_reviewed_pec():
 @pytest.mark.parametrize(
     ("function_name", "options", "message"),
     (
-        ("sample_sa_solver", {"use_pece": True}, "duplicate-sigma"),
-        ("sample_sa_solver_pece", {}, "duplicate-sigma"),
         ("sample_sa_solver", {"predictor_order": True}, "predictor_order"),
         ("sample_sa_solver", {"corrector_order": -1}, "corrector_order"),
         ("sample_sa_solver", {"s_noise": float("nan")}, "s_noise"),
@@ -727,7 +1142,7 @@ def test_sa_unsupported_options_fail_closed(function_name, options, message):
     assert message in reason
 
 
-def test_native_sa_sampler_contract_accepts_pec_and_inert_pece_options():
+def test_native_sa_sampler_contract_accepts_pec_and_pece_options():
     if not os.environ.get("COMFYUI_PATH"):
         pytest.skip("COMFYUI_PATH is required for native SA sampler provenance")
     pytest.importorskip("torchsde")
@@ -753,9 +1168,14 @@ def test_native_sa_sampler_contract_accepts_pec_and_inert_pece_options():
         "sa_solver_pece",
         {"tau_func": tau_func, "corrector_order": 0},
     )
+    active_pece = comfy.samplers.ksampler(
+        "sa_solver_pece",
+        {"tau_func": tau_func, "corrector_order": 4},
+    )
 
     assert _sa_solver_sampler_contract(pec) == (True, None)
     assert _sa_solver_sampler_contract(inert_pece) == (True, None)
+    assert _sa_solver_sampler_contract(active_pece) == (True, None)
 
 
 @pytest.mark.parametrize(
@@ -765,7 +1185,7 @@ def test_native_sa_sampler_contract_accepts_pec_and_inert_pece_options():
         ("sa_solver_pece", {"corrector_order": 4}),
     ),
 )
-def test_native_sa_sampler_contract_rejects_active_pece(sampler_name, options):
+def test_native_sa_sampler_contract_accepts_active_pece(sampler_name, options):
     if not os.environ.get("COMFYUI_PATH"):
         pytest.skip("COMFYUI_PATH is required for native SA sampler provenance")
     pytest.importorskip("torchsde")
@@ -778,9 +1198,123 @@ def test_native_sa_sampler_contract_rejects_active_pece(sampler_name, options):
         comfy.samplers.ksampler(sampler_name, options)
     )
 
-    assert not accepted
-    assert reason is not None
-    assert "duplicate-sigma" in reason
+    assert accepted
+    assert reason is None
+
+
+def test_generic_sa_pece_option_is_consumed_before_adapter_forwarding(monkeypatch):
+    calls = []
+
+    class FakeSampler:
+        def __init__(self):
+            def sample_sa_solver():
+                return None
+
+            sample_sa_solver.__name__ = "sample_sa_solver"
+            self.sampler_function = sample_sa_solver
+            self.extra_options = {
+                "use_pece": True,
+                "corrector_order": 4,
+                "predictor_order": 3,
+                "simple_order_2": False,
+                "s_noise": 0.0,
+            }
+            self.inpaint_options = {}
+
+        def sample(
+            self,
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        ):
+            return self.sampler_function(
+                model_wrap,
+                noise,
+                sigmas,
+                extra_args=extra_args,
+                callback=callback,
+                disable=disable_pbar,
+                **self.extra_options,
+            )
+
+    sampler = FakeSampler()
+
+    class Executor:
+        class_obj = sampler
+        wrappers = (object(),)
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("native fallback must not be used")
+
+    def isolated(
+        runtime,
+        model,
+        x,
+        sigmas,
+        *,
+        use_pece,
+        corrector_order,
+        predictor_order,
+        simple_order_2,
+        s_noise,
+        **kwargs,
+    ):
+        calls.append(
+            {
+                "use_pece": use_pece,
+                "corrector_order": corrector_order,
+                "predictor_order": predictor_order,
+                "simple_order_2": simple_order_2,
+                "s_noise": s_noise,
+                "kwargs": kwargs,
+            }
+        )
+        return x
+
+    monkeypatch.setattr(
+        sampling_module,
+        "_sample_sa_solver_forecast_isolated",
+        isolated,
+    )
+
+    runtime = SimpleNamespace(
+        disable_forecasting_for_run=lambda _reason: None,
+        config=SimpleNamespace(debug=False),
+    )
+    result = _run_solver_aware_sa(
+        Executor(),
+        runtime,
+        object(),
+        torch.tensor([1.0, 0.0]),
+        {},
+        None,
+        torch.ones(1),
+        None,
+        None,
+        True,
+    )
+
+    torch.testing.assert_close(result, torch.ones(1))
+    assert calls == [
+        {
+            "use_pece": True,
+            "corrector_order": 4,
+            "predictor_order": 3,
+            "simple_order_2": False,
+            "s_noise": 0.0,
+            "kwargs": {
+                "extra_args": {},
+                "callback": None,
+                "disable": True,
+                "continuum_active": False,
+            },
+        }
+    ]
 
 
 def test_sa_solver_replay_is_intentionally_causal_only():
@@ -904,7 +1438,8 @@ def test_sa_offline_request_runs_one_causal_spectrum_pass(monkeypatch, caplog):
     assert "running one causal Spectrum pass" in caplog.text
 
 
-def test_active_pece_falls_back_before_runtime_state(monkeypatch, caplog):
+
+def test_active_pece_outer_wrapper_enters_phase_aware_runtime(monkeypatch):
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(model_aware_mode="off", offline_smoothing_replay=False)
     )
@@ -913,43 +1448,71 @@ def test_active_pece_falls_back_before_runtime_state(monkeypatch, caplog):
             BINDING_KEY: SpectrumH3Binding(runtime),
             "transformer_options": {},
         },
-        model_patcher=object(),
+        model_patcher=_Patcher(),
     )
     sampler = _sampler(
         "sample_sa_solver",
-        {"use_pece": True, "corrector_order": 4},
+        {"use_pece": True, "corrector_order": 4, "s_noise": 0.0},
     )
     calls = []
 
     monkeypatch.setattr(
         sampling_module,
         "_native_sa_solver_preflight_reason",
-        lambda _sampler, _model_options: (
-            "SA-Solver PECE with an active corrector has duplicate-sigma "
-            "predicted/corrected states and is not reviewed for Spectrum forecasting"
-        ),
+        lambda _sampler, _model_options: None,
     )
 
     class Executor:
         class_obj = guider
 
         def __call__(self, *args, **kwargs):
-            calls.append((runtime.active_run_id, args, kwargs))
-            return "native-pece"
+            run = runtime._run
+            assert run is not None
+            calls.append(
+                {
+                    "run_id": runtime.active_run_id,
+                    "total_steps": runtime.stats.total_steps,
+                    "stage_count": run.stage_count,
+                    "separate_stage_histories": run.separate_stage_histories,
+                    "forecastable": run.forecastable_stage_indices,
+                    "history_stages": run.history_stage_indices,
+                    "history_steps": run.history_step_ids,
+                    "tail_stages": run.tail_actual_stage_indices,
+                    "bootstrap": run.allow_state_conditioned_bootstrap,
+                    "topology": run.logical_call_topology,
+                    "model_aware_force_actual": run.model_aware_can_force_actual,
+                }
+            )
+            return "phase-aware-pece"
 
-    with caplog.at_level("WARNING"):
-        result = outer_sample_wrapper(
-            Executor(),
-            torch.ones(1),
-            torch.zeros(1),
-            sampler,
-            torch.tensor([1.0, 0.7, 0.4, 0.0]),
-            seed=17,
-        )
+    result = outer_sample_wrapper(
+        Executor(),
+        torch.ones(1),
+        torch.zeros(1),
+        sampler,
+        torch.tensor([1.0, 0.7, 0.4, 0.0]),
+        seed=17,
+    )
 
-    assert result == "native-pece"
+    assert result == "phase-aware-pece"
     assert len(calls) == 1
-    assert calls[0][0] is None
+    call = calls[0]
+    assert call["run_id"] == 1
+    assert call["total_steps"] == 5
+    assert call["stage_count"] == 2
+    assert call["separate_stage_histories"] is False
+    assert call["forecastable"] == (0,)
+    assert call["history_stages"] == frozenset({0, 1})
+    assert call["history_steps"] == frozenset({0, 2, 4})
+    assert call["tail_stages"] == frozenset({1})
+    assert call["bootstrap"] is True
+    assert [entry.phase for entry in call["topology"]] == [
+        "predicted",
+        "predicted",
+        "corrected",
+        "predicted",
+        "corrected",
+    ]
+    assert call["model_aware_force_actual"] is False
     assert runtime.active_run_id is None
-    assert "running the untouched native sampler" in caplog.text
-    assert "duplicate-sigma" in caplog.text
+

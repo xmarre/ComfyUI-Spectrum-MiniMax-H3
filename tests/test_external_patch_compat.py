@@ -441,6 +441,24 @@ def test_already_actual_transition_does_not_duplicate_model_evaluation():
     assert run.forced_actuals == 0
 
 
+def test_pece_same_sigma_corrected_phase_cannot_bypass_hard_transition():
+    fake = _FakeRuntime(parsed(contract(sigma_start=0.55, sigma_end=1.0)))
+    _observe(fake, 0, 0.70, "actual")
+    _commit(fake)
+
+    # The predicted phase crosses the hard boundary and is promoted to exact.
+    assert _observe(fake, 1, 0.50, "forecast") == "actual"
+    _commit(fake)
+
+    # Native PECE's corrected phase is a distinct evaluation at the same sigma.
+    # It is already exact by policy, and the equal coordinate cannot create or
+    # evade a second transition.
+    assert _observe(fake, 2, 0.50, "actual") == "actual"
+    run = compat._compat_state(fake).run
+    assert run.transitions == 1
+    assert run.forced_actuals == 1
+
+
 def test_two_contracts_crossing_same_step_force_only_one_actual():
     contracts = parsed(
         contract(instance_id="diffaid-h3-1", sigma_start=0.55, sigma_end=1.0),

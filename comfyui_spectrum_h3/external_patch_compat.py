@@ -829,9 +829,13 @@ def _log_effective_step(runtime: Any, decision: dict[str, Any]) -> None:
     if not runtime.config.debug:
         return
     sampling.LOG.warning(
-        "Spectrum H3 step run_id=%s step=%s coordinate=%.6f decision=%s reason=%s history=%s window=%.3f",
+        "Spectrum H3 step run_id=%s step=%s outer_step=%s stage=%s phase=%s "
+        "coordinate=%.6f decision=%s reason=%s history=%s window=%.3f",
         decision["run_id"],
         decision["step_id"],
+        decision["policy_step_id"],
+        decision["stage_index"],
+        decision["phase"],
         decision["coordinate"],
         "actual" if decision["actual"] else "forecast",
         decision["reason"],

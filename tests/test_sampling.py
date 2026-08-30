@@ -130,7 +130,9 @@ def test_sa_policy_separates_stochastic_tail_burst_from_deterministic_refresh(fu
 
     sampler.extra_options = {"s_noise": 0.0}
     assert max_consecutive_forecasts(sampler) == 1
-    assert min_actual_steps_after_forecast(sampler) == 4
+    assert min_actual_steps_after_forecast(sampler) == (
+        0 if function_name == "sample_sa_solver_pece" else 4
+    )
 
     sampler.extra_options = {
         "s_noise": 0.0,
@@ -138,6 +140,14 @@ def test_sa_policy_separates_stochastic_tail_burst_from_deterministic_refresh(fu
         "corrector_order": 0,
     }
     assert min_actual_steps_after_forecast(sampler) == 2
+
+    if function_name == "sample_sa_solver":
+        sampler.extra_options = {
+            "s_noise": 0.0,
+            "use_pece": True,
+            "corrector_order": 4,
+        }
+        assert min_actual_steps_after_forecast(sampler) == 0
 
 
 def test_unsupported_sampler_has_no_forecast_streak_policy():
