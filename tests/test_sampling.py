@@ -49,8 +49,11 @@ def _sampler(function_name: str) -> SimpleNamespace:
         "sample_res_multistep_cfg_pp",
         "sample_seeds_2",
         "sample_seeds_3",
+        "sample_refdelta_seeds_2",
+        "sample_refdelta_seeds_3",
         "sample_sa_solver",
         "sample_sa_solver_pece",
+        "sample_refdelta_sa_solver",
     ),
 )
 def test_reviewed_samplers_are_supported(function_name):
@@ -87,6 +90,8 @@ def test_unreviewed_sampler_names_do_not_match_by_prefix(function_name):
         "sample_res_multistep_cfg_pp",
         "sample_seeds_2",
         "sample_seeds_3",
+        "sample_refdelta_seeds_2",
+        "sample_refdelta_seeds_3",
     ),
 )
 def test_supported_h3_samplers_limit_forecast_streaks(function_name):
@@ -110,6 +115,8 @@ def test_res_multistep_policy_refreshes_once_and_protects_tail(function_name):
         "_turbo_sampler",
         "sample_seeds_2",
         "sample_seeds_3",
+        "sample_refdelta_seeds_2",
+        "sample_refdelta_seeds_3",
     ),
 )
 def test_non_res_policy_keeps_one_refresh_and_user_tail(function_name):
@@ -119,7 +126,10 @@ def test_non_res_policy_keeps_one_refresh_and_user_tail(function_name):
     assert min_tail_actual_steps(sampler) == 0
 
 
-@pytest.mark.parametrize("function_name", ("sample_sa_solver", "sample_sa_solver_pece"))
+@pytest.mark.parametrize(
+    "function_name",
+    ("sample_sa_solver", "sample_sa_solver_pece", "sample_refdelta_sa_solver"),
+)
 def test_sa_policy_separates_stochastic_tail_burst_from_deterministic_refresh(function_name):
     sampler = _sampler(function_name)
     sampler.extra_options = {}
@@ -150,6 +160,27 @@ def test_sa_policy_separates_stochastic_tail_burst_from_deterministic_refresh(fu
         assert min_actual_steps_after_forecast(sampler) == 0
 
 
+def test_refdelta_sa_backend_remains_pec_only_on_active_pece_capable_spectrum():
+    sampler = _sampler("sample_refdelta_sa_solver")
+    sampler.extra_options = {"corrector_order": 4}
+
+    assert not sampling_module._sa_solver_is_active_pece(sampler)
+    assert sampling_module._sa_solver_expected_model_calls(
+        sampler,
+        torch.tensor([0.9, 0.7, 0.5, 0.0]),
+    ) == 3
+    topology = sampling_module._sa_solver_call_topology(
+        sampler,
+        torch.tensor([0.9, 0.7, 0.5, 0.0]),
+    )
+    assert topology is not None
+    assert [(entry.outer_step, entry.stage_index, entry.phase) for entry in topology] == [
+        (0, 0, "predicted"),
+        (1, 0, "predicted"),
+        (2, 0, "predicted"),
+    ]
+
+
 def test_unsupported_sampler_has_no_forecast_streak_policy():
     sampler = _sampler("sample_euler_ancestral")
 
@@ -168,6 +199,10 @@ def test_unsupported_sampler_has_no_forecast_streak_policy():
         ("sample_seeds_3", [1.0, 0.6, 0.2, 0.0], 7),
         ("sample_seeds_2", [1.0, 0.6, 0.2], 4),
         ("sample_seeds_3", [1.0, 0.6, 0.2], 6),
+        ("sample_refdelta_seeds_2", [1.0, 0.6, 0.2, 0.0], 5),
+        ("sample_refdelta_seeds_3", [1.0, 0.6, 0.2, 0.0], 7),
+        ("sample_refdelta_seeds_2", [1.0, 0.6, 0.2], 4),
+        ("sample_refdelta_seeds_3", [1.0, 0.6, 0.2], 6),
     ),
 )
 def test_seeds_expected_model_calls_tracks_internal_stages(
@@ -281,6 +316,22 @@ def test_seeds_replay_safety_requires_deterministic_native_configuration(
     assert sampler_supports_seeded_replay(sampler) is replay_safe
 
 
+@pytest.mark.parametrize(
+    ("function_name", "options"),
+    (
+        ("sample_refdelta_seeds_2", {}),
+        ("sample_refdelta_seeds_3", {}),
+        ("sample_refdelta_seeds_2", {"eta": 0.0}),
+        ("sample_refdelta_seeds_3", {"s_noise": 0.0}),
+    ),
+)
+def test_refdelta_seeds_replay_is_intentionally_causal_only(function_name, options):
+    sampler = _sampler(function_name)
+    sampler.extra_options = options
+
+    assert not sampler_supports_seeded_replay(sampler)
+
+
 def test_seeds_2_endpoint_stage_is_rejected_for_spectrum_tracking():
     reason = _seeds_option_contract("sample_seeds_2", {"r": 1.0})
 
@@ -376,6 +427,141 @@ def test_stochastic_seeds_outer_wrapper_enters_state_residual_spectrum(monkeypat
     assert "running the untouched native sampler" not in caplog.text
     assert "feature_geometry=state_conditioned_residual_shared_history" in caplog.text
     assert "stage_histories=shared" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    (
+        "sample_refdelta_er_sde",
+        "sample_refdelta_seeds_2",
+        "sample_refdelta_seeds_3",
+        "sample_refdelta_sa_solver",
+    ),
+)
+def test_refdelta_sampler_multigpu_bypasses_before_runtime_start(
+    monkeypatch,
+    caplog,
+    function_name,
+):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            model_aware_mode="off",
+            offline_smoothing_replay=False,
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={
+            BINDING_KEY: SpectrumH3Binding(runtime),
+            "transformer_options": {},
+            "multigpu_clones": [object()],
+        },
+        model_patcher=object(),
+    )
+    sampler = _sampler(function_name)
+    sampler.extra_options = {}
+    active_runs = []
+
+    def unexpected_preflight(*_args, **_kwargs):
+        raise AssertionError("multi-GPU RefDelta bypass must precede solver preflight")
+
+    monkeypatch.setattr(
+        sampling_module,
+        "_native_er_sde_preflight_reason",
+        unexpected_preflight,
+    )
+    monkeypatch.setattr(
+        sampling_module,
+        "_native_seeds_preflight_reason",
+        unexpected_preflight,
+    )
+    monkeypatch.setattr(
+        sampling_module,
+        "_native_sa_solver_preflight_reason",
+        unexpected_preflight,
+    )
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            active_runs.append(runtime.active_run_id)
+            return "native-refdelta-multigpu"
+
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            sampler,
+            torch.tensor([1.0, 0.5, 0.0]),
+            seed=17,
+        )
+
+    assert result == "native-refdelta-multigpu"
+    assert active_runs == [None]
+    assert runtime.active_run_id is None
+    assert "multi-GPU parallel model calls bypass transactional step finalization" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    (
+        "sample_refdelta_er_sde",
+        "sample_refdelta_seeds_2",
+        "sample_refdelta_seeds_3",
+        "sample_refdelta_sa_solver",
+    ),
+)
+def test_refdelta_sampler_wrapper_does_not_inject_bridge_for_multigpu(
+    function_name,
+):
+    runtime = SpectrumH3Runtime(SpectrumH3Config(model_aware_mode="off"))
+    runtime.start_run(
+        torch.tensor([1.0, 0.0]),
+        function_name,
+        supported_sampler=True,
+    )
+    sampler = _sampler(function_name)
+    seen = {}
+
+    class Executor:
+        class_obj = sampler
+
+        def __call__(
+            self,
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        ):
+            seen["extra_args"] = extra_args
+            return "native-inner-refdelta"
+
+    extra_args = {
+        "model_options": {
+            "multigpu_clones": [object()],
+            "transformer_options": {},
+        }
+    }
+    try:
+        result = sampling_module.sampler_sample_wrapper(
+            Executor(),
+            object(),
+            torch.tensor([1.0, 0.0]),
+            extra_args,
+            None,
+            torch.ones(1),
+        )
+    finally:
+        runtime.end_run(runtime.active_run_id)
+
+    assert result == "native-inner-refdelta"
+    transformer_options = seen["extra_args"]["model_options"]["transformer_options"]
+    assert sampling_module.REFDELTA_BRIDGE_KEY not in transformer_options
 
 
 def test_stochastic_seeds_offline_request_runs_one_causal_spectrum_pass(monkeypatch, caplog):

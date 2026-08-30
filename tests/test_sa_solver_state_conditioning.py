@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import ast
-import copy
 import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -41,48 +38,16 @@ def _sampler(function_name: str, options: dict | None = None):
 
 
 def _native_sa_functions():
-    comfyui_path = os.environ.get("COMFYUI_PATH")
-    if not comfyui_path:
-        pytest.skip("COMFYUI_PATH is required for synthetic native SA-Solver tests")
-    source_path = Path(comfyui_path) / "comfy/k_diffusion/sampling.py"
-    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    functions = []
-    for name in ("sample_sa_solver", "sample_sa_solver_pece"):
-        function = copy.deepcopy(
-            next(
-                node
-                for node in tree.body
-                if isinstance(node, ast.FunctionDef) and node.name == name
-            )
-        )
-        function.decorator_list = []
-        functions.append(function)
-
-    import comfy.k_diffusion.sa_solver as native_sa_solver
-
-    namespace = {
-        "torch": torch,
-        "trange": lambda count, disable=None: range(count),
-        "default_noise_sampler": lambda x, seed=None: (
-            lambda _sigma, _sigma_next: torch.randn(
-                x.shape,
-                generator=torch.Generator(device=x.device).manual_seed(seed or 0),
-                device=x.device,
-                dtype=x.dtype,
-            )
-        ),
-        "offset_first_sigma_for_snr": lambda sigmas, _sampling: sigmas,
-        "sigma_to_half_log_snr": lambda sigma, model_sampling: -torch.log(sigma),
-        "sa_solver": SimpleNamespace(
-            compute_stochastic_adams_b_coeffs=(
-                native_sa_solver.compute_stochastic_adams_b_coeffs
-            ),
-            get_tau_interval_func=native_sa_solver.get_tau_interval_func,
-        ),
+    if not os.environ.get("COMFYUI_PATH"):
+        pytest.skip("COMFYUI_PATH is required for native SA-Solver tests")
+    try:
+        import comfy.k_diffusion.sampling as native_sampling
+    except ImportError as exc:
+        pytest.skip(f"optional ComfyUI runtime dependency is unavailable: {exc}")
+    return {
+        name: getattr(native_sampling, name)
+        for name in ("sample_sa_solver", "sample_sa_solver_pece")
     }
-    module = ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[]))
-    exec(compile(module, "<native SA-Solver>", "exec"), namespace)  # noqa: S102
-    return namespace
 
 
 class _ModelSampling:

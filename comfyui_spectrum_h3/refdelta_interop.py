@@ -20,6 +20,12 @@ REFDELTA_INTEROP_CONTRACT = (
     "actual-anchor-history",
     "exact-gated-stochastic-increment",
 )
+REFDELTA_BACKEND_INTEROP_CONTRACT = (
+    "comfyui-refdelta-spectrum-backend",
+    1,
+    "actual-anchor-history",
+    "native-solver-noise-geometry",
+)
 _REFDELTA_CANONICAL_PACKAGE = "comfyui_refdelta_solver"
 _REFDELTA_ALIAS_METADATA = frozenset(
     {
@@ -100,6 +106,36 @@ def _install_refdelta_namespace_alias_finder() -> None:
 
 
 _install_refdelta_namespace_alias_finder()
+
+
+@dataclass(slots=True)
+class RefDeltaBackendInteropBridge:
+    """Classify RefDelta SEEDS/SA model calls from the completed Spectrum step."""
+
+    runtime: object
+    api_version: ClassVar[int] = 1
+    interop_contract: ClassVar[tuple[str, int, str, str]] = (
+        REFDELTA_BACKEND_INTEROP_CONTRACT
+    )
+
+    def model_result_is_actual(self, step_id: int) -> bool:
+        observed_step = getattr(self.runtime, "last_completed_step_id", None)
+        if observed_step != int(step_id):
+            raise RefDeltaInteropError(
+                "RefDelta backend requested a classification for the wrong Spectrum "
+                f"step (requested={int(step_id)}, observed={observed_step})"
+            )
+        mode = getattr(self.runtime, "last_completed_mode", None)
+        if mode == "actual":
+            return True
+        if mode == "forecast":
+            return False
+        raise RefDeltaInteropError(
+            f"unreviewed Spectrum RefDelta backend step mode {mode!r}"
+        )
+
+    def clear(self) -> None:
+        return None
 
 
 @dataclass(slots=True)
@@ -199,8 +235,10 @@ class RefDeltaInteropBridge:
 
 
 __all__ = [
+    "REFDELTA_BACKEND_INTEROP_CONTRACT",
     "REFDELTA_BRIDGE_KEY",
     "REFDELTA_INTEROP_CONTRACT",
+    "RefDeltaBackendInteropBridge",
     "RefDeltaInteropBridge",
     "RefDeltaInteropError",
 ]

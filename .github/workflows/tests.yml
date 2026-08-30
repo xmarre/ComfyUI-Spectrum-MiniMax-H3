@@ -52,7 +52,7 @@ jobs:
         with:
           persist-credentials: false
           repository: xmarre/ComfyUI-MiniMax-H3-RefDelta-Solver
-          ref: 359c4fed506ca124171a315297273011aee77159
+          ref: 2d980cc42a8fa8f9c476c96200b6dab377ec526a
           path: RefDeltaSolver
 
       - name: Set up Python

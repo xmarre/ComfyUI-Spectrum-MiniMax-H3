@@ -23,8 +23,10 @@ from .er_sde_stochastic import (
 )
 from .model_aware import get_model_forecastability_profile
 from .refdelta_interop import (
+    REFDELTA_BACKEND_INTEROP_CONTRACT,
     REFDELTA_BRIDGE_KEY,
     REFDELTA_INTEROP_CONTRACT,
+    RefDeltaBackendInteropBridge,
     RefDeltaInteropBridge,
     RefDeltaInteropError,
 )
@@ -63,10 +65,26 @@ SUPPORTED_SINGLE_CALL_SAMPLERS = frozenset(
     }
 )
 
-SEEDS_SAMPLERS = frozenset({"sample_seeds_2", "sample_seeds_3"})
-SA_SOLVER_SAMPLERS = frozenset({"sample_sa_solver", "sample_sa_solver_pece"})
+NATIVE_SEEDS_SAMPLERS = frozenset({"sample_seeds_2", "sample_seeds_3"})
+REFDELTA_SEEDS_SAMPLERS = frozenset(
+    {"sample_refdelta_seeds_2", "sample_refdelta_seeds_3"}
+)
+SEEDS_SAMPLERS = NATIVE_SEEDS_SAMPLERS | REFDELTA_SEEDS_SAMPLERS
+NATIVE_SA_SOLVER_SAMPLERS = frozenset({"sample_sa_solver", "sample_sa_solver_pece"})
+REFDELTA_SA_SOLVER_SAMPLERS = frozenset({"sample_refdelta_sa_solver"})
+SA_SOLVER_SAMPLERS = NATIVE_SA_SOLVER_SAMPLERS | REFDELTA_SA_SOLVER_SAMPLERS
+REFDELTA_BACKEND_SAMPLERS = REFDELTA_SEEDS_SAMPLERS | REFDELTA_SA_SOLVER_SAMPLERS
 SUPPORTED_SAMPLERS = SUPPORTED_SINGLE_CALL_SAMPLERS | SEEDS_SAMPLERS | SA_SOLVER_SAMPLERS
-SEEDS_STAGE_COUNTS = {"sample_seeds_2": 2, "sample_seeds_3": 3}
+SEEDS_STAGE_COUNTS = {
+    "sample_seeds_2": 2,
+    "sample_seeds_3": 3,
+    "sample_refdelta_seeds_2": 2,
+    "sample_refdelta_seeds_3": 3,
+}
+REFDELTA_SEEDS_BASE_NAMES = {
+    "sample_refdelta_seeds_2": "sample_seeds_2",
+    "sample_refdelta_seeds_3": "sample_seeds_3",
+}
 SEEDS_NATIVE_FUNCTION_DIGESTS = {
     "sample_seeds_2": "e7bcf519718453f77e7ade9b71678c1b593472c8e9b0af142f64f97a9267f383",
     "sample_seeds_3": "8cb90838a30f6ed0d9ba267f0a16275ce8ec5d65a9a5475f1a10cb573d45ce42",
@@ -74,6 +92,12 @@ SEEDS_NATIVE_FUNCTION_DIGESTS = {
 SEEDS_TRACKED_OPTIONS = {
     "sample_seeds_2": frozenset({"eta", "s_noise", "noise_sampler", "r", "solver_type"}),
     "sample_seeds_3": frozenset({"eta", "s_noise", "noise_sampler", "r_1", "r_2"}),
+    "sample_refdelta_seeds_2": frozenset(
+        {"eta", "s_noise", "noise_sampler", "r", "solver_type", "config"}
+    ),
+    "sample_refdelta_seeds_3": frozenset(
+        {"eta", "s_noise", "noise_sampler", "r_1", "r_2", "config"}
+    ),
 }
 
 
@@ -107,6 +131,17 @@ SA_SOLVER_TRACKED_OPTIONS = {
             "predictor_order",
             "corrector_order",
             "simple_order_2",
+        }
+    ),
+    "sample_refdelta_sa_solver": frozenset(
+        {
+            "tau_func",
+            "s_noise",
+            "noise_sampler",
+            "predictor_order",
+            "corrector_order",
+            "simple_order_2",
+            "config",
         }
     ),
 }
@@ -448,6 +483,65 @@ def _sa_solver_stochastic_protection(
     return (), stochastic_input_steps, None
 
 
+def _refdelta_backend_sampler_contract(
+    name: str,
+    function: Any,
+    options: dict[str, Any],
+) -> tuple[bool, str | None]:
+    """Validate the versioned RefDelta SEEDS/SA interop surface."""
+    try:
+        from comfyui_refdelta_solver.config import RefDeltaSamplerConfig
+        from comfyui_refdelta_solver.sampler_backends import (
+            sample_refdelta_sa_solver,
+            sample_refdelta_seeds_2,
+            sample_refdelta_seeds_3,
+        )
+        from comfyui_refdelta_solver.spectrum_interop import (
+            SPECTRUM_BACKEND_INTEROP_CONTRACT,
+        )
+    except (ImportError, AttributeError) as exc:
+        return False, f"RefDelta backend interop API is unavailable: {exc}"
+
+    expected = {
+        "sample_refdelta_seeds_2": sample_refdelta_seeds_2,
+        "sample_refdelta_seeds_3": sample_refdelta_seeds_3,
+        "sample_refdelta_sa_solver": sample_refdelta_sa_solver,
+    }.get(name)
+    if expected is None or function is not expected:
+        return False, "sampler function is not the installed RefDelta backend implementation"
+    if SPECTRUM_BACKEND_INTEROP_CONTRACT != REFDELTA_BACKEND_INTEROP_CONTRACT:
+        return False, "RefDelta/Spectrum backend interop contract version does not match"
+    if (
+        getattr(function, "__spectrum_interop_contract__", None)
+        != REFDELTA_BACKEND_INTEROP_CONTRACT
+    ):
+        return False, "RefDelta backend did not publish the reviewed interop contract"
+
+    config = options.get("config")
+    if type(config) is not RefDeltaSamplerConfig:
+        return False, "RefDelta backend config has unreviewed provenance"
+    try:
+        config.validate()
+    except (TypeError, ValueError) as exc:
+        return False, f"RefDelta backend config is invalid: {exc}"
+    if config.calibration_capture:
+        return False, "RefDelta calibration capture is ER-SDE-only"
+    return True, None
+
+
+def _with_refdelta_backend_bridge(
+    extra_args: dict[str, Any],
+    runtime: SpectrumH3Runtime,
+) -> dict[str, Any]:
+    copied = dict(extra_args or {})
+    model_options = dict(copied.get("model_options") or {})
+    transformer_options = dict(model_options.get("transformer_options") or {})
+    transformer_options[REFDELTA_BRIDGE_KEY] = RefDeltaBackendInteropBridge(runtime)
+    model_options["transformer_options"] = transformer_options
+    copied["model_options"] = model_options
+    return copied
+
+
 def _sa_solver_option_contract(name: str, options: Any) -> str | None:
     """Validate the native SA option surface without executing user callbacks."""
     if name not in SA_SOLVER_SAMPLERS:
@@ -502,10 +596,16 @@ def _sa_solver_sampler_contract(sampler: Any) -> tuple[bool, str | None]:
         return False, f"{name!r} is not a reviewed SA-Solver sampler"
 
     function = getattr(sampler, "sampler_function", None)
-    if function is not getattr(native_sampling, name, None):
-        return False, f"sampler function is not native ComfyUI {name}"
-    if function_ast_digest(function) != SA_SOLVER_NATIVE_FUNCTION_DIGESTS[name]:
-        return False, f"native {name} implementation is not a reviewed revision"
+    if name in REFDELTA_SA_SOLVER_SAMPLERS:
+        options = getattr(sampler, "extra_options", {}) or {}
+        accepted, reason = _refdelta_backend_sampler_contract(name, function, options)
+        if not accepted:
+            return False, reason
+    else:
+        if function is not getattr(native_sampling, name, None):
+            return False, f"sampler function is not native ComfyUI {name}"
+        if function_ast_digest(function) != SA_SOLVER_NATIVE_FUNCTION_DIGESTS[name]:
+            return False, f"native {name} implementation is not a reviewed revision"
     if (
         function_ast_digest(native_sampling.sample_sa_solver)
         != SA_SOLVER_NATIVE_FUNCTION_DIGESTS["sample_sa_solver"]
@@ -594,7 +694,8 @@ def _seeds_option_contract(name: str, options: Any) -> str | None:
     if noise_sampler is not None and not callable(noise_sampler):
         return "SEEDS noise_sampler must be callable or None"
 
-    if name == "sample_seeds_2":
+    base_name = REFDELTA_SEEDS_BASE_NAMES.get(name, name)
+    if base_name == "sample_seeds_2":
         if options.get("solver_type", "phi_1") not in {"phi_1", "phi_2"}:
             return "SEEDS-2 solver_type must be 'phi_1' or 'phi_2'"
         try:
@@ -646,10 +747,20 @@ def _seeds_sampler_contract(sampler: Any) -> tuple[bool, str | None]:
         return False, f"{name!r} is not a reviewed SEEDS sampler"
 
     function = getattr(sampler, "sampler_function", None)
-    if function is not getattr(native_sampling, name, None):
-        return False, f"sampler function is not native ComfyUI {name}"
-    if function_ast_digest(function) != SEEDS_NATIVE_FUNCTION_DIGESTS[name]:
-        return False, f"native {name} implementation is not a reviewed revision"
+    base_name = REFDELTA_SEEDS_BASE_NAMES.get(name, name)
+    if name in REFDELTA_SEEDS_SAMPLERS:
+        options = getattr(sampler, "extra_options", {}) or {}
+        accepted, reason = _refdelta_backend_sampler_contract(name, function, options)
+        if not accepted:
+            return False, reason
+    else:
+        if function is not getattr(native_sampling, name, None):
+            return False, f"sampler function is not native ComfyUI {name}"
+        if function_ast_digest(function) != SEEDS_NATIVE_FUNCTION_DIGESTS[name]:
+            return False, f"native {name} implementation is not a reviewed revision"
+    native_base = getattr(native_sampling, base_name, None)
+    if function_ast_digest(native_base) != SEEDS_NATIVE_FUNCTION_DIGESTS[base_name]:
+        return False, f"native {base_name} implementation is not a reviewed revision"
 
     if type(sampler) is not comfy.samplers.KSAMPLER:
         return False, "SEEDS sampler object is not native ComfyUI KSAMPLER"
@@ -741,6 +852,11 @@ def sampler_supports_seeded_replay(sampler: Any) -> bool:
     if name in SA_SOLVER_SAMPLERS:
         # SA-Solver is a multistep method: replaying altered denoiser values
         # changes its Adams history even when the RNG itself is reproducible.
+        return False
+    if name in REFDELTA_SEEDS_SAMPLERS:
+        # The backend bridge intentionally classifies only the live causal pass.
+        # Do not create an offline replay mode whose provenance cannot be mapped
+        # back to RefDelta's actual-only evidence contract.
         return False
     if name in SEEDS_SAMPLERS:
         options = getattr(sampler, "extra_options", {}) or {}
@@ -1655,28 +1771,58 @@ def _run_solver_aware_sa(
         disable=False,
         **run_options,
     ):
-        # Native `sample_sa_solver` exposes `use_pece` through KSAMPLER
-        # extra_options. Consume that reviewed option here before forwarding the
-        # remaining solver kwargs; otherwise the adapter would pass use_pece
-        # twice when the generic SA entry point is configured for PECE.
+        # Native sample_sa_solver exposes use_pece through KSAMPLER extra_options.
+        # Consume that reviewed option exactly once before forwarding solver kwargs.
         run_options = dict(run_options)
         forwarded_use_pece = run_options.pop("use_pece", use_pece)
         if type(forwarded_use_pece) is not bool or forwarded_use_pece != use_pece:
             raise RuntimeError(
                 "SA isolated-history adapter observed a changed use_pece option"
             )
-        return _sample_sa_solver_forecast_isolated(
-            runtime,
-            model,
-            x,
-            run_sigmas,
-            extra_args=extra_args,
-            callback=callback,
-            disable=disable,
-            use_pece=use_pece,
-            continuum_active=continuum_active,
-            **run_options,
-        )
+
+        refdelta_state = None
+        if name in REFDELTA_SA_SOLVER_SAMPLERS:
+            if use_pece:
+                raise RuntimeError(
+                    "RefDelta SA backend is PEC-only but reached an active PECE adapter"
+                )
+            config = run_options.pop("config", None)
+            if config is None:
+                raise RuntimeError("RefDelta SA adapter lost its validated config")
+            if not config.is_native_equivalence_mode:
+                from comfyui_refdelta_solver.sampler_backends import (
+                    prepare_refdelta_backend_adapters,
+                )
+
+                refdelta_state, model, adapted_noise = (
+                    prepare_refdelta_backend_adapters(
+                        model,
+                        x,
+                        run_sigmas,
+                        extra_args or {},
+                        config,
+                        "sa_solver",
+                        1,
+                        run_options.get("noise_sampler"),
+                    )
+                )
+                run_options["noise_sampler"] = adapted_noise
+        try:
+            return _sample_sa_solver_forecast_isolated(
+                runtime,
+                model,
+                x,
+                run_sigmas,
+                extra_args=extra_args,
+                callback=callback,
+                disable=disable,
+                use_pece=use_pece,
+                continuum_active=continuum_active,
+                **run_options,
+            )
+        finally:
+            if refdelta_state is not None:
+                refdelta_state.finish()
 
     spectrum_sa_function.__name__ = f"{name}_spectrum_isolated_history"
     copied.sampler_function = spectrum_sa_function
@@ -1997,6 +2143,26 @@ def outer_sample_wrapper(
 
     runtime = binding.runtime
     name = sampler_name(sampler)
+    if (
+        (name == REFDELTA_SAMPLER_NAME or name in REFDELTA_BACKEND_SAMPLERS)
+        and "multigpu_clones" in (getattr(guider, "model_options", None) or {})
+    ):
+        LOG.warning(
+            "Spectrum H3 disabled for this RefDelta backend run because multi-GPU "
+            "parallel model calls bypass transactional step finalization; running "
+            "the untouched RefDelta sampler"
+        )
+        return executor(
+            noise,
+            latent_image,
+            sampler,
+            sigmas,
+            denoise_mask,
+            callback,
+            disable_pbar,
+            seed,
+            latent_shapes=latent_shapes,
+        )
     expected_model_calls = None
     sa_call_topology = None
     if name in SA_SOLVER_SAMPLERS:
@@ -2148,6 +2314,7 @@ def outer_sample_wrapper(
         not runtime.config.offline_smoothing_replay
         or sampler_supports_seeded_replay(sampler)
         or stochastic_seeds
+        or name in REFDELTA_SEEDS_SAMPLERS
         or name in SA_SOLVER_SAMPLERS
     )
     if runtime.config.model_aware_mode != "off" and profile_eligible:
@@ -2391,6 +2558,21 @@ def outer_sample_wrapper(
             latent_shapes=latent_shapes,
         )
     if not sampler_supports_seeded_replay(sampler):
+        if name in REFDELTA_SEEDS_SAMPLERS:
+            LOG.warning(
+                "Spectrum H3 offline smoothing replay is disabled for RefDelta SEEDS "
+                "because actual-only RefDelta evidence is defined on the live causal pass; "
+                "running one causal state-conditioned Spectrum pass"
+            )
+            return execute_run(
+                noise,
+                latent_image,
+                sigmas,
+                denoise_mask,
+                callback,
+                disable_pbar,
+                phase="single_pass_replay_fallback",
+            )
         if stochastic_seeds:
             LOG.warning(
                 "Spectrum H3 offline smoothing replay is disabled for stochastic SEEDS "
@@ -2958,7 +3140,24 @@ def sampler_sample_wrapper(
         )
     runtime = binding.runtime
     sampler = executor.class_obj
-    if sampler_name(sampler) in SA_SOLVER_SAMPLERS:
+    name = sampler_name(sampler)
+    if (
+        (name == REFDELTA_SAMPLER_NAME or name in REFDELTA_BACKEND_SAMPLERS)
+        and "multigpu_clones" in ((extra_args or {}).get("model_options") or {})
+    ):
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+    if name in REFDELTA_BACKEND_SAMPLERS:
+        extra_args = _with_refdelta_backend_bridge(extra_args, runtime)
+    if name in SA_SOLVER_SAMPLERS:
         return _run_solver_aware_sa(
             executor,
             runtime,
@@ -2971,7 +3170,7 @@ def sampler_sample_wrapper(
             denoise_mask,
             disable_pbar,
         )
-    if sampler_name(sampler) in ER_SDE_SAMPLERS:
+    if name in ER_SDE_SAMPLERS:
         return _run_tracked_er_sde(
             executor,
             runtime,
