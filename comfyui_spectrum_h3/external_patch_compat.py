@@ -27,6 +27,9 @@ _PROFILE_CACHE_LOCK = threading.RLock()
 _RUNTIME_STATE_ATTR = "_spectrum_h3_external_patch_compat"
 _CURRENT_DECISION_ATTR = "_spectrum_h3_external_patch_decision"
 
+HARD_TRANSITION_REASON = "external patch hard sigma transition"
+TERMINAL_PECE_DEFERRED_REASON = "external patch terminal PECE transition deferred"
+
 _INSTALLED = False
 _ORIGINAL_OUTER_SAMPLE_WRAPPER = None
 _ORIGINAL_PREDICT_NOISE_WRAPPER = None
@@ -63,6 +66,7 @@ class ExternalPatchDescriptor:
     token_tail: float
     cond_only: bool
     scope: str
+    terminal_pece_exact_corrector_safe: bool = False
 
     @property
     def inert(self) -> bool:
@@ -102,6 +106,7 @@ class ExternalPatchDescriptor:
             self.token_tail,
             self.cond_only,
             self.scope,
+            self.terminal_pece_exact_corrector_safe,
         )
 
 
@@ -152,6 +157,15 @@ class _ExternalRollbackState:
     committed_active: tuple[bool, ...] | None
     committed_sigma: tuple[float, ...] | None
     committed_step_id: int | None
+    awaiting_terminal_pece_corrector: "_DeferredTerminalPECETransition | None"
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredTerminalPECETransition:
+    predicted_step_id: int
+    corrected_step_id: int
+    outer_step: int
+    transition_indices: tuple[int, ...]
 
 
 @dataclass(slots=True)
@@ -167,8 +181,14 @@ class _ExternalRunState:
     pending_active: tuple[bool, ...] | None = None
     pending_sigma: tuple[float, ...] | None = None
     pending_transition_indices: tuple[int, ...] = ()
+    pending_terminal_pece_transition: _DeferredTerminalPECETransition | None = None
+    awaiting_terminal_pece_corrector: _DeferredTerminalPECETransition | None = None
+    pending_terminal_pece_confirmation_step_id: int | None = None
     transitions: int = 0
     forced_actuals: int = 0
+    terminal_pece_deferred: int = 0
+    terminal_pece_confirmed: int = 0
+    terminal_pece_failed_safe: int = 0
     contract_failures: int = 0
     failed_safe: bool = False
 
@@ -289,6 +309,7 @@ def _parse_descriptor(raw: Any, *, block_count: int, position: int) -> ExternalP
         token_tail=token_tail,
         cond_only=cond_only,
         scope=scope,
+        terminal_pece_exact_corrector_safe=False,
     )
 
 
@@ -555,6 +576,104 @@ def _set_effective_actual(runtime: Any, reason: str) -> None:
         decision["reason"] = str(reason)
 
 
+def _set_effective_forecast_reason(runtime: Any, reason: str) -> None:
+    step = getattr(runtime, "_step", None)
+    if step is None or step.mode != "forecast":
+        raise RuntimeError("external patch deferral requires an active forecast step")
+    step.reason = str(reason)
+    step.adaptive_recompute = False
+    step.bootstrap_forecast = False
+    step.model_aware_decision = None
+    step.model_aware_forced_actual = False
+    decision = getattr(runtime, _CURRENT_DECISION_ATTR, None)
+    if isinstance(decision, dict):
+        decision["actual"] = False
+        decision["reason"] = str(reason)
+
+
+def _terminal_pece_deferral(
+    runtime: Any,
+    run_state: _ExternalRunState,
+    transition_indices: tuple[int, ...],
+) -> tuple[_DeferredTerminalPECETransition | None, str]:
+    if not transition_indices:
+        return None, "no hard transition"
+    descriptors = tuple(run_state.parsed.descriptors[index] for index in transition_indices)
+    if not all(value.terminal_pece_exact_corrector_safe for value in descriptors):
+        return None, "provider capability missing"
+    guarantee_query = getattr(
+        runtime,
+        "terminal_pece_exact_corrector_after_current_step",
+        None,
+    )
+    if not callable(guarantee_query):
+        return None, "runtime topology proof unavailable"
+    guarantee = guarantee_query()
+    if guarantee is None:
+        return None, "terminal exact-corrector topology not proven"
+    step = getattr(runtime, "_step", None)
+    if step is None or step.mode != "forecast":
+        return None, "current step is not a forecast candidate"
+    predicted_step_id = getattr(guarantee, "predicted_step_id", None)
+    corrected_step_id = getattr(guarantee, "corrected_step_id", None)
+    outer_step = getattr(guarantee, "outer_step", None)
+    if (
+        isinstance(predicted_step_id, bool)
+        or not isinstance(predicted_step_id, int)
+        or isinstance(corrected_step_id, bool)
+        or not isinstance(corrected_step_id, int)
+        or isinstance(outer_step, bool)
+        or not isinstance(outer_step, int)
+    ):
+        return None, "runtime topology proof is malformed"
+    if predicted_step_id != int(step.step_id):
+        return None, "topology proof identifies another predicted step"
+    if (
+        corrected_step_id != predicted_step_id + 1
+        or outer_step != getattr(step, "policy_step_id", None)
+    ):
+        return None, "topology proof does not identify the immediate same-outer corrector"
+    return (
+        _DeferredTerminalPECETransition(
+            predicted_step_id=predicted_step_id,
+            corrected_step_id=corrected_step_id,
+            outer_step=outer_step,
+            transition_indices=transition_indices,
+        ),
+        "guaranteed exact same-outer corrector",
+    )
+
+
+def _validate_deferred_corrector_arrival(
+    runtime: Any,
+    run_state: _ExternalRunState,
+    *,
+    step_id: int,
+    active: tuple[bool, ...],
+    normalized: tuple[float, ...],
+) -> str | None:
+    deferred = run_state.awaiting_terminal_pece_corrector
+    if deferred is None:
+        return None
+    if step_id != deferred.corrected_step_id:
+        return (
+            "deferred terminal PECE transition was not followed by its declared "
+            f"corrector (expected step {deferred.corrected_step_id}, observed {step_id})"
+        )
+    step = getattr(runtime, "_step", None)
+    if (
+        step is None
+        or step.mode != "actual"
+        or getattr(step, "phase", None) != "corrected"
+        or getattr(step, "policy_step_id", None) != deferred.outer_step
+    ):
+        return "deferred terminal PECE transition reached a non-exact corrector"
+    if run_state.committed_active != active or run_state.committed_sigma != normalized:
+        return "external patch state changed between terminal predictor and corrector"
+    run_state.pending_terminal_pece_confirmation_step_id = step_id
+    return None
+
+
 def _fail_safe_current_step(runtime: Any, run_state: _ExternalRunState, reason: str) -> None:
     if not run_state.failed_safe:
         run_state.contract_failures += 1
@@ -564,6 +683,9 @@ def _fail_safe_current_step(runtime: Any, run_state: _ExternalRunState, reason: 
             "sampling for this run: %s",
             reason,
         )
+    run_state.pending_terminal_pece_transition = None
+    run_state.awaiting_terminal_pece_corrector = None
+    run_state.pending_terminal_pece_confirmation_step_id = None
     runtime._disable_forecasting(f"external patch compatibility metadata invalid: {reason}")
     _set_effective_actual(runtime, "external patch compatibility all-actual fallback")
 
@@ -605,6 +727,18 @@ def observe_external_patch_runtime(
         raise RuntimeError("external patch runtime state arrived without an active step")
     step_id = int(step.step_id)
 
+    confirmation_failure = _validate_deferred_corrector_arrival(
+        runtime,
+        run_state,
+        step_id=step_id,
+        active=active,
+        normalized=normalized,
+    )
+    if confirmation_failure is not None:
+        run_state.terminal_pece_failed_safe += 1
+        _fail_safe_current_step(runtime, run_state, confirmation_failure)
+        return True
+
     if run_state.pending_step_id == step_id:
         if run_state.pending_active != active or run_state.pending_sigma != normalized:
             _fail_safe_current_step(
@@ -631,11 +765,27 @@ def observe_external_patch_runtime(
     if transition_indices:
         run_state.transitions += len(transition_indices)
         if step.mode == "forecast":
-            reason = "external patch hard sigma transition"
-            _set_effective_actual(runtime, reason)
-            run_state.forced_actuals += 1
-            action = "force_actual"
+            deferred, deferral_reason = _terminal_pece_deferral(
+                runtime,
+                run_state,
+                transition_indices,
+            )
+            if deferred is not None:
+                _set_effective_forecast_reason(runtime, TERMINAL_PECE_DEFERRED_REASON)
+                run_state.pending_terminal_pece_transition = deferred
+                run_state.terminal_pece_deferred += 1
+                action = "allow_terminal_pece_forecast"
+            else:
+                if any(
+                    run_state.parsed.descriptors[index].terminal_pece_exact_corrector_safe
+                    for index in transition_indices
+                ):
+                    run_state.terminal_pece_failed_safe += 1
+                _set_effective_actual(runtime, HARD_TRANSITION_REASON)
+                run_state.forced_actuals += 1
+                action = "force_actual"
         else:
+            deferral_reason = "step already exact"
             action = "already_actual"
         if runtime.config.debug:
             details = []
@@ -647,10 +797,12 @@ def observe_external_patch_runtime(
                     f"{str(active[index]).lower()}@{normalized[index]:.6f}"
                 )
             LOG.warning(
-                "Spectrum H3 external patch transition step=%s transitions=%s action=%s",
+                "Spectrum H3 external patch transition step=%s transitions=%s "
+                "action=%s reason=%s",
                 step_id,
                 ",".join(details),
                 action,
+                deferral_reason,
             )
     return step.mode == "actual"
 
@@ -712,6 +864,31 @@ def _runtime_finalize_step(self, run_id: int, step_id: int) -> None:
         run_state.pending_active = None
         run_state.pending_sigma = None
         run_state.pending_transition_indices = ()
+        if (
+            run_state.pending_terminal_pece_transition is not None
+            and run_state.pending_terminal_pece_transition.predicted_step_id == int(step_id)
+        ):
+            run_state.awaiting_terminal_pece_corrector = (
+                run_state.pending_terminal_pece_transition
+            )
+            run_state.pending_terminal_pece_transition = None
+        if run_state.pending_terminal_pece_confirmation_step_id == int(step_id):
+            deferred = run_state.awaiting_terminal_pece_corrector
+            if deferred is None or deferred.corrected_step_id != int(step_id):
+                raise RuntimeError(
+                    "external patch terminal PECE confirmation lost its pending transition"
+                )
+            run_state.awaiting_terminal_pece_corrector = None
+            run_state.pending_terminal_pece_confirmation_step_id = None
+            run_state.terminal_pece_confirmed += 1
+            if self.config.debug:
+                LOG.warning(
+                    "Spectrum H3 external patch terminal PECE exact corrector confirmed "
+                    "predicted_step=%s corrected_step=%s outer_step=%s",
+                    deferred.predicted_step_id,
+                    deferred.corrected_step_id,
+                    deferred.outer_step,
+                )
     setattr(self, _CURRENT_DECISION_ATTR, None)
 
 
@@ -724,6 +901,8 @@ def _runtime_abort_step(self, run_id: int, step_id: int) -> None:
         run_state.pending_active = None
         run_state.pending_sigma = None
         run_state.pending_transition_indices = ()
+        run_state.pending_terminal_pece_transition = None
+        run_state.pending_terminal_pece_confirmation_step_id = None
     setattr(self, _CURRENT_DECISION_ATTR, None)
 
 
@@ -737,6 +916,7 @@ def _runtime_create_rollback_snapshot(self):
             committed_active=run_state.committed_active,
             committed_sigma=run_state.committed_sigma,
             committed_step_id=run_state.committed_step_id,
+            awaiting_terminal_pece_corrector=run_state.awaiting_terminal_pece_corrector,
         )
     return snapshot
 
@@ -751,10 +931,15 @@ def _runtime_restore_rollback_snapshot(self, snapshot) -> None:
         run_state.committed_active = external.committed_active
         run_state.committed_sigma = external.committed_sigma
         run_state.committed_step_id = external.committed_step_id
+        run_state.awaiting_terminal_pece_corrector = (
+            external.awaiting_terminal_pece_corrector
+        )
         run_state.pending_step_id = None
         run_state.pending_active = None
         run_state.pending_sigma = None
         run_state.pending_transition_indices = ()
+        run_state.pending_terminal_pece_transition = None
+        run_state.pending_terminal_pece_confirmation_step_id = None
     setattr(self, _CURRENT_DECISION_ATTR, None)
 
 
@@ -778,6 +963,9 @@ def _runtime_debug_summary(self) -> str:
         f"external_patch_final_perturbation={runtime_final:.6f} "
         f"external_patch_transitions={run_state.transitions} "
         f"external_patch_forced_actuals={run_state.forced_actuals} "
+        f"external_patch_terminal_pece_deferred={run_state.terminal_pece_deferred} "
+        f"external_patch_terminal_pece_confirmed={run_state.terminal_pece_confirmed} "
+        f"external_patch_terminal_pece_failed_safe={run_state.terminal_pece_failed_safe} "
         f"external_patch_contract_failures={run_state.contract_failures}"
     )
 
@@ -1081,6 +1269,8 @@ __all__ = [
     "EXTERNAL_PATCH_RUNTIME_KEY",
     "EXTERNAL_PATCH_SCHEMA_VERSION",
     "EXTERNAL_PATCH_SCOPE",
+    "HARD_TRANSITION_REASON",
+    "TERMINAL_PECE_DEFERRED_REASON",
     "ExternalAwareProfile",
     "ExternalPatchContractError",
     "ExternalPatchDescriptor",
