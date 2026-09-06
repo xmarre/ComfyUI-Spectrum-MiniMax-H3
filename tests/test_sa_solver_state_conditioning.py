@@ -695,8 +695,70 @@ def test_active_pece_supports_forecasted_predicted_phase_every_outer_step_after_
         assert float(callback["denoised"].abs().max()) < 10.0
 
 
+def test_active_pece_terminal_deferral_preserves_19_call_12_actual_accounting():
+    pytest.importorskip("scipy")
+    modes = [
+        "actual",  # P0
+        "actual", "actual",  # P1/C1
+        "forecast", "actual",  # P2/C2
+        "forecast", "actual",  # P3/C3
+        "actual", "actual",  # P4/C4: retained interior hard transition
+        "forecast", "actual",  # P5/C5
+        "forecast", "actual",  # P6/C6
+        "forecast", "actual",  # P7/C7
+        "forecast", "actual",  # P8/C8
+        "forecast", "actual",  # P9/C9: deferred terminal transition
+    ]
+    reasons = [None] * len(modes)
+    reasons[7] = "external patch hard sigma transition"
+    reasons[17] = "external patch terminal PECE transition deferred"
+    run = _run_isolated(
+        modes,
+        sigmas=tuple(value / 10 for value in range(10, -1, -1)),
+        use_pece=True,
+        tau_func="piecewise",
+        s_noise=0.7,
+        reasons=reasons,
+    )
+    baseline_modes = list(modes)
+    baseline_modes[17] = "actual"
+    baseline_reasons = list(reasons)
+    baseline_reasons[17] = "external patch hard sigma transition"
+    baseline = _run_isolated(
+        baseline_modes,
+        sigmas=tuple(value / 10 for value in range(10, -1, -1)),
+        use_pece=True,
+        tau_func="piecewise",
+        s_noise=0.7,
+        reasons=baseline_reasons,
+    )
 
-def test_active_pece_hard_transition_restarts_dense_endpoint_interpolation():
+    assert len(run.model_events) == 19
+    assert modes.count("actual") == 12
+    assert modes.count("forecast") == 7
+    assert run.runtime.last_completed_step_id == 18
+    assert run.runtime.last_completed_mode == "actual"
+    assert baseline_modes.count("actual") == 13
+    assert baseline_modes.count("forecast") == 6
+    assert run.noise_args == baseline.noise_args
+    assert len(run.noise_draws) == len(baseline.noise_draws)
+    for candidate_draw, baseline_draw in zip(run.noise_draws, baseline.noise_draws):
+        torch.testing.assert_close(candidate_draw, baseline_draw, rtol=0, atol=0)
+    torch.testing.assert_close(run.rng_state, baseline.rng_state, rtol=0, atol=0)
+    torch.testing.assert_close(run.result, baseline.result, rtol=0, atol=0)
+
+
+
+@pytest.mark.parametrize(
+    "transition_reason",
+    [
+        "external patch hard sigma transition",
+        "external patch terminal PECE transition deferred",
+    ],
+)
+def test_active_pece_hard_transition_restarts_dense_endpoint_interpolation(
+    transition_reason,
+):
     pytest.importorskip("scipy")
     run = _run_isolated(
         ["actual", "forecast", "actual", "actual", "actual", "forecast", "actual"],
@@ -708,7 +770,7 @@ def test_active_pece_hard_transition_restarts_dense_endpoint_interpolation():
             None,
             None,
             None,
-            "external patch hard sigma transition",
+            transition_reason,
             None,
             None,
             None,
@@ -1498,4 +1560,3 @@ def test_active_pece_outer_wrapper_enters_phase_aware_runtime(
     ]
     assert call["model_aware_force_actual"] is False
     assert runtime.active_run_id is None
-

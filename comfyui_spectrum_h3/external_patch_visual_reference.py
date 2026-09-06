@@ -9,7 +9,8 @@ from . import external_patch_compat as compat
 
 VISUAL_PATCH_PROFILES_KEY = "spectrum_h3_visual_reference_patch_profiles"
 VISUAL_PATCH_RUNTIME_KEY = "spectrum_h3_visual_reference_patch_runtime"
-VISUAL_PATCH_SCHEMA_VERSION = 1
+VISUAL_PATCH_SCHEMA_VERSION = 2
+VISUAL_PATCH_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
 VISUAL_PATCH_PROVIDER = "comfyui-flux2-untwisting-rope"
 VISUAL_PATCH_KIND = "visual_reference_attention_modulation"
 VISUAL_PATCH_ARCHITECTURE = "minimax_h3"
@@ -54,7 +55,7 @@ def _parse_visual_profile(
         raise compat.ExternalPatchContractError(
             f"visual_profile[{position}].schema_version must be an integer"
         )
-    if schema != VISUAL_PATCH_SCHEMA_VERSION:
+    if schema not in VISUAL_PATCH_SUPPORTED_SCHEMA_VERSIONS:
         raise compat.ExternalPatchContractError(
             f"visual_profile[{position}] uses unsupported schema_version={schema}"
         )
@@ -140,6 +141,19 @@ def _parse_visual_profile(
         "scale_temporal_axis",
         position=position,
     )
+    capability_name = "terminal_pece_exact_corrector_safe"
+    if schema == 1:
+        if capability_name in raw:
+            raise compat.ExternalPatchContractError(
+                f"visual_profile[{position}].{capability_name} requires schema_version=2"
+            )
+        terminal_pece_safe = False
+    else:
+        terminal_pece_safe = _required_bool(
+            raw,
+            capability_name,
+            position=position,
+        )
 
     expected_strength = max(
         abs(high_start - 1.0),
@@ -150,6 +164,19 @@ def _parse_visual_profile(
     if not math.isclose(strength, expected_strength, rel_tol=1e-9, abs_tol=1e-9):
         raise compat.ExternalPatchContractError(
             f"visual_profile[{position}].strength does not match the declared scale endpoints"
+        )
+    if terminal_pece_safe and not (
+        progress_start == 0.0
+        and 0.90 <= progress_end < 1.0
+        and not hard_start
+        and hard_end
+        and strength <= 0.05 + 1e-9
+        and scope in {"image_only", "image_and_video"}
+        and not scale_temporal_axis
+    ):
+        raise compat.ExternalPatchContractError(
+            f"visual_profile[{position}].{capability_name} is outside the reviewed "
+            "weak spatial-only late hard-end envelope"
         )
 
     # Both the producer's schedule_fraction() and Spectrum's active_at() are
@@ -178,9 +205,10 @@ def _parse_visual_profile(
         token_tail=1.0,
         cond_only=False,
         scope=scope,
+        terminal_pece_exact_corrector_safe=terminal_pece_safe,
     )
     canonical = descriptor.canonical + (
-        "visual_reference_profile_v1",
+        f"visual_reference_profile_v{schema}",
         progress_start,
         progress_end,
         hard_start,
@@ -191,6 +219,7 @@ def _parse_visual_profile(
         low_end,
         beta,
         scale_temporal_axis,
+        terminal_pece_safe,
     )
     return descriptor, canonical
 
@@ -257,7 +286,11 @@ def _visual_runtime_entries(
                 f"visual_runtime[{position}] must be a dictionary"
             )
         schema = value.get("schema_version")
-        if isinstance(schema, bool) or not isinstance(schema, int) or schema != VISUAL_PATCH_SCHEMA_VERSION:
+        if (
+            isinstance(schema, bool)
+            or not isinstance(schema, int)
+            or schema not in VISUAL_PATCH_SUPPORTED_SCHEMA_VERSIONS
+        ):
             raise compat.ExternalPatchContractError(
                 f"visual_runtime[{position}] has unsupported schema_version"
             )
@@ -289,10 +322,11 @@ def _visual_runtime_entries(
         # cfg.enabled, while Spectrum's transaction state must follow the declared
         # hard schedule boundaries. Derive that state only from exact progress.
         by_id[instance_id] = {
-            "schema_version": VISUAL_PATCH_SCHEMA_VERSION,
+            "schema_version": compat.EXTERNAL_PATCH_SCHEMA_VERSION,
             "provider": provider,
             "instance_id": instance_id,
             "normalized_sigma": 1.0 - progress,
+            "provider_schema_version": schema,
         }
 
     expected = {value.instance_id for value in descriptors}
@@ -302,7 +336,15 @@ def _visual_runtime_entries(
         raise compat.ExternalPatchContractError(
             f"visual patch runtime/static instance mismatch missing={missing} extra={extra}"
         )
-    return [by_id[value.instance_id] for value in descriptors]
+    ordered: list[dict[str, Any]] = []
+    for descriptor in descriptors:
+        entry = by_id[descriptor.instance_id]
+        if entry.pop("provider_schema_version") != descriptor.schema_version:
+            raise compat.ExternalPatchContractError(
+                f"visual runtime/profile schema changed for instance {descriptor.instance_id!r}"
+            )
+        ordered.append(entry)
+    return ordered
 
 
 def runtime_entries_with_visual_references(
@@ -358,6 +400,7 @@ __all__ = [
     "VISUAL_PATCH_PROVIDER",
     "VISUAL_PATCH_RUNTIME_KEY",
     "VISUAL_PATCH_SCHEMA_VERSION",
+    "VISUAL_PATCH_SUPPORTED_SCHEMA_VERSIONS",
     "install_visual_reference_patch_compat",
     "parse_external_patch_contracts_with_visual_references",
     "runtime_entries_with_visual_references",

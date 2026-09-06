@@ -64,11 +64,11 @@ def parse(*, include_diffaid=True, profile=None):
     return compat.parse_external_patch_contracts(options, block_count=5)
 
 
-def visual_runtime(progress, *, active=True):
+def visual_runtime(progress, *, active=True, schema_version=1):
     return {
         visual.VISUAL_PATCH_RUNTIME_KEY: (
             {
-                "schema_version": 1,
+                "schema_version": schema_version,
                 "provider": visual.VISUAL_PATCH_PROVIDER,
                 "instance_id": "untwist-h3-1",
                 "schedule_progress": progress,
@@ -101,6 +101,89 @@ def test_soft_end_widens_visual_guard_to_sigma_zero():
     assert descriptor.sigma_start == 0.0
     assert descriptor.sigma_end == 1.0
     assert descriptor.has_hard_temporal_transition is False
+
+
+def test_v2_weak_late_spatial_profile_declares_terminal_pece_capability():
+    profile = untwist_profile(
+        schema_version=2,
+        strength=0.05,
+        progress_end=0.95,
+        high_scale_start=0.95,
+        high_scale_end=1.0,
+        low_scale_start=1.0,
+        low_scale_end=1.05,
+        terminal_pece_exact_corrector_safe=True,
+    )
+    parsed = parse(include_diffaid=False, profile=profile)
+    descriptor = parsed.descriptors[0]
+    assert descriptor.schema_version == 2
+    assert descriptor.terminal_pece_exact_corrector_safe is True
+    assert compat._runtime_entries(
+        visual_runtime(1.0, active=False, schema_version=2),
+        parsed,
+    ) == pytest.approx((0.0,))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"progress_start": 0.1, "hard_start": True},
+        {"progress_end": 0.89},
+        {"scope": "all_visual_including_continuum"},
+        {"scale_temporal_axis": True},
+        {"strength": 0.10, "high_scale_start": 0.90},
+    ],
+)
+def test_v2_terminal_pece_capability_rejects_unreviewed_profiles(override):
+    values = {
+        "schema_version": 2,
+        "strength": 0.05,
+        "high_scale_start": 0.95,
+        "high_scale_end": 1.0,
+        "low_scale_start": 1.0,
+        "low_scale_end": 1.05,
+        "terminal_pece_exact_corrector_safe": True,
+    }
+    values.update(override)
+    profile = untwist_profile(**values)
+    with pytest.raises(
+        compat.ExternalPatchContractError,
+        match="reviewed weak spatial-only late hard-end envelope",
+    ):
+        parse(include_diffaid=False, profile=profile)
+
+
+def test_v1_profile_cannot_smuggle_terminal_pece_capability():
+    with pytest.raises(
+        compat.ExternalPatchContractError,
+        match="requires schema_version=2",
+    ):
+        parse(
+            include_diffaid=False,
+            profile=untwist_profile(
+                terminal_pece_exact_corrector_safe=True,
+            ),
+        )
+
+
+def test_visual_runtime_schema_must_match_static_profile():
+    parsed = parse(
+        include_diffaid=False,
+        profile=untwist_profile(
+            schema_version=2,
+            strength=0.05,
+            high_scale_start=0.95,
+            high_scale_end=1.0,
+            low_scale_start=1.0,
+            low_scale_end=1.05,
+            terminal_pece_exact_corrector_safe=True,
+        ),
+    )
+    with pytest.raises(
+        compat.ExternalPatchContractError,
+        match="runtime/profile schema changed",
+    ):
+        compat._runtime_entries(visual_runtime(1.0, schema_version=1), parsed)
 
 
 def test_hard_start_maps_inclusive_progress_start_to_sigma_end():

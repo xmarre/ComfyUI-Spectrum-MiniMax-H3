@@ -1356,16 +1356,25 @@ def _sample_sa_solver_pece_forecast_isolated(
                 lambdas[i],
                 i,
             )
-            if predicted_reason == "external patch hard sigma transition":
+            if predicted_reason in {
+                "external patch hard sigma transition",
+                "external patch terminal PECE transition deferred",
+            }:
                 dense_endpoint_preds.clear()
                 dense_endpoint_lambdas.clear()
                 dense_endpoint_outer_steps.clear()
                 if runtime.config.debug:
                     LOG.warning(
                         "Spectrum H3 SA PECE dense history reset sa_outer=%s "
-                        "reason=external_patch_hard_transition "
+                        "reason=%s "
                         "native_adams_history=preserved",
                         i,
+                        (
+                            "external_patch_terminal_pece_transition_deferred"
+                            if predicted_reason
+                            == "external patch terminal PECE transition deferred"
+                            else "external_patch_hard_transition"
+                        ),
                     )
             append_bounded(
                 dense_endpoint_preds,

@@ -61,6 +61,15 @@ class SolverCallDescriptor:
     phase: str
 
 
+@dataclass(frozen=True, slots=True)
+class ExactCorrectorGuarantee:
+    """Explicit proof that the current predicted call has an exact follow-up."""
+
+    predicted_step_id: int
+    corrected_step_id: int
+    outer_step: int
+
+
 @dataclass(slots=True)
 class RuntimeStats:
     run_id: int = 0
@@ -360,6 +369,60 @@ class SpectrumH3Runtime:
     @property
     def active_policy_step_id(self) -> int | None:
         return None if self._step is None else self._step.policy_step_id
+
+    def terminal_pece_exact_corrector_after_current_step(
+        self,
+    ) -> ExactCorrectorGuarantee | None:
+        """Prove the narrow terminal predicted -> exact corrected topology.
+
+        This query exposes runtime topology facts without teaching external-patch
+        compatibility how SA-Solver numbers its calls. Missing or inconsistent
+        metadata returns ``None`` so callers retain their conservative behavior.
+        """
+        run = self._run
+        step = self._step
+        if run is None or step is None or self._offline_phase == "replay":
+            return None
+        topology = run.logical_call_topology
+        if topology is None or run.stage_count != 2:
+            return None
+        predicted_step_id = int(step.step_id)
+        corrected_step_id = predicted_step_id + 1
+        if (
+            predicted_step_id < 0
+            or corrected_step_id >= len(topology)
+            or corrected_step_id != run.total_steps - 1
+        ):
+            return None
+        predicted = topology[predicted_step_id]
+        corrected = topology[corrected_step_id]
+        if (
+            predicted.outer_step != step.policy_step_id
+            or predicted.stage_index != step.stage_index
+            or predicted.phase != step.phase
+            or predicted.phase != "predicted"
+            or predicted.outer_step <= 0
+            or predicted.outer_step != run.policy_steps - 1
+            or corrected.outer_step != predicted.outer_step
+            or corrected.phase != "corrected"
+            or corrected.stage_index == predicted.stage_index
+        ):
+            return None
+        forecastable = run.forecastable_stage_indices
+        if forecastable is None or corrected.stage_index in forecastable:
+            return None
+        if corrected.stage_index not in run.history_stage_indices:
+            return None
+        if run.history_step_ids is None or corrected_step_id not in run.history_step_ids:
+            return None
+        tail_actual = run.tail_actual_stage_indices
+        if tail_actual is None or corrected.stage_index not in tail_actual:
+            return None
+        return ExactCorrectorGuarantee(
+            predicted_step_id=predicted_step_id,
+            corrected_step_id=corrected_step_id,
+            outer_step=predicted.outer_step,
+        )
 
     @property
     def active_state_conditioned_residual(self) -> bool:

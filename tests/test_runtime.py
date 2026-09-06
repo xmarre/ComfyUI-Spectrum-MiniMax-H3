@@ -6,6 +6,7 @@ import torch
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.model_aware import ModelForecastabilityProfile, ProfileLookup
 from comfyui_spectrum_h3.runtime import (
+    ExactCorrectorGuarantee,
     ForecastRetryActual,
     SolverCallDescriptor,
     SpectrumH3Runtime,
@@ -198,6 +199,109 @@ def test_explicit_pece_topology_separates_same_sigma_phases_and_outer_policy():
     assert runtime.forecaster.history_length == 4
     assert runtime.forecaster.latest_anchor_ids(4) == (0, 2, 4, 6)
     assert runtime._stage_forecasters == {}
+    runtime.end_run(run_id)
+
+
+def test_terminal_pece_exact_corrector_proof_uses_explicit_topology():
+    runtime = _runtime(warmup_steps=0, tail_actual_steps=0)
+    sigmas = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0])
+    topology = (
+        SolverCallDescriptor(0, 0, "predicted"),
+        SolverCallDescriptor(1, 0, "predicted"),
+        SolverCallDescriptor(1, 1, "corrected"),
+        SolverCallDescriptor(2, 0, "predicted"),
+        SolverCallDescriptor(2, 1, "corrected"),
+        SolverCallDescriptor(3, 0, "predicted"),
+        SolverCallDescriptor(3, 1, "corrected"),
+    )
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_sa_solver_pece",
+        supported_sampler=True,
+        expected_model_calls=len(topology),
+        stage_count=2,
+        logical_call_topology=topology,
+        state_conditioned_residual=True,
+        separate_stage_histories=False,
+        forecastable_stage_indices=(0,),
+        history_stage_indices=(0, 1),
+        history_step_ids=(0, 2, 4, 6),
+        tail_actual_stage_indices=(1,),
+        allow_state_conditioned_bootstrap=True,
+        min_actual_prefix_steps=2,
+        max_consecutive_forecasts=1,
+        model_aware_can_force_actual=False,
+    )
+
+    for sigma in (1.0, 0.75, 0.75):
+        _complete_step(runtime, sigma)
+
+    interior = runtime.begin_step(torch.tensor([0.5]))
+    assert interior["phase"] == "predicted"
+    assert runtime.terminal_pece_exact_corrector_after_current_step() is None
+    runtime.abort_step(interior["run_id"], interior["step_id"])
+    runtime.end_run(run_id)
+
+
+def test_terminal_pece_exact_corrector_proof_identifies_final_predicted_call():
+    runtime = _runtime(warmup_steps=0, tail_actual_steps=0)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+    topology = (
+        SolverCallDescriptor(0, 0, "predicted"),
+        SolverCallDescriptor(1, 0, "predicted"),
+        SolverCallDescriptor(1, 1, "corrected"),
+    )
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_sa_solver_pece",
+        supported_sampler=True,
+        expected_model_calls=3,
+        stage_count=2,
+        logical_call_topology=topology,
+        state_conditioned_residual=True,
+        separate_stage_histories=False,
+        forecastable_stage_indices=(0,),
+        history_stage_indices=(0, 1),
+        history_step_ids=(0, 2),
+        tail_actual_stage_indices=(1,),
+        allow_state_conditioned_bootstrap=True,
+        max_consecutive_forecasts=1,
+        model_aware_can_force_actual=False,
+    )
+    _complete_step(runtime, 1.0)
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    assert decision["actual"] is False
+    assert runtime.terminal_pece_exact_corrector_after_current_step() == (
+        ExactCorrectorGuarantee(1, 2, 1)
+    )
+    runtime.abort_step(decision["run_id"], decision["step_id"])
+    runtime.end_run(run_id)
+
+
+def test_terminal_pece_exact_corrector_proof_rejects_one_lane_pec():
+    runtime = _runtime(warmup_steps=0, tail_actual_steps=0)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+    topology = (
+        SolverCallDescriptor(0, 0, "model"),
+        SolverCallDescriptor(1, 0, "model"),
+    )
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_sa_solver",
+        supported_sampler=True,
+        expected_model_calls=2,
+        stage_count=1,
+        logical_call_topology=topology,
+        forecastable_stage_indices=(0,),
+        history_stage_indices=(0,),
+        tail_actual_stage_indices=(),
+        max_consecutive_forecasts=1,
+        model_aware_can_force_actual=False,
+    )
+    _complete_step(runtime, 1.0)
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    assert runtime.terminal_pece_exact_corrector_after_current_step() is None
+    runtime.abort_step(decision["run_id"], decision["step_id"])
     runtime.end_run(run_id)
 
 

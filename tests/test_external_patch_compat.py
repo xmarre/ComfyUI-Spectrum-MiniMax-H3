@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +11,7 @@ import torch
 from comfyui_spectrum_h3 import external_patch_compat as compat
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3 import model_aware
-from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
+from comfyui_spectrum_h3.runtime import ExactCorrectorGuarantee, SpectrumH3Runtime
 
 
 def contract(**overrides):
@@ -316,10 +317,18 @@ def test_recognized_runtime_patch_does_not_inflate_model_aware_schedule_risk():
 
 
 class _FakeRuntime:
-    def __init__(self, parsed_contracts, *, replay=False, model_aware_mode="off"):
+    def __init__(
+        self,
+        parsed_contracts,
+        *,
+        replay=False,
+        model_aware_mode="off",
+        exact_corrector_guarantee=None,
+    ):
         self.config = SimpleNamespace(debug=False, model_aware_mode=model_aware_mode)
         self._step = None
         self.disabled_reason = None
+        self.exact_corrector_guarantee = exact_corrector_guarantee
         state = compat._compat_state(self)
         state.parsed = parsed_contracts
         state.contract_failure = None
@@ -329,9 +338,11 @@ class _FakeRuntime:
             replay=replay,
         )
 
-    def set_step(self, step_id, mode):
+    def set_step(self, step_id, mode, *, phase="model", policy_step_id=None):
         self._step = SimpleNamespace(
             step_id=step_id,
+            policy_step_id=step_id if policy_step_id is None else policy_step_id,
+            phase=phase,
             mode=mode,
             reason="scheduled",
             adaptive_recompute=False,
@@ -348,17 +359,43 @@ class _FakeRuntime:
     def _disable_forecasting(self, reason):
         self.disabled_reason = str(reason)
 
+    def terminal_pece_exact_corrector_after_current_step(self):
+        return self.exact_corrector_guarantee
+
+
+def terminal_pece_safe(parsed_contracts):
+    descriptors = tuple(
+        replace(value, terminal_pece_exact_corrector_safe=True)
+        for value in parsed_contracts.descriptors
+    )
+    return compat.ParsedExternalPatchContracts(
+        descriptors=descriptors,
+        canonical=tuple(value.canonical for value in descriptors),
+        fingerprint="terminal-pece-safe",
+    )
+
 
 def _commit(fake):
     run = compat._compat_state(fake).run
     assert run is not None
+    committed_step_id = run.pending_step_id
     run.committed_active = run.pending_active
     run.committed_sigma = run.pending_sigma
-    run.committed_step_id = run.pending_step_id
+    run.committed_step_id = committed_step_id
     run.pending_step_id = None
     run.pending_active = None
     run.pending_sigma = None
     run.pending_transition_indices = ()
+    if (
+        run.pending_terminal_pece_transition is not None
+        and run.pending_terminal_pece_transition.predicted_step_id == committed_step_id
+    ):
+        run.awaiting_terminal_pece_corrector = run.pending_terminal_pece_transition
+        run.pending_terminal_pece_transition = None
+    if run.pending_terminal_pece_confirmation_step_id == committed_step_id:
+        run.awaiting_terminal_pece_corrector = None
+        run.pending_terminal_pece_confirmation_step_id = None
+        run.terminal_pece_confirmed += 1
 
 
 def _observe(fake, step_id, sigma, mode="forecast", instance_ids=("diffaid-h3-1",)):
@@ -459,6 +496,148 @@ def test_pece_same_sigma_corrected_phase_cannot_bypass_hard_transition():
     assert run.forced_actuals == 1
 
 
+def test_terminal_pece_transition_defers_only_to_proven_exact_corrector():
+    contracts = terminal_pece_safe(
+        parsed(contract(sigma_start=0.05, sigma_end=1.0))
+    )
+    fake = _FakeRuntime(
+        contracts,
+        exact_corrector_guarantee=ExactCorrectorGuarantee(1, 2, 1),
+    )
+    _observe(fake, 0, 0.10, "actual")
+    _commit(fake)
+
+    fake.set_step(1, "forecast", phase="predicted", policy_step_id=1)
+    assert compat.observe_external_patch_runtime(
+        fake,
+        runtime_options(runtime_entry(sigma=0.0)),
+    ) is False
+    assert fake._step.mode == "forecast"
+    assert fake._step.reason == compat.TERMINAL_PECE_DEFERRED_REASON
+    run = compat._compat_state(fake).run
+    assert run.transitions == 1
+    assert run.forced_actuals == 0
+    assert run.terminal_pece_deferred == 1
+    _commit(fake)
+
+    fake.set_step(2, "actual", phase="corrected", policy_step_id=1)
+    assert compat.observe_external_patch_runtime(
+        fake,
+        runtime_options(runtime_entry(sigma=0.0)),
+    ) is True
+    _commit(fake)
+    assert run.terminal_pece_confirmed == 1
+    assert run.awaiting_terminal_pece_corrector is None
+
+
+@pytest.mark.parametrize(
+    "guarantee",
+    [
+        None,
+        ExactCorrectorGuarantee(2, 3, 1),
+        ExactCorrectorGuarantee(1, 3, 1),
+        SimpleNamespace(predicted_step_id="1", corrected_step_id=2, outer_step=1),
+    ],
+)
+def test_terminal_capability_fails_closed_without_matching_pece_topology(guarantee):
+    contracts = terminal_pece_safe(
+        parsed(contract(sigma_start=0.05, sigma_end=1.0))
+    )
+    fake = _FakeRuntime(contracts, exact_corrector_guarantee=guarantee)
+    _observe(fake, 0, 0.10, "actual")
+    _commit(fake)
+    assert _observe(fake, 1, 0.0, "forecast") == "actual"
+    run = compat._compat_state(fake).run
+    assert run.forced_actuals == 1
+    assert run.terminal_pece_deferred == 0
+    assert run.terminal_pece_failed_safe == 1
+
+
+def test_interior_pece_transition_remains_actual_even_with_provider_capability():
+    contracts = terminal_pece_safe(
+        parsed(contract(sigma_start=0.30, sigma_end=1.0))
+    )
+    fake = _FakeRuntime(contracts, exact_corrector_guarantee=None)
+    _observe(fake, 0, 0.50, "actual")
+    _commit(fake)
+    assert _observe(fake, 1, 0.20, "forecast") == "actual"
+
+
+def test_stacked_transition_uses_unsafe_descriptor_to_force_actual():
+    contracts = parsed(
+        contract(instance_id="safe", sigma_start=0.05, sigma_end=1.0),
+        contract(instance_id="unsafe", sigma_start=0.05, sigma_end=1.0),
+    )
+    safe_first = replace(
+        contracts.descriptors[0],
+        terminal_pece_exact_corrector_safe=True,
+    )
+    stacked = compat.ParsedExternalPatchContracts(
+        descriptors=(safe_first, contracts.descriptors[1]),
+        canonical=(),
+        fingerprint="stacked",
+    )
+    fake = _FakeRuntime(
+        stacked,
+        exact_corrector_guarantee=ExactCorrectorGuarantee(1, 2, 1),
+    )
+    _observe(fake, 0, 0.10, "actual", ("safe", "unsafe"))
+    _commit(fake)
+    assert _observe(fake, 1, 0.0, "forecast", ("safe", "unsafe")) == "actual"
+    run = compat._compat_state(fake).run
+    assert run.transitions == 2
+    assert run.forced_actuals == 1
+    assert run.terminal_pece_deferred == 0
+
+
+def test_deferred_terminal_transition_retry_does_not_double_count():
+    contracts = terminal_pece_safe(
+        parsed(contract(sigma_start=0.05, sigma_end=1.0))
+    )
+    fake = _FakeRuntime(
+        contracts,
+        exact_corrector_guarantee=ExactCorrectorGuarantee(1, 2, 1),
+    )
+    _observe(fake, 0, 0.10, "actual")
+    _commit(fake)
+    fake.set_step(1, "forecast", phase="predicted", policy_step_id=1)
+    options = runtime_options(runtime_entry(sigma=0.0))
+    assert compat.observe_external_patch_runtime(fake, options) is False
+    assert compat.observe_external_patch_runtime(fake, options) is False
+    run = compat._compat_state(fake).run
+    assert run.transitions == 1
+    assert run.terminal_pece_deferred == 1
+
+
+def test_deferred_terminal_corrector_mismatch_fails_safe_and_clears_state():
+    contracts = terminal_pece_safe(
+        parsed(contract(sigma_start=0.05, sigma_end=1.0))
+    )
+    fake = _FakeRuntime(
+        contracts,
+        exact_corrector_guarantee=ExactCorrectorGuarantee(1, 2, 1),
+    )
+    _observe(fake, 0, 0.10, "actual")
+    _commit(fake)
+    fake.set_step(1, "forecast", phase="predicted", policy_step_id=1)
+    compat.observe_external_patch_runtime(
+        fake,
+        runtime_options(runtime_entry(sigma=0.0)),
+    )
+    _commit(fake)
+
+    fake.set_step(2, "actual", phase="corrected", policy_step_id=1)
+    assert compat.observe_external_patch_runtime(
+        fake,
+        runtime_options(runtime_entry(sigma=0.01)),
+    ) is True
+    run = compat._compat_state(fake).run
+    assert run.failed_safe is True
+    assert run.terminal_pece_failed_safe == 1
+    assert run.awaiting_terminal_pece_corrector is None
+    assert run.pending_terminal_pece_confirmation_step_id is None
+
+
 def test_two_contracts_crossing_same_step_force_only_one_actual():
     contracts = parsed(
         contract(instance_id="diffaid-h3-1", sigma_start=0.55, sigma_end=1.0),
@@ -516,6 +695,28 @@ def test_aborted_step_does_not_commit_external_state(monkeypatch):
     assert run.pending_step_id is None
 
 
+def test_aborted_terminal_deferral_never_becomes_awaiting_state(monkeypatch):
+    contracts = terminal_pece_safe(
+        parsed(contract(sigma_start=0.05, sigma_end=1.0))
+    )
+    fake = _FakeRuntime(
+        contracts,
+        exact_corrector_guarantee=ExactCorrectorGuarantee(1, 2, 1),
+    )
+    _observe(fake, 0, 0.10, "actual")
+    _commit(fake)
+    fake.set_step(1, "forecast", phase="predicted", policy_step_id=1)
+    compat.observe_external_patch_runtime(
+        fake,
+        runtime_options(runtime_entry(sigma=0.0)),
+    )
+    monkeypatch.setattr(compat, "_ORIGINAL_ABORT_STEP", lambda self, run_id, step_id: None)
+    compat._runtime_abort_step(fake, 1, 1)
+    run = compat._compat_state(fake).run
+    assert run.pending_terminal_pece_transition is None
+    assert run.awaiting_terminal_pece_corrector is None
+
+
 def test_finalize_commits_exactly_once(monkeypatch):
     fake = _FakeRuntime(parsed(contract(sigma_start=0.55, sigma_end=1.0)))
     _observe(fake, 0, 0.70, "actual")
@@ -545,6 +746,20 @@ def test_rollback_restore_rewinds_committed_external_state(monkeypatch):
     assert run.committed_step_id == 0
 
 
+def test_rollback_restore_rewinds_awaiting_terminal_corrector(monkeypatch):
+    fake = _FakeRuntime(parsed(contract()))
+    run = compat._compat_state(fake).run
+    deferred = compat._DeferredTerminalPECETransition(1, 2, 1, (0,))
+    run.awaiting_terminal_pece_corrector = deferred
+    snapshot = object()
+    monkeypatch.setattr(compat, "_ORIGINAL_CREATE_ROLLBACK_SNAPSHOT", lambda self: snapshot)
+    monkeypatch.setattr(compat, "_ORIGINAL_RESTORE_ROLLBACK_SNAPSHOT", lambda self, value: None)
+    assert compat._runtime_create_rollback_snapshot(fake) is snapshot
+    run.awaiting_terminal_pece_corrector = None
+    compat._runtime_restore_rollback_snapshot(fake, snapshot)
+    assert run.awaiting_terminal_pece_corrector == deferred
+
+
 def test_malformed_runtime_state_fails_safe_to_current_actual_and_future_all_actual():
     fake = _FakeRuntime(parsed(contract(sigma_start=0.55, sigma_end=1.0)))
     fake.set_step(0, "forecast")
@@ -558,6 +773,21 @@ def test_malformed_runtime_state_fails_safe_to_current_actual_and_future_all_act
     fake.set_step(1, "forecast")
     assert compat.observe_external_patch_runtime(fake, {}) is False
     assert run.contract_failures == 1
+
+
+def test_debug_summary_reports_terminal_pece_transition_counters(monkeypatch):
+    fake = _FakeRuntime(parsed(contract()))
+    run = compat._compat_state(fake).run
+    run.terminal_pece_deferred = 2
+    run.terminal_pece_confirmed = 1
+    run.terminal_pece_failed_safe = 1
+    monkeypatch.setattr(compat, "_ORIGINAL_DEBUG_SUMMARY", lambda self: "base")
+
+    summary = compat._runtime_debug_summary(fake)
+
+    assert "external_patch_terminal_pece_deferred=2" in summary
+    assert "external_patch_terminal_pece_confirmed=1" in summary
+    assert "external_patch_terminal_pece_failed_safe=1" in summary
 
 
 def test_offline_replay_does_not_reintroduce_transition_promotion():
