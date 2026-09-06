@@ -1,3 +1,64 @@
+# Spectrum MiniMax H3 v0.2.24
+
+v0.2.24 removes two unnecessary actual-evaluation barriers in validated few-step and progressive workflows while preserving the exact anchors required by the underlying samplers and external-patch contracts.
+
+## Qualified terminal Untwist PECE deferral
+
+PR #98 adds a narrow, versioned exception to Spectrum's normal hard external-patch transition rule for active SA-Solver PECE.
+
+- ComfyUI-Untwisting-RoPE v0.2.3 can declare `terminal_pece_exact_corrector_safe=true` only for its reviewed weak terminal spatial-only envelope.
+- Spectrum independently proves that the current call is the terminal predicted PECE phase and that the immediate next logical call is the exact corrected phase for the same outer step before allowing the predictor to remain forecasted.
+- The corrected call remains an actual H3 evaluation and becomes the persistent endpoint. Native SA-Solver sigma/tau/noise/RNG ordering and Adams history remain intact.
+- Missing or malformed capability metadata, PEC/non-PECE sampling, missing correctors, unknown topology, interior transitions, replay, or any stacked unsafe transition retain the ordinary exact hard-boundary promotion.
+- DiffAid's current strong interior hard transition remains exact.
+
+The follow-up short-lifetime regression found that the deferral layer was clearing Spectrum's already-selected one-point bootstrap mechanism under `max_speed`. That turned a valid one-anchor hold into the ordinary multi-point forecaster and produced `Spectrum forecaster does not have enough actual history`. The final fix changes only the external-patch reason and preserves the forecast mechanism chosen by `begin_step()`.
+
+The corrected progressive high stages now execute the intended two-outer-step PECE topology:
+
+```text
+P0  A
+P1  F
+C1  A
+```
+
+Both exercised high-stage invocations completed as **2 actual / 1 forecast**, confirmed the exact same-outer corrector, and reported zero terminal fail-safe events and zero Spectrum fallbacks. Across the complete corrected progressive workflow, metrics reported **22 logical sampler calls, 17 actual transformer NFEs, 5 Spectrum forecasts, and 2 exact handoff-probe NFEs**.
+
+The terminal-deferral semantic change also passed matched decoded-media A/B testing. In the validated 0.5 MP four-pass workflow, the new policy produced **32 actual / 16 forecast** calls versus **36 / 12** under the previous terminal-transition policy, saving four real H3 transformer evaluations without a discernible quality regression.
+
+## RES final-tail policy
+
+PR #100 removes the obsolete RES-specific three-step final-tail floor that originated as an empirical safeguard for the old monolithic RES path.
+
+- `tail_actual_steps` is now authoritative for `sample_res_multistep` and `sample_res_multistep_cfg_pp`; Spectrum no longer silently raises the RES final tail to three actual calls.
+- The separate RES recurrence safeguard is unchanged: after a forecast, one exact H3 evaluation still refreshes native `old_denoised` before another forecast may occur.
+- Continuum prefixes, warmup, external-patch transitions, fallbacks, force-actual conditions, and other independent correctness boundaries still take precedence.
+
+A three-step progressive high-resolution RES stage with one exact Continuum prefix and `tail_actual_steps=1` can therefore use:
+
+```text
+A F A
+```
+
+The production progressive RES validation exercised four stages as `A F A F A`, `A F A`, `A A F A A`, and `A F A`. That is **16 logical sampler calls = 11 actual + 5 forecast**; two exact handoff probes bring the workflow to **13 actual transformer NFEs** overall. All four stages reported zero Spectrum fallbacks. Decoded video and audio were reviewed as excellent, with the RES result preferred over the matched Euler control.
+
+## Step/NFE documentation and release process
+
+PR #95 is also included in this release archive. It is documentation/release-process only: it clarifies that UI scheduler steps are outer sigma intervals rather than necessarily one H3 model call, records the `2N - 1` / `3N - 2` multistage call counts, and hardens documentation-only release-note refreshes against stale workflow runs. It does not change sampler or forecasting behavior.
+
+The release workflow now also keeps the level-1 version heading in `RELEASE_NOTES.md` for repository history and version validation while removing that heading from the GitHub release body. The GitHub release title therefore appears only once.
+
+## Validation
+
+- PR #100: GitHub Actions run **576** passed the full eight-lane reviewed ComfyUI/Python matrix, followed by the successful production-stack RES media validation.
+- PR #98: final PR-head GitHub Actions run **575** passed all eight matrix jobs; the corrected real `max_speed` short-lifetime workflow completed without the prior under-history failure.
+- Combined post-merge `main`: GitHub Actions run **578** passed after PR #100 and PR #98 were both present on `main`.
+- Companion ComfyUI-Untwisting-RoPE #5: merged `main` tests run **23** passed.
+
+Existing Euler, ER-SDE, SEEDS, ordinary SA-Solver PEC, RefDelta ownership, Continuum prefix semantics, native/all-actual fallbacks, and unsafe external-patch transition handling remain unchanged outside the specific policies above.
+
+---
+
 # Spectrum MiniMax H3 v0.2.23
 
 v0.2.23 completes the SA-Solver PECE and RefDelta multi-backend integration and makes **`balanced` the default active-PECE forecast policy** after matched MiniMax-H3 production testing.

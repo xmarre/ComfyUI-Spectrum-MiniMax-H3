@@ -35,8 +35,39 @@ jobs:
             echo "Invalid project version: ${version}" >&2
             exit 1
           fi
+
+          python - "${version}" <<'PY'
+          import pathlib
+          import sys
+
+          version = sys.argv[1]
+          notes = pathlib.Path("RELEASE_NOTES.md").read_text(encoding="utf-8")
+          heading = next((line.strip() for line in notes.splitlines() if line.strip()), "")
+          if f"v{version}" not in heading:
+              raise SystemExit(
+                  f"RELEASE_NOTES.md first heading must identify v{version}; got {heading!r}"
+              )
+          PY
+
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare current GitHub release body
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          notes = Path("RELEASE_NOTES.md").read_text(encoding="utf-8")
+          current = notes.split("\n---\n", 1)[0]
+          lines = current.splitlines()
+          if not lines or not lines[0].startswith("# "):
+              raise SystemExit("current release notes must start with a level-1 release heading")
+          body = "\n".join(lines[1:]).lstrip("\n") + "\n"
+          if not body.strip():
+              raise SystemExit("GitHub release body is empty after removing the release heading")
+          Path("CURRENT_RELEASE_NOTES.md").write_text(body, encoding="utf-8")
+          PY
 
       - name: Build release archive
         env:
@@ -51,12 +82,6 @@ jobs:
             --output="dist/${archive}" \
             HEAD
           (cd dist && sha256sum "${archive}" > SHA256SUMS)
-
-      - name: Extract current release notes
-        shell: bash
-        run: |
-          awk '/^---$/ { exit } { print }' RELEASE_NOTES.md > CURRENT_RELEASE_NOTES.md
-          test -s CURRENT_RELEASE_NOTES.md
 
       - name: Publish or refresh GitHub release
         env:
