@@ -165,13 +165,6 @@ SA_SOLVER_TRACKED_OPTIONS = {
     ),
 }
 
-RES_MULTISTEP_SAMPLERS = frozenset(
-    {
-        "sample_res_multistep",
-        "sample_res_multistep_cfg_pp",
-    }
-)
-
 ER_SDE_SAMPLERS = frozenset({"sample_er_sde", "sample_refdelta_er_sde"})
 REFDELTA_SAMPLER_NAME = "sample_refdelta_er_sde"
 ER_SDE_NATIVE_SCALER_MODULE = "comfy_extras.nodes_custom_sampler"
@@ -2077,10 +2070,6 @@ def min_actual_steps_after_forecast(sampler: Any) -> int:
     return 1 if name in SUPPORTED_SAMPLERS else 0
 
 
-def min_tail_actual_steps(sampler: Any) -> int:
-    return 3 if sampler_name(sampler) in RES_MULTISTEP_SAMPLERS else 0
-
-
 def _binding_from_model_options(
     model_options: dict[str, Any] | None,
 ) -> SpectrumH3Binding | None:
@@ -2445,7 +2434,6 @@ def outer_sample_wrapper(
             supported_sampler=sampler_is_supported(sampler),
             max_consecutive_forecasts=max_consecutive_forecasts(sampler),
             min_actual_steps_after_forecast=min_actual_steps_after_forecast(sampler),
-            min_tail_actual_steps=min_tail_actual_steps(sampler),
             min_actual_prefix_steps=phase_prefix,
             min_sampler_actual_prefix_steps=pece_policy_prefix,
             expected_model_calls=expected_model_calls,

@@ -16,7 +16,6 @@ from comfyui_spectrum_h3.sampling import (
     install_sampler_wrappers,
     max_consecutive_forecasts,
     min_actual_steps_after_forecast,
-    min_tail_actual_steps,
     outer_sample_wrapper,
     predict_noise_wrapper,
     sampler_is_supported,
@@ -100,11 +99,10 @@ def test_supported_h3_samplers_limit_forecast_streaks(function_name):
 
 
 @pytest.mark.parametrize("function_name", ("sample_res_multistep", "sample_res_multistep_cfg_pp"))
-def test_res_multistep_policy_refreshes_once_and_protects_tail(function_name):
+def test_res_multistep_policy_keeps_one_refresh_without_hidden_tail_floor(function_name):
     sampler = _sampler(function_name)
 
     assert min_actual_steps_after_forecast(sampler) == 1
-    assert min_tail_actual_steps(sampler) == 3
 
 
 @pytest.mark.parametrize(
@@ -120,11 +118,10 @@ def test_res_multistep_policy_refreshes_once_and_protects_tail(function_name):
         "sample_refdelta_seeds_3",
     ),
 )
-def test_non_res_policy_keeps_one_refresh_and_user_tail(function_name):
+def test_non_res_policy_keeps_one_refresh(function_name):
     sampler = _sampler(function_name)
 
     assert min_actual_steps_after_forecast(sampler) == 1
-    assert min_tail_actual_steps(sampler) == 0
 
 
 @pytest.mark.parametrize(
@@ -142,7 +139,6 @@ def test_sa_policy_separates_stochastic_tail_burst_from_deterministic_refresh(fu
 
     assert max_consecutive_forecasts(sampler) == 1
     assert min_actual_steps_after_forecast(sampler) == 0
-    assert min_tail_actual_steps(sampler) == 0
 
     sampler.extra_options = {"s_noise": 0.0}
     assert max_consecutive_forecasts(sampler) == 1
@@ -227,7 +223,6 @@ def test_unsupported_sampler_has_no_forecast_streak_policy():
 
     assert max_consecutive_forecasts(sampler) is None
     assert min_actual_steps_after_forecast(sampler) == 0
-    assert min_tail_actual_steps(sampler) == 0
 
 
 

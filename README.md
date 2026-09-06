@@ -241,8 +241,8 @@ Forecasting is fail-closed and allowlisted for reviewed sampler contracts.
 | Native ER-SDE | `sample_er_sde` | Same conservative cadence plus stochastic-state tracking and solver-space dense output. |
 | RefDelta ER-SDE | `sample_refdelta_er_sde` | Requires RefDelta Solver v0.2.0+; preserves actual-only evidence and transfers the exact adaptive stochastic increment. |
 | MiniMax H3 Turbo | `_turbo_sampler` | Reviewed deterministic single-call contract. |
-| RES multistep | `sample_res_multistep` | Conservative cadence with protected native tail. |
-| RES multistep CFG++ | `sample_res_multistep_cfg_pp` | Same RES safeguards. |
+| RES multistep | `sample_res_multistep` | One exact refresh after each forecast; final-tail protection follows `tail_actual_steps`. |
+| RES multistep CFG++ | `sample_res_multistep_cfg_pp` | Same one-refresh rule; no sampler-specific final-tail floor. |
 | SEEDS-2 | `sample_seeds_2` | Stochastic outer stage stays exact; internal stage uses exact-current-state + transformer-residual forecasting with shared interleaved history. |
 | RefDelta SEEDS-2 | `sample_refdelta_seeds_2` | Same Spectrum SEEDS stage policy; RefDelta keeps actual-only outer trajectory evidence and reuses one stochastic gate across the native correlated SEEDS noise segments. |
 | SEEDS-3 | `sample_seeds_3` | Same state-conditioned residual architecture; more conservative because two internal stages occur between exact outer anchors. |
@@ -251,6 +251,9 @@ Forecasting is fail-closed and allowlisted for reviewed sampler contracts.
 | RefDelta SA-Solver PEC | `sample_refdelta_sa_solver` | RefDelta trajectory/stochastic control composed around Spectrum's actual-only isolated PEC adapter. |
 | SA-Solver PECE | `sample_sa_solver` / `sample_sa_solver_pece` | Active correctors use explicit predicted/corrected phases; P0 plus exact corrected endpoints own shared persistent history, while later predicted phases are solver-space forecasts unless a correctness boundary promotes them. |
 | RefDelta SA-Solver PECE | `sample_refdelta_sa_solver_pece` | Same Spectrum active-PECE endpoint topology and user-selected PECE forecast policy; RefDelta keeps P0/C_i actual endpoint evidence and uses the corrected endpoint to own trajectory/stochastic state. |
+
+
+RES keeps the one-exact-evaluation post-forecast refresh because native RES carries `old_denoised` into the following second-order update. That recurrence safeguard is independent of the final tail. RES no longer raises `tail_actual_steps` internally: the configured final tail remains authoritative, while Continuum prefixes, warmup, external-patch transitions, fallbacks, and other force-actual conditions continue to apply independently.
 
 Unknown or changed sampler contracts fall back to native execution rather than guessing.
 

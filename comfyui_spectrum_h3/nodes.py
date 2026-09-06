@@ -85,7 +85,7 @@ class SpectrumApplyMiniMaxH3:
                         "max": 64,
                         "step": 1,
                         "tooltip": (
-                            "Requested final native tail. RES enforces its three-step solver tail. "
+                            "Requested final native tail. RES does not add a hidden tail floor; its separate one-actual post-forecast refresh remains enforced. "
                             "ER-SDE offline replay promotes only a penultimate step that the normal schedule would forecast, preserving a future exact terminal anchor without a blanket two-step tail."
                         ),
                     },

@@ -1709,7 +1709,7 @@ def test_res_multistep_refreshes_once_without_growing_the_window():
     assert runtime.stats.current_window == pytest.approx(4.0)
 
 
-def test_twenty_step_res_schedule_refreshes_once_and_enforces_three_step_tail():
+def test_twenty_step_res_schedule_refreshes_once_without_sampler_tail_floor():
     runtime = SpectrumH3Runtime(SpectrumH3Config(tail_actual_steps=0))
     runtime.start_run(
         torch.linspace(1.0, 0.0, 21),
@@ -1717,7 +1717,6 @@ def test_twenty_step_res_schedule_refreshes_once_and_enforces_three_step_tail():
         supported_sampler=True,
         max_consecutive_forecasts=1,
         min_actual_steps_after_forecast=1,
-        min_tail_actual_steps=3,
     )
     forecast_indices = []
     previous_was_forecast = False
@@ -1750,10 +1749,43 @@ def test_twenty_step_res_schedule_refreshes_once_and_enforces_three_step_tail():
         previous_was_forecast = not actual
         runtime.finalize_step(decision["run_id"], decision["step_id"])
 
-    assert forecast_indices == [1, 3, 5, 7, 9, 11, 13, 15]
-    assert runtime.stats.actual_steps == 12
-    assert runtime.stats.forecast_steps == 8
+    assert forecast_indices == [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+    assert runtime.stats.actual_steps == 10
+    assert runtime.stats.forecast_steps == 10
 
+
+
+def test_three_step_res_progressive_stage_uses_configured_tail_only():
+    runtime = _runtime(
+        warmup_steps=0,
+        tail_actual_steps=1,
+        bootstrap_first_forecast=True,
+        window_size=2.0,
+        flex_window=0.0,
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.6, 0.2, 0.0]),
+        "sample_res_multistep",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+        min_actual_prefix_steps=1,
+    )
+
+    decisions = [
+        _complete_step(runtime, timestep)
+        for timestep in (1.0, 0.6, 0.2)
+    ]
+
+    assert [decision["actual"] for decision in decisions] == [True, False, True]
+    assert [decision["reason"] for decision in decisions] == [
+        "H3 Continuum actual prefix",
+        "one-point bootstrap forecast",
+        "final actual tail",
+    ]
+    assert runtime.stats.actual_steps == 2
+    assert runtime.stats.forecast_steps == 1
+    runtime.end_run(run_id)
 
 def test_aborted_res_refresh_does_not_consume_refresh_state():
     runtime = _runtime(warmup_steps=2, window_size=4.0, tail_actual_steps=0)
