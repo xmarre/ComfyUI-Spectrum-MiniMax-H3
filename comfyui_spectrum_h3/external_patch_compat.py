@@ -582,7 +582,9 @@ def _set_effective_forecast_reason(runtime: Any, reason: str) -> None:
         raise RuntimeError("external patch deferral requires an active forecast step")
     step.reason = str(reason)
     step.adaptive_recompute = False
-    step.bootstrap_forecast = False
+    # Deferral changes only the external-patch reason. Preserve the forecast
+    # mechanism selected by begin_step(): max_speed P1 can legitimately be a
+    # one-point bootstrap with exactly one actual feature-history anchor.
     step.model_aware_decision = None
     step.model_aware_forced_actual = False
     decision = getattr(runtime, _CURRENT_DECISION_ATTR, None)
