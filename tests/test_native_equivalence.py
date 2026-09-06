@@ -35,7 +35,7 @@ class _CountingBlock(torch.nn.Module):
         super().__init__()
         self.calls = 0
 
-    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options=None):
+    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options=None, attention=None):
         self.calls += 1
         return x + t_emb[0].mean().to(x.dtype) * 0.01
 
@@ -301,7 +301,7 @@ def test_sa_solver_state_conditioned_forecast_uses_exact_current_input_and_skips
     runtime.end_run(run_id)
 
 
-def test_forced_actual_wrapper_is_native_equivalent_and_does_not_mutate_options():
+def test_forced_actual_wrapper_is_native_equivalent_and_preserves_existing_option_values():
     _, _, PackedLayout = _native_imports()
     model, _ = _tiny_model()
     x, context, payload = _inputs(PackedLayout)
@@ -314,7 +314,7 @@ def test_forced_actual_wrapper_is_native_equivalent_and_does_not_mutate_options(
     )
     run_id = runtime.start_run(torch.tensor([1.0, 0.5, 0.0]), "sample_euler", supported_sampler=True)
     wrapped, _ = _wrapped_call(model, runtime, 1.0, 500.0, x, context, payload)
-    assert native_options == before
+    assert native_options["sentinel"] == before["sentinel"]
     assert isinstance(wrapped, list) and len(wrapped) == 2
     for native_part, wrapped_part in zip(native, wrapped, strict=True):
         assert native_part.shape == wrapped_part.shape

@@ -42,7 +42,7 @@ class _CountingBlock(torch.nn.Module):
         super().__init__()
         self.calls = 0
 
-    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options=None):
+    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options=None, attention=None):
         self.calls += 1
         return x + t_emb[0].mean().to(x.dtype) * 0.01
 

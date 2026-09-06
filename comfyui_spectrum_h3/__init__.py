@@ -1,3 +1,4 @@
+from .comfy_compiler_compat import install_comfy_compiler_compat
 from .config import AGGRESSIVE_PRESET, CONSERVATIVE_PRESET, SpectrumH3Config
 from .er_sde_offline_replay_safety import install_er_sde_offline_replay_safety
 from .er_sde_policy import install_er_sde_tail_policy
@@ -40,6 +41,9 @@ install_external_patch_compat()
 install_visual_reference_patch_compat()
 install_external_patch_hardening()
 install_er_sde_offline_replay_safety()
+# Compiler compatibility must be outermost: it owns the thread-local lifetime
+# from Spectrum step entry through every already-installed finalize/end wrapper.
+install_comfy_compiler_compat()
 
 # External compatibility wraps the already-installed safe end-run hook. Preserve
 # the inner implementation's identity and expose the effective outermost hook

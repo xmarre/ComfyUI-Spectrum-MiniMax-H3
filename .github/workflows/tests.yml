@@ -32,6 +32,10 @@ jobs:
             python_version: "3.12"
             comfy_kitchen_version: "0.2.31"
             comfy_aimdo_version: "0.4.15"
+          - comfy_ref: 15eb748b3ec5f8a0a2d470b7fb280e2d7579f916
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.33"
+            comfy_aimdo_version: "0.5.2"
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
@@ -91,6 +95,7 @@ jobs:
             tests/test_external_patch_transaction_parity.py \
             --ignore I001,UP037
           python -m ruff check \
+            comfyui_spectrum_h3/comfy_compiler_compat.py \
             comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/generic_correction.py \
             comfyui_spectrum_h3/generic_correction_calibration.py \
@@ -113,6 +118,7 @@ jobs:
             comfyui_spectrum_h3/runtime.py \
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
+            tests/test_comfy_compiler_compat.py \
             tests/test_config.py \
             tests/test_continuum_interop.py \
             tests/test_er_sde_solver_dense_output.py \
