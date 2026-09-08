@@ -1,3 +1,40 @@
+# Spectrum MiniMax H3 v0.2.25
+
+v0.2.25 restores stable Spectrum operation with current ComfyUI DynamicVRAM/Comfy Compiler by keeping Spectrum-managed MiniMax H3 solver steps out of Aimdo malloc-graph capture without disabling either system globally.
+
+## Comfy Compiler / DynamicVRAM compatibility
+
+PR #102 fixes issue #99, where current ComfyUI could segfault in `comfy_aimdo.malloc_graph.MallocGraph.pop()` during Spectrum H3 sampling. The first narrow candidate only moved retained Spectrum history allocation outside the active malloc graph; real CUDA testing showed that was insufficient because the first prompt could complete while a second prompt in the same process still crashed during `malloc_graph_end()`.
+
+The final integration uses a broader, structural boundary:
+
+- Spectrum lazily wraps `comfy.model_prefetch.malloc_graph_enabled` and returns `False` only while a supported Spectrum H3 solver step is active on the current worker thread;
+- native MiniMax H3 therefore does not enter or pop an Aimdo malloc graph for Spectrum-managed forwards, where actual and forecast/replay calls intentionally have different allocation/control topology;
+- DynamicVRAM remains enabled;
+- Comfy Compiler remains enabled for non-Spectrum work;
+- normal compiler behavior is restored after every finalized Spectrum step;
+- `end_run` and the next `start_run` both clear stale thread-local bypass state so aborted workflows cannot leak the compatibility scope into later work;
+- the compatibility layer is installed last/outermost so existing Spectrum runtime wrappers cannot replace its cleanup boundary.
+
+This deliberately trades the Comfy Compiler malloc-graph optimization away only for Spectrum-managed H3 denoiser calls. It does not globally apply the `--disable-comfy-compiler` workaround and does not require `--highvram`.
+
+## Current-Core compatibility coverage
+
+The reviewed CI matrix now includes ComfyUI `15eb748b3ec5f8a0a2d470b7fb280e2d7579f916` with Python 3.12, `comfy-kitchen==0.2.33`, and `comfy-aimdo==0.5.2`. Native MiniMax test fixtures were also aligned with the current `attention` block argument and current transient H3 transformer-option metadata while preserving caller-owned option values.
+
+Older reviewed ComfyUI revisions that predate Comfy Compiler remain supported; the compiler contract test skips only where that API does not yet exist.
+
+## Validation
+
+- PR #102 final head `be607cf485dc720cf2557c45e01f21404d75e871` passed GitHub Actions run **#589** across all **9** reviewed ComfyUI/Python matrix jobs.
+- CodeRabbit completed the final diff review with **no actionable comments** and rated merge risk minimal.
+- Real CUDA/runtime validation confirmed that the revised compatibility boundary fixed the crash; the tester also reported no obvious performance regression in normal use.
+- The original failing issue is closed after the accepted runtime retest.
+
+Existing Spectrum forecasting policies, sampler equations, Continuum prefix semantics, external-patch exactness rules, generic correction, offline replay semantics, and non-Spectrum Comfy Compiler behavior are unchanged outside this compatibility boundary.
+
+---
+
 # Spectrum MiniMax H3 v0.2.24
 
 v0.2.24 removes two unnecessary actual-evaluation barriers in validated few-step and progressive workflows while preserving the exact anchors required by the underlying samplers and external-patch contracts.
