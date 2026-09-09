@@ -45,7 +45,11 @@ class CoreBSAAudit:
     pool_specs: tuple[tuple[int, int, str], ...]
     expected_receipts: tuple[tuple[Any, ...], ...]
     source_blob: str
+    current_override: Any
     failure: str | None = None
+    actual_options_id: int | None = None
+    actual_metadata_ok: bool | None = None
+    actual_inside_window: bool | None = None
 
 
 def has_core_bsa_callback(options: dict[str, Any]) -> bool:
@@ -229,6 +233,8 @@ def _sigma_value(options: dict[str, Any]) -> float | None:
         if len(sigmas) == 0:
             return None
         return float(sigmas[0])
+    except torch.cuda.OutOfMemoryError:
+        raise
     except (TypeError, ValueError, RuntimeError):
         return None
 
@@ -448,6 +454,8 @@ def _pool_entry(
             int(entry[0]._version),
             int(entry[1]._version),
         )
+    except torch.cuda.OutOfMemoryError:
+        raise
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return ("invalid",)
 
@@ -614,6 +622,7 @@ def probe(
             pool_specs=pool_specs,
             expected_receipts=expected_receipts,
             source_blob=source_blob,
+            current_override=options.get("optimized_attention_override"),
         ), None
     except torch.cuda.OutOfMemoryError:
         raise
@@ -633,34 +642,45 @@ def _current_route_matches(
         return False
     if not torch.is_tensor(hidden) or hidden.ndim < 1 or int(hidden.shape[0]) != audit.seq_len:
         return False
-    if _normalize_uuids(call_options) != audit.uuids:
-        return False
-    if _settings_identity(audit.patch) != audit.settings_identity:
-        return False
-    actual_layout = _normalize_layout(call_options.get("minimax_h3_layout"))
-    if actual_layout is None or actual_layout[1] != audit.layout_identity or actual_layout[0] != audit.seq_len:
-        return False
 
-    expected_route = audit.route_specs[index][0]
-    sigma = _sigma_value(call_options)
-    if sigma is None:
+    options_id = id(call_options)
+    if audit.actual_options_id != options_id or audit.actual_metadata_ok is None:
+        metadata_ok = True
+        if _normalize_uuids(call_options) != audit.uuids:
+            metadata_ok = False
+        if _settings_identity(audit.patch) != audit.settings_identity:
+            metadata_ok = False
+        if call_options.get("optimized_attention_override") is not audit.current_override:
+            metadata_ok = False
+        actual_layout = _normalize_layout(call_options.get("minimax_h3_layout"))
+        if (
+            actual_layout is None
+            or actual_layout[1] != audit.layout_identity
+            or actual_layout[0] != audit.seq_len
+        ):
+            metadata_ok = False
+        sigma = _sigma_value(call_options)
+        if sigma is None:
+            metadata_ok = False
+            inside_window = False
+        else:
+            sigma_start = audit.settings_identity[4]
+            sigma_end = audit.settings_identity[5]
+            inside_window = sigma_end <= sigma <= sigma_start
+        audit.actual_options_id = options_id
+        audit.actual_metadata_ok = metadata_ok
+        audit.actual_inside_window = inside_window
+
+    if not audit.actual_metadata_ok:
         return False
-    (
-        _vsa,
-        _tau,
-        _topk,
-        _extra,
-        sigma_start,
-        sigma_end,
-        min_tokens,
-        dense_blocks,
-        _sink_mode,
-    ) = audit.settings_identity
+    min_tokens = audit.settings_identity[6]
+    dense_blocks = audit.settings_identity[7]
     dense = (
-        not (sigma_end <= sigma <= sigma_start)
+        not bool(audit.actual_inside_window)
         or audit.seq_len < min_tokens
-        or index in set(dense_blocks)
+        or index in dense_blocks
     )
+    expected_route = audit.route_specs[index][0]
     if expected_route == "h3_dense":
         return dense
     return not dense
@@ -675,7 +695,13 @@ def _make_actual_wrapper(
     key = (index, audit.seq_len, audit.uuids)
 
     def audited_replacement(args, replacement_context):
-        metadata_ok = _current_route_matches(audit, index, args)
+        try:
+            metadata_ok = _current_route_matches(audit, index, args)
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception:  # noqa: BLE001 - observation must not abort the actual block
+            metadata_ok = False
+            audit.failure = "actual_metadata_failed"
         try:
             before = _pool_entry(audit.patch, key, audit.pool_specs[index])
         except torch.cuda.OutOfMemoryError:

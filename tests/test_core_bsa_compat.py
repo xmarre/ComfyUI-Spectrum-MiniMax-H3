@@ -327,3 +327,56 @@ def test_actual_route_mismatch_fails_receipt_acceptance(monkeypatch):
     assert receipts[0][4] == "h3_dense"
     assert audit.failure == "actual_route_mismatch"
     assert not core_bsa_compat.accepts_actual(audit, receipts)
+
+
+def test_adapter_propagates_cuda_oom_from_sigma_introspection():
+    class OOMSigmas:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, _index):
+            raise torch.cuda.OutOfMemoryError("synthetic metadata OOM")
+
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        core_bsa_compat._sigma_value({"sigmas": OOMSigmas()})
+
+
+def test_invalid_pooled_shape_is_not_forecast_safe(monkeypatch):
+    monkeypatch.setattr(
+        core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True
+    )
+    _nodes, model, patch, options = _installation(sigma=0.5)
+    patch.pooled[(0, 128, ("positive",))] = (
+        torch.zeros((1, 128), dtype=torch.float32),
+        torch.zeros((1, 128), dtype=torch.float32),
+    )
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None
+    assert audit is not None
+    assert not audit.safe
+    assert audit.route_specs[0][0] == "h3_sparse_unproven"
+
+
+def test_vsa_remains_fail_closed():
+    _nodes, model, patch, options = _installation()
+    patch.vsa = True
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert audit is None
+    assert reason == "vsa_unsupported"
+
+
+def test_actual_attention_owner_change_invalidates_receipt():
+    _nodes, model, _patch, options = _installation(sigma=1.0, count=1)
+    layout = _layout()
+    audit, reason = core_bsa_compat.probe(options, layout, model)
+    assert reason is None and audit is not None
+
+    prepared = {**options, RECEIPTS: []}
+    prepared = core_bsa_compat.instrument_actual_options(prepared, audit, RECEIPTS)
+    args = _actual_args(prepared, layout, 128)
+    args["transformer_options"]["optimized_attention_override"] = lambda *args, **kwargs: None
+    wrapped = prepared["patches_replace"]["dit"][("double_block", 0)]
+    wrapped(args, {"original_block": lambda call_args: {"img": call_args["img"]}})
+
+    assert audit.failure == "actual_route_mismatch"
+    assert not core_bsa_compat.accepts_actual(audit, tuple(prepared[RECEIPTS]))
