@@ -33,7 +33,7 @@ AUDITED_BSA_GIT_BLOBS = frozenset(
 )
 
 _MISSING = object()
-_IDENTITY_LOCK = threading.Lock()
+_IDENTITY_LOCK = threading.RLock()
 _IDENTITY_COUNTER = itertools.count(1)
 _IDENTITY_REGISTRY: dict[int, tuple[weakref.ReferenceType[Any] | None, int, Any | None]] = {}
 
