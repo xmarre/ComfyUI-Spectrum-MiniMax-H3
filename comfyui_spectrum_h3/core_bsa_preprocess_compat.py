@@ -13,7 +13,8 @@ source/closure audit. Unknown preprocessors remain actual-only.
 """
 from __future__ import annotations
 
-import importlib
+from pathlib import Path
+import sys
 from typing import Any
 
 import torch
@@ -23,7 +24,8 @@ from . import core_bsa_compat
 AUDITED_UNTWIST_GIT_BLOBS = frozenset(
     {"49a6eeda841a9dffe52974dceb3bce78bf02f25d"}
 )
-_UNTWIST_MODULE = "flux_untwist.patches"
+_UNTWIST_TOPLEVEL_MODULE = "flux_untwist.patches"
+_UNTWIST_MODULE_SUFFIX = ".flux_untwist.patches"
 _UNTWIST_FACTORY = "make_minimax_h3_attention_override"
 _UNTWIST_PREPROCESS_QUALNAME = (
     "make_minimax_h3_attention_override.<locals>.preprocess"
@@ -34,19 +36,43 @@ _UNTWIST_CONFIG_KEY = "minimax_h3_untwist_rope"
 _MISSING = object()
 
 
+def _loaded_untwist_module(base: Any) -> Any | None:
+    """Resolve the reviewed source module under either test or ComfyUI package naming."""
+    module_name = getattr(base, "__module__", None)
+    if not isinstance(module_name, str):
+        return None
+    if module_name != _UNTWIST_TOPLEVEL_MODULE and not module_name.endswith(
+        _UNTWIST_MODULE_SUFFIX
+    ):
+        return None
+    module = sys.modules.get(module_name)
+    if module is None:
+        return None
+    source = getattr(module, "__file__", None)
+    code = getattr(base, "__code__", None)
+    if not isinstance(source, str) or code is None:
+        return None
+    try:
+        source_path = Path(source).resolve()
+        code_path = Path(code.co_filename).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if (
+        source_path != code_path
+        or source_path.name != "patches.py"
+        or source_path.parent.name != "flux_untwist"
+    ):
+        return None
+    return module
+
+
 def _audited_untwist_preprocess(transform: Any) -> tuple[Any, ...] | None:
     """Return a stable identity only for the exact reviewed Untwist preprocessor."""
     base = getattr(transform, "__func__", transform)
-    if (
-        getattr(base, "__module__", None) != _UNTWIST_MODULE
-        or getattr(base, "__qualname__", None) != _UNTWIST_PREPROCESS_QUALNAME
-    ):
+    if getattr(base, "__qualname__", None) != _UNTWIST_PREPROCESS_QUALNAME:
         return None
-    try:
-        module = importlib.import_module(_UNTWIST_MODULE)
-    except torch.cuda.OutOfMemoryError:
-        raise
-    except Exception:  # noqa: BLE001 - optional external provider stays fail-closed
+    module = _loaded_untwist_module(base)
+    if module is None:
         return None
     blob = core_bsa_compat._module_blob_sha(module)
     if blob not in AUDITED_UNTWIST_GIT_BLOBS:
