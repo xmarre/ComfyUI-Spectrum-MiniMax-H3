@@ -4,7 +4,13 @@ import pytest
 import torch
 
 from comfyui_spectrum_h3 import core_bsa_compat, core_bsa_preprocess_compat
-from comfyui_spectrum_h3.backend_history import RECEIPTS, preflight
+from comfyui_spectrum_h3.backend_history import (
+    BackendHistory,
+    RECEIPTS,
+    observe,
+    preflight,
+    prepare,
+)
 
 
 class _FakeAttention:
@@ -28,6 +34,31 @@ class _FakeModel:
     def __init__(self, count=2):
         self.blocks = [_FakeBlock() for _ in range(count)]
         self.dtype = torch.bfloat16
+
+
+class _EmptyForecaster:
+    history_length = 0
+
+
+class _BackendRuntime:
+    def __init__(self):
+        self.config = SimpleNamespace(debug=False)
+        self._backend_history = BackendHistory()
+        self._history_topology = None
+        self._history_labels = None
+        self._primary_forecaster = _EmptyForecaster()
+        self._stage_forecasters = {}
+        self._step = None
+        self._offline_archive = None
+        self._offline_smoother = None
+        self.prepared = None
+        self.observed = None
+
+    def prepare_backend_history(self, run_id, step_id, identity, safe):
+        self.prepared = (run_id, step_id, identity, bool(safe))
+
+    def observe_backend_history(self, run_id, step_id, identity, receipts, safe):
+        self.observed = (run_id, step_id, identity, receipts, bool(safe))
 
 
 def _audited_nodes():
@@ -131,6 +162,16 @@ def _actual_args(options, layout, seq_len=128):
     }
 
 
+def _run_prepared_dense_block(prepared, layout):
+    args = _actual_args(prepared, layout)
+    wrapped = prepared["patches_replace"]["dit"][("double_block", 0)]
+    wrapped(
+        args,
+        {"original_block": lambda call_args: {"img": call_args["img"]}},
+    )
+    return args
+
+
 def test_reviewed_untwist_wrapper_keeps_stable_backend_identity():
     model, _patch, bsa_override, options = _installation()
     first_options, first_outer = _with_untwist(options, bsa_override, progress=0.25)
@@ -230,13 +271,8 @@ def test_dense_actual_receipt_accepts_real_untwist_owner():
 
     prepared = {**options, RECEIPTS: []}
     prepared = core_bsa_compat.instrument_actual_options(prepared, audit, RECEIPTS)
-    args = _actual_args(prepared, layout)
-    wrapped = prepared["patches_replace"]["dit"][("double_block", 0)]
-    output = wrapped(
-        args,
-        {"original_block": lambda call_args: {"img": call_args["img"]}},
-    )
-    assert "img" in output
+    output_args = _run_prepared_dense_block(prepared, layout)
+    assert output_args["img"].shape[0] == layout.seq_len
     assert audit.failure is None
     assert core_bsa_compat.accepts_actual(audit, tuple(prepared[RECEIPTS]))
 
@@ -285,3 +321,41 @@ def test_untwist_introspection_oom_propagates(monkeypatch):
     monkeypatch.setattr(core_bsa_preprocess_compat, "_unwrap_reviewed_untwist", fail)
     with pytest.raises(torch.cuda.OutOfMemoryError):
         core_bsa_preprocess_compat.probe({}, None, None)
+
+
+def test_backend_prepare_observe_round_trip_accepts_untwist_bsa():
+    model, _patch, bsa_override, options = _installation(count=1)
+    options, _outer = _with_untwist(options, bsa_override)
+    layout = _layout()
+    runtime = _BackendRuntime()
+
+    prepared, pending = prepare(runtime, 7, 3, options, layout, model)
+    assert pending is not None
+    assert core_bsa_compat.PRIVATE_AUDIT_KEY in prepared
+    _run_prepared_dense_block(prepared, layout)
+    observe(runtime, 7, 3, prepared, pending)
+
+    assert runtime.observed is not None
+    assert runtime.observed[-1] is True
+    assert len(runtime.observed[-2]) == 1
+
+
+def test_backend_prepare_observe_round_trip_rejects_owner_change():
+    model, _patch, bsa_override, options = _installation(count=1)
+    options, _outer = _with_untwist(options, bsa_override)
+    layout = _layout()
+    runtime = _BackendRuntime()
+
+    prepared, pending = prepare(runtime, 7, 4, options, layout, model)
+    assert pending is not None
+    args = _actual_args(prepared, layout)
+    args["transformer_options"]["optimized_attention_override"] = object()
+    wrapped = prepared["patches_replace"]["dit"][("double_block", 0)]
+    wrapped(
+        args,
+        {"original_block": lambda call_args: {"img": call_args["img"]}},
+    )
+    observe(runtime, 7, 4, prepared, pending)
+
+    assert runtime.observed is not None
+    assert runtime.observed[-1] is False
