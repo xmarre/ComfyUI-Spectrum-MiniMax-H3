@@ -1,0 +1,329 @@
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from comfyui_spectrum_h3 import core_bsa_compat
+from comfyui_spectrum_h3.backend_history import POLICIES, RECEIPTS, preflight
+
+
+class _FakeAttention:
+    def __init__(self, heads=2):
+        self.heads = heads
+        self.head_dim = 128
+        self.qkv_proj = SimpleNamespace(
+            weight=torch.empty(1, dtype=torch.bfloat16, device="cpu")
+        )
+
+    def forward(self, x, rope_freqs=None, transformer_options={}):
+        return x
+
+
+class _FakeBlock:
+    def __init__(self):
+        self.attn = _FakeAttention()
+
+
+class _FakeModel:
+    def __init__(self, count=2):
+        self.blocks = [_FakeBlock() for _ in range(count)]
+        self.dtype = torch.bfloat16
+
+
+def _audited_nodes():
+    try:
+        import comfy_extras.nodes_sparse_attention as nodes
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"core BSA is unavailable in this reviewed ComfyUI fixture: {exc}")
+    if core_bsa_compat._module_blob_sha(nodes) not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS:
+        pytest.skip("this ComfyUI fixture is not the reviewed core BSA source")
+    return nodes
+
+
+def _layout(seq_len=128):
+    return SimpleNamespace(
+        seq_len=seq_len,
+        signature=(64, 1, 8, 8, 16),
+        segments=[
+            (0, 64, "text"),
+            (64, 96, "audio"),
+            (96, seq_len, "video"),
+        ],
+    )
+
+
+def _installation(*, count=2, previous=None, sigma=1.0, uuids=("positive",)):
+    nodes = _audited_nodes()
+    model = _FakeModel(count)
+    patch = nodes.SparseAttnPatch(
+        tau=1.0,
+        topk_ratio=0.0,
+        vsa=False,
+        sigma_start=0.8,
+        sigma_end=0.0,
+        min_tokens=1,
+        dense_blocks=set(),
+        sink_conditioning="exact_kv",
+        extra_tokens=0,
+        verbose=False,
+    )
+    override = nodes.make_attention_override(patch, previous)
+    patch.installed.add(override)
+    dit = {
+        ("double_block", index): nodes.make_h3_block_patch(block, index, patch)
+        for index, block in enumerate(model.blocks)
+    }
+    options = {
+        "callbacks": {"on_prepare_state": {"block_sparse_attention": []}},
+        "optimized_attention_override": override,
+        "patches_replace": {"dit": dit},
+        "sigmas": torch.tensor([sigma]),
+        "uuids": uuids,
+    }
+    return nodes, model, patch, options
+
+
+def _actual_args(options, layout, seq_len):
+    call_options = dict(options)
+    call_options["minimax_h3_layout"] = layout
+    return {
+        "img": torch.zeros(seq_len, 4, dtype=torch.bfloat16),
+        "rope_freqs": torch.zeros(seq_len, 1),
+        "transformer_options": call_options,
+    }
+
+
+def test_reviewed_core_bsa_dense_route_is_structurally_recognized():
+    _nodes, model, _patch, options = _installation(sigma=1.0)
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None
+    assert audit is not None
+    assert audit.safe
+    assert {spec[0] for spec in audit.route_specs} == {"h3_dense"}
+
+
+def test_explicit_provider_contract_keeps_precedence(monkeypatch):
+    class Provider:
+        def __call__(self, **_kwargs):
+            return ("explicit",)
+
+    def forbidden_probe(*_args, **_kwargs):
+        raise AssertionError("core BSA adapter must not run with an explicit provider")
+
+    monkeypatch.setattr(core_bsa_compat, "probe", forbidden_probe)
+    identity, safe = preflight({POLICIES: {"explicit": Provider()}}, None, None)
+    assert identity == (("explicit", ("explicit",)),)
+    assert safe
+
+
+def test_unreviewed_core_bsa_source_fails_closed(monkeypatch):
+    _nodes, model, _patch, options = _installation()
+    monkeypatch.setattr(core_bsa_compat, "_module_blob_sha", lambda _module: "unreviewed")
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert audit is None
+    assert reason == "source_unreviewed"
+    identity, safe = preflight(options, _layout(), model)
+    assert identity == ("core_bsa_unreported", "source_unreviewed")
+    assert not safe
+
+
+def test_missing_or_foreign_h3_replacement_fails_closed():
+    _nodes, model, _patch, options = _installation()
+    options["patches_replace"]["dit"][("double_block", 1)] = lambda args, extra: extra[
+        "original_block"
+    ](args)
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert audit is None
+    assert reason == "ownership_unproven"
+
+
+def test_stacked_bsa_ownership_fails_closed():
+    nodes, model, first_patch, first_options = _installation()
+    first_override = first_options["optimized_attention_override"]
+    second_patch = nodes.SparseAttnPatch(
+        tau=1.0,
+        topk_ratio=0.0,
+        vsa=False,
+        sigma_start=0.8,
+        sigma_end=0.0,
+        min_tokens=1,
+        dense_blocks=set(),
+        sink_conditioning="exact_kv",
+        extra_tokens=0,
+        verbose=False,
+    )
+    second_override = nodes.make_attention_override(second_patch, first_override)
+    second_patch.installed.add(second_override)
+    options = dict(first_options)
+    options["optimized_attention_override"] = second_override
+    options["patches_replace"] = {
+        "dit": {
+            ("double_block", index): nodes.make_h3_block_patch(
+                block, index, second_patch
+            )
+            for index, block in enumerate(model.blocks)
+        }
+    }
+    assert first_patch is not second_patch
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert audit is None
+    assert reason == "ownership_unproven"
+
+
+def test_inherited_attention_owner_change_changes_policy_identity():
+    nodes, model, patch, options = _installation(previous=lambda *args, **kwargs: None)
+    first, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and first is not None
+
+    replacement_previous = lambda *args, **kwargs: None
+    override = nodes.make_attention_override(patch, replacement_previous)
+    patch.installed.add(override)
+    options["optimized_attention_override"] = override
+    second, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and second is not None
+    assert first.identity != second.identity
+
+
+def test_dense_sparse_and_cold_primed_transitions_change_identity(monkeypatch):
+    _nodes, model, patch, options = _installation(sigma=1.0)
+    dense, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and dense is not None
+
+    monkeypatch.setattr(
+        core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True
+    )
+    options["sigmas"] = torch.tensor([0.5])
+    cold, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and cold is not None and cold.safe
+    assert {spec[0] for spec in cold.route_specs} == {"h3_chunked_sparse_cold"}
+
+    for index, block in enumerate(model.blocks):
+        shape = (block.attn.heads, block.attn.head_dim)
+        patch.pooled[(index, 128, ("positive",))] = (
+            torch.zeros(shape, dtype=torch.float32),
+            torch.zeros(shape, dtype=torch.float32),
+        )
+    primed, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and primed is not None and primed.safe
+    assert {spec[0] for spec in primed.route_specs} == {
+        "h3_chunked_sparse_primed"
+    }
+    assert dense.identity != cold.identity
+    assert cold.identity != primed.identity
+
+
+def test_layout_and_uuid_changes_change_policy_identity(monkeypatch):
+    monkeypatch.setattr(
+        core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True
+    )
+    _nodes, model, _patch, options = _installation(sigma=0.5)
+    first, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and first is not None
+
+    options["uuids"] = ("other",)
+    uuid_changed, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and uuid_changed is not None
+    assert first.identity != uuid_changed.identity
+
+    layout_changed = SimpleNamespace(
+        seq_len=192,
+        signature=(64, 1, 8, 16, 16),
+        segments=[
+            (0, 64, "text"),
+            (64, 96, "audio"),
+            (96, 192, "video"),
+        ],
+    )
+    layout_identity, reason = core_bsa_compat.probe(options, layout_changed, model)
+    assert reason is None and layout_identity is not None
+    assert uuid_changed.identity != layout_identity.identity
+
+
+def test_pool_transition_classifier_rejects_ambiguous_state():
+    patch = SimpleNamespace(pooled={})
+    key = (0, 128, ("positive",))
+    assert core_bsa_compat._classify_pool_transition(
+        core_bsa_compat._pool_entry(patch, key),
+        core_bsa_compat._pool_entry(patch, key),
+    ) == "h3_dense"
+
+    first = torch.zeros((2, 128), dtype=torch.float32)
+    second = torch.zeros((2, 128), dtype=torch.float32)
+    before = core_bsa_compat._pool_entry(patch, key)
+    patch.pooled[key] = (first, second)
+    after = core_bsa_compat._pool_entry(patch, key)
+    assert core_bsa_compat._classify_pool_transition(
+        before, after
+    ) == "h3_chunked_sparse_cold"
+
+    before = core_bsa_compat._pool_entry(patch, key)
+    first.copy_(torch.ones_like(first))
+    second.copy_(torch.ones_like(second))
+    after = core_bsa_compat._pool_entry(patch, key)
+    assert core_bsa_compat._classify_pool_transition(
+        before, after
+    ) == "h3_chunked_sparse_primed"
+
+    before = after
+    patch.pooled[key] = (
+        torch.zeros_like(first),
+        torch.zeros_like(second),
+    )
+    replacement = core_bsa_compat._pool_entry(patch, key)
+    assert core_bsa_compat._classify_pool_transition(before, replacement) == "unknown"
+
+
+def test_main_block_audit_does_not_count_unrelated_attention():
+    nodes, model, _patch, options = _installation(sigma=1.0, count=1)
+    layout = _layout()
+    audit, reason = core_bsa_compat.probe(options, layout, model)
+    assert reason is None and audit is not None
+
+    prepared = {**options, RECEIPTS: []}
+    prepared = core_bsa_compat.instrument_actual_options(prepared, audit, RECEIPTS)
+    receipts = prepared[RECEIPTS]
+
+    override = prepared["optimized_attention_override"]
+    q = torch.zeros(1, 4, 256, dtype=torch.bfloat16)
+    override(
+        lambda q, _k, _v, _heads, **_kwargs: q,
+        q,
+        q,
+        q,
+        2,
+        mask=torch.ones(1),
+        transformer_options={},
+    )
+    assert receipts == []
+
+    args = _actual_args(prepared, layout, 128)
+    wrapped = prepared["patches_replace"]["dit"][("double_block", 0)]
+    output = wrapped(args, {"original_block": lambda call_args: {"img": call_args["img"]}})
+    assert "img" in output
+    assert len(receipts) == 1
+    assert core_bsa_compat.accepts_actual(audit, tuple(receipts))
+
+
+def test_actual_route_mismatch_fails_receipt_acceptance(monkeypatch):
+    monkeypatch.setattr(
+        core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True
+    )
+    _nodes, model, _patch, options = _installation(sigma=0.5, count=1)
+    layout = _layout()
+    audit, reason = core_bsa_compat.probe(options, layout, model)
+    assert reason is None and audit is not None and audit.safe
+    assert audit.route_specs[0][0] == "h3_chunked_sparse_cold"
+
+    prepared = {**options, RECEIPTS: []}
+    prepared = core_bsa_compat.instrument_actual_options(prepared, audit, RECEIPTS)
+    args = _actual_args(prepared, layout, 128)
+    wrapped = prepared["patches_replace"]["dit"][("double_block", 0)]
+
+    # The fake H3 activation is on CPU, so the real reviewed BSA replacement
+    # declines its sparse producer. The Spectrum audit must observe dense rather
+    # than trusting the preflight prediction.
+    wrapped(args, {"original_block": lambda call_args: {"img": call_args["img"]}})
+    receipts = tuple(prepared[RECEIPTS])
+    assert receipts[0][4] == "h3_dense"
+    assert audit.failure == "actual_route_mismatch"
+    assert not core_bsa_compat.accepts_actual(audit, receipts)
