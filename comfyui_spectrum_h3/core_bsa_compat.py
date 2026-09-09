@@ -554,18 +554,7 @@ def _pool_entry(
             for value in entry
         ):
             return ("invalid",)
-    try:
-        return (
-            "present",
-            entry[0],
-            entry[1],
-            int(entry[0]._version),
-            int(entry[1]._version),
-        )
-    except torch.cuda.OutOfMemoryError:
-        raise
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        return ("invalid",)
+    return ("present", entry[0], entry[1])
 
 
 def _pool_ownership_identity(
@@ -593,26 +582,23 @@ def _pool_ownership_identity(
     return tuple(ownership)
 
 
-def _classify_pool_transition(before: tuple[Any, ...], after: tuple[Any, ...]) -> str:
+def _classify_pool_transition(
+    before: tuple[Any, ...],
+    after: tuple[Any, ...],
+    *,
+    sparse_selected: bool,
+) -> str:
     if before[0] == "missing":
-        if after[0] == "missing":
-            return "h3_dense"
-        if after[0] == "present":
+        if sparse_selected and after[0] == "present":
             return "h3_chunked_sparse_cold"
+        if not sparse_selected and after[0] == "missing":
+            return "h3_dense"
         return "unknown"
-    if before[0] != "present":
-        return "unknown"
-    if after[0] != "present":
+    if before[0] != "present" or after[0] != "present":
         return "unknown"
     if before[1] is not after[1] or before[2] is not after[2]:
         return "unknown"
-    before_versions = before[3:5]
-    after_versions = after[3:5]
-    if after_versions == before_versions:
-        return "h3_dense"
-    if all(after_value > before_value for before_value, after_value in zip(before_versions, after_versions)):
-        return "h3_chunked_sparse_primed"
-    return "unknown"
+    return "h3_chunked_sparse_primed" if sparse_selected else "h3_dense"
 
 
 def _route_specs(
@@ -833,6 +819,12 @@ def _make_actual_wrapper(
     receipts: list[Any],
 ):
     key = (index, audit.seq_len, audit.uuids)
+    replacement_closure = _closure_values(replacement)
+    expected_attention = (
+        replacement_closure.get("attention")
+        if replacement_closure is not None
+        else None
+    )
 
     def audited_replacement(args, replacement_context):
         try:
@@ -850,13 +842,32 @@ def _make_actual_wrapper(
             before = ("invalid",)
             metadata_ok = False
 
-        # Preserve execution semantics: only audit code is fail-soft. Exceptions
-        # from the real block replacement must propagate unchanged.
-        output = replacement(args, replacement_context)
+        sparse_selected = False
+        original_block_calls = 0
+        original_block = replacement_context.get("original_block")
+        if expected_attention is None or not callable(original_block):
+            metadata_ok = False
+            output = replacement(args, replacement_context)
+        else:
+            def audited_original_block(call_args):
+                nonlocal sparse_selected, original_block_calls
+                original_block_calls += 1
+                sparse_selected = call_args.get("attention") is expected_attention
+                return original_block(call_args)
+
+            observed_context = dict(replacement_context)
+            observed_context["original_block"] = audited_original_block
+            output = replacement(args, observed_context)
+            if original_block_calls != 1:
+                metadata_ok = False
 
         try:
             after = _pool_entry(audit.patch, key, audit.pool_specs[index])
-            observed = _classify_pool_transition(before, after)
+            observed = _classify_pool_transition(
+                before,
+                after,
+                sparse_selected=sparse_selected,
+            )
             expected_route, expected_sink, expected_sink_q = audit.route_specs[index]
             if not metadata_ok or observed != expected_route:
                 audit.failure = "actual_route_mismatch"
