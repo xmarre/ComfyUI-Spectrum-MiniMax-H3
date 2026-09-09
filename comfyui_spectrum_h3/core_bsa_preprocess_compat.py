@@ -1,118 +1,136 @@
-"""Bridge composable attention preprocessors around reviewed core BSA.
+"""Bridge the reviewed Untwist attention preprocessor around core H3 BSA.
 
-Core MiniMax-H3 BSA owns the block replacements, but model-function wrappers may
-legitimately place an ``attention_preprocess_v1`` provider above BSA at call time.
-The outer provider can be recreated for every model call, so object identity is
-not a stable numerical identity. This module unwraps only the explicit generic
-preprocess contract, asks the source-gated core-BSA auditor to prove the actual
-BSA owner, then restores the real call-time provider for actual-call validation.
-Unknown wrappers still fail closed.
+Untwist v0.2.4 deliberately composes with an existing MiniMax-H3 attention
+provider through ``attention_preprocess_v1``. In the production stack this puts
+Untwist above core BlockSparseAttention at model-call time while BSA still owns
+the H3 block replacements. The core-BSA auditor therefore cannot require BSA to
+remain the top-level ``optimized_attention_override``.
+
+This module does not accept arbitrary preprocess contracts. It recognizes only
+the reviewed Untwist source and requires Untwist's Spectrum runtime descriptor,
+then temporarily exposes the underlying BSA override to the existing exact
+source/closure audit. Unknown preprocessors remain actual-only.
 """
 from __future__ import annotations
 
-import hashlib
-import marshal
-import math
-import types
+import importlib
 from typing import Any
 
 from . import core_bsa_compat
 
+AUDITED_UNTWIST_GIT_BLOBS = frozenset(
+    {"49a6eeda841a9dffe52974dceb3bce78bf02f25d"}
+)
+_UNTWIST_MODULE = "flux_untwist.patches"
+_UNTWIST_FACTORY = "make_minimax_h3_attention_override"
+_UNTWIST_PREPROCESS_QUALNAME = (
+    "make_minimax_h3_attention_override.<locals>.preprocess"
+)
+_UNTWIST_PROVIDER = "comfyui-flux2-untwisting-rope"
+_UNTWIST_RUNTIME_KEY = "spectrum_h3_visual_reference_patch_runtime"
+_UNTWIST_CONFIG_KEY = "minimax_h3_untwist_rope"
 _MISSING = object()
-_UNPROVEN = object()
 
 
-def _freeze_contract_value(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, bool)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else _UNPROVEN
-    if isinstance(value, (tuple, list)):
-        frozen = tuple(_freeze_contract_value(item) for item in value)
-        return _UNPROVEN if any(item is _UNPROVEN for item in frozen) else frozen
-    if isinstance(value, dict):
-        items = []
-        for key, item in value.items():
-            frozen_key = _freeze_contract_value(key)
-            frozen_item = _freeze_contract_value(item)
-            if frozen_key is _UNPROVEN or frozen_item is _UNPROVEN:
-                return _UNPROVEN
-            items.append((frozen_key, frozen_item))
-        return tuple(sorted(items, key=repr))
-    return _UNPROVEN
-
-
-def _stable_callable_semantics(function: Any) -> tuple[Any, ...] | None:
-    """Describe recreated contract transforms by code semantics, not object id."""
-    base = getattr(function, "__func__", function)
-    code = getattr(base, "__code__", None)
-    if not isinstance(code, types.CodeType):
+def _audited_untwist_preprocess(transform: Any) -> tuple[Any, ...] | None:
+    """Return a stable identity only for the exact reviewed Untwist preprocessor."""
+    base = getattr(transform, "__func__", transform)
+    if (
+        getattr(base, "__module__", None) != _UNTWIST_MODULE
+        or getattr(base, "__qualname__", None) != _UNTWIST_PREPROCESS_QUALNAME
+    ):
+        return None
+    try:
+        module = importlib.import_module(_UNTWIST_MODULE)
+    except Exception:  # noqa: BLE001 - optional external provider stays fail-closed
+        return None
+    blob = core_bsa_compat._module_blob_sha(module)
+    if blob not in AUDITED_UNTWIST_GIT_BLOBS:
+        return None
+    factory = getattr(module, _UNTWIST_FACTORY, None)
+    expected_code = core_bsa_compat._nested_code(factory, "preprocess")
+    if expected_code is None or getattr(base, "__code__", None) is not expected_code:
         return None
     closure = core_bsa_compat._closure_values(base)
-    if closure is None:
+    if closure != {}:
         return None
-    frozen_closure = []
-    for name in code.co_freevars:
-        value = closure.get(name, _MISSING)
-        if value is _MISSING:
+    return ("untwist_h3_attention_preprocess_v1", blob)
+
+
+def _untwist_runtime_identity(options: dict[str, Any]) -> tuple[Any, ...] | None:
+    """Require the runtime descriptor Spectrum already uses to track Untwist."""
+    raw = options.get(_UNTWIST_RUNTIME_KEY)
+    if not isinstance(raw, (tuple, list)):
+        return None
+    active = []
+    for value in raw:
+        if not isinstance(value, dict) or value.get("provider") != _UNTWIST_PROVIDER:
+            continue
+        if value.get("active") is not True:
+            continue
+        schema = value.get("schema_version")
+        instance_id = value.get("instance_id")
+        progress = value.get("schedule_progress")
+        if (
+            isinstance(schema, bool)
+            or not isinstance(schema, int)
+            or schema not in {1, 2}
+            or not isinstance(instance_id, str)
+            or not instance_id
+            or isinstance(progress, bool)
+            or not isinstance(progress, (int, float))
+            or not 0.0 <= float(progress) <= 1.0
+        ):
             return None
-        frozen = _freeze_contract_value(value)
-        if frozen is _UNPROVEN:
-            return None
-        frozen_closure.append((name, frozen))
+        active.append((schema, instance_id))
+    if len(active) != 1:
+        return None
 
-    # marshal captures constants/nested code as well as bytecode. History is
-    # process-local, so cross-Python-version serialization stability is irrelevant.
-    digest = hashlib.sha256(marshal.dumps(code)).hexdigest()
-    return (
-        str(getattr(base, "__module__", type(base).__module__)),
-        str(getattr(base, "__qualname__", type(base).__qualname__)),
-        digest,
-        tuple(frozen_closure),
-    )
+    cfg = options.get(_UNTWIST_CONFIG_KEY)
+    if not isinstance(cfg, dict) or cfg.get("enabled") is not True:
+        return None
+    # Progress-dependent scaling is already represented by Spectrum's dedicated
+    # external-patch runtime contract. Keeping only the stable instance here avoids
+    # turning every smooth schedule point into a backend-history discontinuity.
+    return (_UNTWIST_PROVIDER, active[0][0], active[0][1])
 
 
-def _unwrap_preprocess_chain(options: dict[str, Any]) -> tuple[Any, tuple[Any, ...], str | None]:
+def _unwrap_reviewed_untwist(
+    options: dict[str, Any],
+) -> tuple[Any | None, tuple[Any, ...] | None, str | None]:
     current = options.get("optimized_attention_override")
-    transforms = []
-    seen = set()
-
-    while not core_bsa_compat._looks_like_core_bsa_callable(
+    if core_bsa_compat._looks_like_core_bsa_callable(
         current, "make_attention_override", "override"
     ):
-        if current is None:
-            return None, (), "bsa_override_not_found"
-        object_id = id(current)
-        if object_id in seen:
-            return None, (), "outer_preprocess_cycle"
-        seen.add(object_id)
+        return current, None, None
+    if current is None:
+        return None, None, "ownership_unproven"
 
-        contract = getattr(current, "attention_preprocess_v1", _MISSING)
-        if contract is _MISSING:
-            return None, (), "outer_attention_uncontracted"
-        if not isinstance(contract, tuple) or len(contract) != 2:
-            return None, (), "outer_preprocess_contract_invalid"
-        transform, previous = contract
-        transform_identity = _stable_callable_semantics(transform)
-        if transform_identity is None:
-            return None, (), "outer_preprocess_identity_unproven"
-        transforms.append(transform_identity)
-        current = previous
-
-    return current, tuple(transforms), None
+    contract = getattr(current, "attention_preprocess_v1", _MISSING)
+    if not isinstance(contract, tuple) or len(contract) != 2:
+        return None, None, "ownership_unproven"
+    transform, previous = contract
+    preprocess_identity = _audited_untwist_preprocess(transform)
+    if preprocess_identity is None:
+        return None, None, "untwist_preprocess_unreviewed"
+    runtime_identity = _untwist_runtime_identity(options)
+    if runtime_identity is None:
+        return None, None, "untwist_runtime_unproven"
+    if not core_bsa_compat._looks_like_core_bsa_callable(
+        previous, "make_attention_override", "override"
+    ):
+        return None, None, "ownership_unproven"
+    return previous, (preprocess_identity, runtime_identity), None
 
 
 def probe(options: dict[str, Any], layout: Any, model: Any):
-    """Probe core BSA through explicit outer ``attention_preprocess_v1`` layers."""
+    """Prove core BSA ownership through one reviewed active Untwist wrapper."""
     real_override = options.get("optimized_attention_override")
-    if core_bsa_compat._looks_like_core_bsa_callable(
-        real_override, "make_attention_override", "override"
-    ):
-        return core_bsa_compat.probe(options, layout, model)
-
-    bsa_override, preprocess_identity, reason = _unwrap_preprocess_chain(options)
+    bsa_override, preprocess_identity, reason = _unwrap_reviewed_untwist(options)
     if bsa_override is None:
         return None, reason
+    if preprocess_identity is None:
+        return core_bsa_compat.probe(options, layout, model)
 
     normalized = dict(options)
     normalized["optimized_attention_override"] = bsa_override
@@ -120,10 +138,10 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
     if audit is None:
         return None, reason
 
-    # The underlying BSA ownership was proven against the reviewed source. Add
-    # the semantic preprocess chain to history without using the recreated outer
-    # wrapper's address, then validate the exact real wrapper during this actual
-    # call so a mid-forward provider swap still fails closed.
+    # The underlying BSA source, block replacements, patch owner and route are now
+    # proven by the existing auditor. Add only the stable reviewed Untwist owner to
+    # backend history, then restore the actual call-time provider so every actual
+    # block receipt still fails closed if ownership changes during the forward.
     audit.identity = (*audit.identity, ("outer_preprocess", preprocess_identity))
     audit.current_override = real_override
     return audit, None
