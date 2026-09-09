@@ -40,6 +40,7 @@ jobs:
             python_version: "3.12"
             comfy_kitchen_version: "0.2.33"
             comfy_aimdo_version: "0.5.3"
+            fixture_required: true
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
@@ -192,6 +193,7 @@ jobs:
         env:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
           PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE
+          SPECTRUM_REQUIRE_REVIEWED_BSA_FIXTURE: ${{ matrix.fixture_required && '1' || '0' }}
         run: |
           python -m pytest -q \
             --ignore=tests/test_external_patch_compat.py \
