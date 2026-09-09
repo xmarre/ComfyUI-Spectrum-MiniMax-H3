@@ -153,6 +153,86 @@ def _unwrap_reviewed_untwist(
     return previous, (preprocess_identity, runtime_identity), None
 
 
+def _stabilize_flow_audit_identity(audit: Any) -> bool:
+    """Remove per-call object generations from reviewed dynamic Flow wrappers.
+
+    Mixed-Grid creates fresh wrapper functions, layout objects and plan objects on
+    each actual model invocation. Those addresses/generations prove the current
+    call's ownership but are not numerical backend semantics. Retaining them in
+    backend history would force a reset on every model call and suppress every
+    forecast. Exact source/code/closure proof remains in ``flow_wrapper_specs``
+    for the immediate receipt instrumentation; the retained policy uses only the
+    reviewed source, wrapper role/layer and structural carrier/mixed layouts.
+    """
+    raw = getattr(audit, "flow_identity", None)
+    if raw is None:
+        return True
+    if not isinstance(raw, tuple) or len(raw) != 5:
+        return False
+    if raw[0] != "reviewed_flow_h3_wrapper_chain_v1":
+        return False
+    mode, wrapper_specs, carrier_entry, mixed_entry = raw[1:]
+    if not isinstance(wrapper_specs, tuple):
+        return False
+
+    stable_blocks = []
+    for block in wrapper_specs:
+        if not isinstance(block, tuple):
+            return False
+        stable_chain = []
+        for item in block:
+            if not isinstance(item, tuple) or not item:
+                return False
+            if item[0] == "flow_layout_wrapper" and len(item) == 6:
+                stable_chain.append(item[:4])
+            elif item[0] == "flow_mixed_grid_wrapper" and len(item) == 8:
+                stable_chain.append((item[0], item[1], item[2], item[6], item[7]))
+            else:
+                return False
+        stable_blocks.append(tuple(stable_chain))
+
+    if (
+        not isinstance(carrier_entry, tuple)
+        or len(carrier_entry) != 2
+        or carrier_entry[0] != "carrier_layout"
+        or not isinstance(mixed_entry, tuple)
+        or len(mixed_entry) != 2
+        or mixed_entry[0] != "mixed_layout"
+    ):
+        return False
+    if mixed_entry[1] is None:
+        stable_mixed = mixed_entry
+    else:
+        payload = mixed_entry[1]
+        if not isinstance(payload, tuple) or len(payload) != 3:
+            return False
+        stable_mixed = ("mixed_layout", payload[2])
+
+    stable = (
+        raw[0],
+        mode,
+        tuple(stable_blocks),
+        carrier_entry,
+        stable_mixed,
+    )
+    expected_tail = ("outer_block_wrappers", raw)
+    identity = getattr(audit, "identity", None)
+    if not isinstance(identity, tuple) or not identity or identity[-1] != expected_tail:
+        return False
+    audit.identity = (*identity[:-1], ("outer_block_wrappers", stable))
+    audit.flow_identity = stable
+    return True
+
+
+def _probe_flow(options: dict[str, Any], layout: Any, model: Any):
+    audit, reason = core_bsa_flow_compat.probe(options, layout, model)
+    if audit is None:
+        return None, reason
+    if not _stabilize_flow_audit_identity(audit):
+        return None, "flow_identity_unproven"
+    return audit, None
+
+
 def probe(options: dict[str, Any], layout: Any, model: Any):
     """Prove core BSA through reviewed Untwist and Flow composition."""
     try:
@@ -165,11 +245,11 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
     if bsa_override is None:
         return None, reason
     if preprocess_identity is None:
-        return core_bsa_flow_compat.probe(options, layout, model)
+        return _probe_flow(options, layout, model)
 
     normalized = dict(options)
     normalized["optimized_attention_override"] = bsa_override
-    audit, reason = core_bsa_flow_compat.probe(normalized, layout, model)
+    audit, reason = _probe_flow(normalized, layout, model)
     if audit is None:
         return None, reason
 
