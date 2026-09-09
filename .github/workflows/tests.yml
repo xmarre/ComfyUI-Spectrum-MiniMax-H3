@@ -36,6 +36,11 @@ jobs:
             python_version: "3.12"
             comfy_kitchen_version: "0.2.33"
             comfy_aimdo_version: "0.5.2"
+          - comfy_ref: be92396834f9b6e3e361cfe30e7eed693137a448
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.33"
+            comfy_aimdo_version: "0.5.3"
+            fixture_required: true
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
@@ -58,6 +63,14 @@ jobs:
           repository: xmarre/ComfyUI-MiniMax-H3-RefDelta-Solver
           ref: 21d0191d933fedf2885df082d33eb1bc2fffd529
           path: RefDeltaSolver
+
+      - name: Check out reviewed Untwist interop
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/ComfyUI-Untwisting-RoPE
+          ref: 63c8d8df5e08dfdad4b397480d966b90f9b5a6c6
+          path: UntwistRoPE
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -96,6 +109,8 @@ jobs:
             --ignore I001,UP037
           python -m ruff check \
             comfyui_spectrum_h3/backend_history.py \
+            comfyui_spectrum_h3/core_bsa_compat.py \
+            comfyui_spectrum_h3/core_bsa_preprocess_compat.py \
             comfyui_spectrum_h3/comfy_compiler_compat.py \
             comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/generic_correction.py \
@@ -120,6 +135,8 @@ jobs:
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
             tests/test_backend_history.py \
+            tests/test_core_bsa_compat.py \
+            tests/test_core_bsa_preprocess_compat.py \
             tests/test_comfy_compiler_compat.py \
             tests/test_config.py \
             tests/test_continuum_interop.py \
@@ -155,7 +172,7 @@ jobs:
       - name: Run focused external compatibility suites
         env:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
-          PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver
+          PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE
         run: |
           python -m pytest -q \
             tests/test_external_patch_compat.py \
@@ -175,7 +192,8 @@ jobs:
       - name: Run tests against native MiniMax H3
         env:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
-          PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver
+          PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE
+          SPECTRUM_REQUIRE_REVIEWED_BSA_FIXTURE: ${{ matrix.fixture_required && '1' || '0' }}
         run: |
           python -m pytest -q \
             --ignore=tests/test_external_patch_compat.py \
