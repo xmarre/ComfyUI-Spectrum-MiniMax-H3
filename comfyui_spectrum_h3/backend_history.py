@@ -59,26 +59,38 @@ def _runtime_has_backend_evidence(runtime) -> bool:
     return runtime._offline_smoother is not None
 
 
-def preflight(options, layout, model):
+def _preflight(options, layout, model):
     policies = options.get(POLICIES, {})
-    if not policies:
-        # Core BSA predates the provider contract. Preserve its operator while
-        # requiring actual execution; never forecast across its unreported schedule.
-        callbacks = options.get("callbacks", {})
-        if any("block_sparse_attention" in group for group in callbacks.values()):
-            return ("core_bsa_unreported",), False
-        return None, True
-    identities = []
-    safe = True
-    for name, provider in sorted(policies.items()):
-        identity = _provider_identity(provider, layout=layout, options=options, model=model)
-        safe = safe and identity is not None
-        identities.append((name, identity))
-    return tuple(identities), safe
+    if policies:
+        identities = []
+        safe = True
+        for name, provider in sorted(policies.items()):
+            identity = _provider_identity(provider, layout=layout, options=options, model=model)
+            safe = safe and identity is not None
+            identities.append((name, identity))
+        return tuple(identities), safe, None
+
+    # Core ComfyUI BSA does not publish the generic provider contract. Spectrum
+    # owns a narrowly version-gated compatibility audit for the exact reviewed
+    # implementation; any unknown source/ownership remains actual-only.
+    from . import core_bsa_compat
+
+    if core_bsa_compat.has_core_bsa_callback(options):
+        audit, reason = core_bsa_compat.probe(options, layout, model)
+        if audit is not None:
+            return audit.identity, audit.safe, audit
+        return ("core_bsa_unreported", reason or "unrecognized"), False, None
+
+    return None, True, None
+
+
+def preflight(options, layout, model):
+    identity, safe, _audit = _preflight(options, layout, model)
+    return identity, safe
 
 
 def prepare(runtime, run_id, step_id, options, layout, model):
-    identity, safe = preflight(options, layout, model)
+    identity, safe, audit = _preflight(options, layout, model)
     if identity is None:
         if runtime._backend_history.policy is None:
             return options, None
@@ -90,7 +102,13 @@ def prepare(runtime, run_id, step_id, options, layout, model):
     if runtime._backend_history.policy is None and not _runtime_has_backend_evidence(runtime):
         runtime._backend_history = BackendHistory(policy=identity)
     runtime.prepare_backend_history(run_id, step_id, identity, safe)
-    return {**options, RECEIPTS: []}, (identity, safe)
+
+    prepared = {**options, RECEIPTS: []}
+    if audit is not None:
+        from . import core_bsa_compat
+
+        prepared = core_bsa_compat.instrument_actual_options(prepared, audit, RECEIPTS)
+    return prepared, (identity, safe)
 
 
 def observe(runtime, run_id, step_id, options, policy):
@@ -98,11 +116,18 @@ def observe(runtime, run_id, step_id, options, policy):
         return
     identity, safe = policy
     receipts = tuple(options.get(RECEIPTS, ()))
-    # A fallback is not proof that the next call follows the same route. Until a
-    # provider can predict it, execute actuals and re-enable forecasts after SOL
-    # eligibility returns. Stable dense warmup is predictable through its policy.
-    safe = safe and bool(receipts) and all(
-        _provider_accepts(provider, receipts)
-        for provider in options.get(POLICIES, {}).values()
-    )
+
+    from . import core_bsa_compat
+
+    audit = options.get(core_bsa_compat.PRIVATE_AUDIT_KEY)
+    if audit is not None:
+        safe = safe and core_bsa_compat.accepts_actual(audit, receipts)
+    else:
+        # A fallback is not proof that the next call follows the same route. Until
+        # a provider can predict it, execute actuals and re-enable forecasts after
+        # the provider reports a stable route.
+        safe = safe and bool(receipts) and all(
+            _provider_accepts(provider, receipts)
+            for provider in options.get(POLICIES, {}).values()
+        )
     runtime.observe_backend_history(run_id, step_id, identity, receipts, safe)

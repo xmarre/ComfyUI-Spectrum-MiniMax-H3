@@ -36,6 +36,10 @@ jobs:
             python_version: "3.12"
             comfy_kitchen_version: "0.2.33"
             comfy_aimdo_version: "0.5.2"
+          - comfy_ref: be92396834f9b6e3e361cfe30e7eed693137a448
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.33"
+            comfy_aimdo_version: "0.5.3"
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
@@ -96,6 +100,7 @@ jobs:
             --ignore I001,UP037
           python -m ruff check \
             comfyui_spectrum_h3/backend_history.py \
+            comfyui_spectrum_h3/core_bsa_compat.py \
             comfyui_spectrum_h3/comfy_compiler_compat.py \
             comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/generic_correction.py \
@@ -120,6 +125,7 @@ jobs:
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
             tests/test_backend_history.py \
+            tests/test_core_bsa_compat.py \
             tests/test_comfy_compiler_compat.py \
             tests/test_config.py \
             tests/test_continuum_interop.py \
