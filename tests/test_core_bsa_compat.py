@@ -326,6 +326,7 @@ def test_pool_transition_classifier_rejects_ambiguous_state():
     assert core_bsa_compat._classify_pool_transition(
         core_bsa_compat._pool_entry(patch, key),
         core_bsa_compat._pool_entry(patch, key),
+        sparse_selected=False,
     ) == "h3_dense"
 
     first = torch.zeros((2, 128), dtype=torch.float32)
@@ -334,7 +335,7 @@ def test_pool_transition_classifier_rejects_ambiguous_state():
     patch.pooled[key] = (first, second)
     after = core_bsa_compat._pool_entry(patch, key)
     assert core_bsa_compat._classify_pool_transition(
-        before, after
+        before, after, sparse_selected=True
     ) == "h3_chunked_sparse_cold"
 
     before = core_bsa_compat._pool_entry(patch, key)
@@ -342,8 +343,11 @@ def test_pool_transition_classifier_rejects_ambiguous_state():
     second.copy_(torch.ones_like(second))
     after = core_bsa_compat._pool_entry(patch, key)
     assert core_bsa_compat._classify_pool_transition(
-        before, after
+        before, after, sparse_selected=True
     ) == "h3_chunked_sparse_primed"
+    assert core_bsa_compat._classify_pool_transition(
+        before, after, sparse_selected=False
+    ) == "h3_dense"
 
     before = after
     patch.pooled[key] = (
@@ -351,7 +355,71 @@ def test_pool_transition_classifier_rejects_ambiguous_state():
         torch.zeros_like(second),
     )
     replacement = core_bsa_compat._pool_entry(patch, key)
-    assert core_bsa_compat._classify_pool_transition(before, replacement) == "unknown"
+    assert core_bsa_compat._classify_pool_transition(
+        before, replacement, sparse_selected=True
+    ) == "unknown"
+
+
+def test_pool_entry_accepts_inference_mode_tensors():
+    key = (0, 128, ("positive",))
+    with torch.inference_mode():
+        first = torch.zeros((2, 128), dtype=torch.float32)
+        second = torch.zeros((2, 128), dtype=torch.float32)
+    patch = SimpleNamespace(pooled={key: (first, second)})
+
+    with pytest.raises(RuntimeError, match="version counter"):
+        _ = first._version
+
+    state = core_bsa_compat._pool_entry(patch, key, (2, 128, None))
+    assert state[0] == "present"
+    assert state[1] is first
+    assert state[2] is second
+
+
+def test_actual_wrapper_observes_sparse_selection_without_version_counter(monkeypatch):
+    key = (0, 128, ("positive",))
+    with torch.inference_mode():
+        first = torch.zeros((2, 128), dtype=torch.float32)
+        second = torch.zeros((2, 128), dtype=torch.float32)
+    patch = SimpleNamespace(pooled={key: (first, second)})
+
+    def attention(*_args, **_kwargs):
+        return None
+
+    def replacement(args, extra):
+        return extra["original_block"]({**args, "attention": attention})
+
+    audit = SimpleNamespace(
+        seq_len=128,
+        uuids=("positive",),
+        patch=patch,
+        pool_specs=((2, 128, None),),
+        route_specs=(("h3_chunked_sparse_primed", (0, 0), (0, 0)),),
+        patch_generation=11,
+        failure=None,
+    )
+    monkeypatch.setattr(core_bsa_compat, "_current_route_matches", lambda *_args: True)
+    receipts = []
+    wrapped = core_bsa_compat._make_actual_wrapper(audit, 0, replacement, receipts)
+    output = wrapped(
+        {"img": torch.zeros(128, 4)},
+        {"original_block": lambda call_args: {"img": call_args["img"]}},
+    )
+
+    assert "img" in output
+    assert audit.failure is None
+    assert receipts == [
+        (
+            core_bsa_compat.ADAPTER_KEY,
+            core_bsa_compat.ADAPTER_VERSION,
+            11,
+            0,
+            "h3_chunked_sparse_primed",
+            128,
+            (0, 0),
+            (0, 0),
+        )
+    ]
 
 
 def test_main_block_audit_does_not_count_unrelated_attention():
