@@ -11,10 +11,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
 import importlib
+import itertools
 import math
 from pathlib import Path
+import threading
 import types
 from typing import Any
+import weakref
 
 import torch
 
@@ -30,6 +33,51 @@ AUDITED_BSA_GIT_BLOBS = frozenset(
 )
 
 _MISSING = object()
+_IDENTITY_LOCK = threading.Lock()
+_IDENTITY_COUNTER = itertools.count(1)
+_IDENTITY_REGISTRY: dict[int, tuple[weakref.ReferenceType[Any] | None, int, Any | None]] = {}
+
+
+def _release_lifetime_generation(
+    object_id: int,
+    generation: int,
+    reference: weakref.ReferenceType[Any],
+) -> None:
+    with _IDENTITY_LOCK:
+        current = _IDENTITY_REGISTRY.get(object_id)
+        if current is not None and current[0] is reference and current[1] == generation:
+            _IDENTITY_REGISTRY.pop(object_id, None)
+
+
+def _lifetime_generation(value: Any) -> int:
+    """Return a process-lifetime generation immune to CPython address reuse."""
+    if value is None:
+        return 0
+    object_id = id(value)
+    with _IDENTITY_LOCK:
+        current = _IDENTITY_REGISTRY.get(object_id)
+        if current is not None:
+            reference, generation, strong = current
+            owner = strong if reference is None else reference()
+            if owner is value:
+                return generation
+            if owner is None:
+                _IDENTITY_REGISTRY.pop(object_id, None)
+
+        generation = next(_IDENTITY_COUNTER)
+
+        def cleanup(reference, *, object_id=object_id, generation=generation):
+            _release_lifetime_generation(object_id, generation, reference)
+
+        try:
+            reference = weakref.ref(value, cleanup)
+        except TypeError:
+            # Rare non-weakrefable callable owners are kept alive rather than
+            # allowing their address to be recycled into backend history.
+            _IDENTITY_REGISTRY[object_id] = (None, generation, value)
+        else:
+            _IDENTITY_REGISTRY[object_id] = (reference, generation, None)
+        return generation
 
 
 @dataclass
@@ -37,6 +85,7 @@ class CoreBSAAudit:
     identity: tuple[Any, ...]
     safe: bool
     patch: Any
+    patch_generation: int
     block_count: int
     seq_len: int
     uuids: tuple[Any, ...]
@@ -185,7 +234,7 @@ def _callable_identity(function: Any) -> tuple[Any, ...]:
     return (
         str(getattr(base, "__module__", type(base).__module__)),
         str(getattr(base, "__qualname__", type(base).__qualname__)),
-        id(base),
+        _lifetime_generation(base),
     )
 
 
@@ -195,7 +244,7 @@ def _attention_owner_identity(provider: Any) -> tuple[Any, ...]:
     current = provider
     while current is not None and hasattr(current, "attention_preprocess_v1"):
         if id(current) in seen:
-            return ("cyclic_preprocess", id(current))
+            return ("cyclic_preprocess", _lifetime_generation(current))
         seen.add(id(current))
         contract = current.attention_preprocess_v1
         if not isinstance(contract, tuple) or len(contract) != 2:
@@ -533,8 +582,8 @@ def _pool_ownership_identity(
             ownership.append(
                 (
                     index,
-                    id(state[1]),
-                    id(state[2]),
+                    _lifetime_generation(state[1]),
+                    _lifetime_generation(state[2]),
                     str(state[1].device),
                     str(state[2].device),
                 )
@@ -627,6 +676,7 @@ def probe(
         if ownership is None:
             return None, "ownership_unproven"
         patch, ownership_identity = ownership
+        patch_generation = _lifetime_generation(patch)
 
         normalized_layout = _normalize_layout(layout)
         if normalized_layout is None:
@@ -679,7 +729,7 @@ def probe(
             (
                 ADAPTER_KEY,
                 ADAPTER_VERSION,
-                id(patch),
+                patch_generation,
                 index,
                 route,
                 seq_len,
@@ -693,7 +743,7 @@ def probe(
             ADAPTER_KEY,
             ADAPTER_VERSION,
             source_blob,
-            id(patch),
+            patch_generation,
             ("mode", mode),
             ("settings", settings_identity),
             ("layout", layout_identity),
@@ -707,6 +757,7 @@ def probe(
             identity=identity,
             safe=bool(safe),
             patch=patch,
+            patch_generation=patch_generation,
             block_count=len(model.blocks),
             seq_len=seq_len,
             uuids=uuids,
@@ -812,7 +863,7 @@ def _make_actual_wrapper(
             receipt = (
                 ADAPTER_KEY,
                 ADAPTER_VERSION,
-                id(audit.patch),
+                audit.patch_generation,
                 index,
                 observed,
                 audit.seq_len,
@@ -873,7 +924,7 @@ def accepts_actual(audit: CoreBSAAudit, receipts: tuple[Any, ...]) -> bool:
             return False
         if receipt[0] != ADAPTER_KEY or receipt[1] != ADAPTER_VERSION:
             return False
-        if receipt[2] != id(audit.patch):
+        if receipt[2] != audit.patch_generation:
             return False
         block = receipt[3]
         if type(block) is not int or block < 0 or block >= audit.block_count or block in seen:
