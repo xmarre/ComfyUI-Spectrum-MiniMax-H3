@@ -74,13 +74,12 @@ def _preflight(options, layout, model):
         return tuple(identities), safe, None
 
     # Core ComfyUI BSA does not publish the generic provider contract. Spectrum
-    # owns a narrowly version-gated compatibility audit for the exact reviewed
-    # implementation; any unknown source/ownership remains actual-only. Explicit
-    # attention_preprocess_v1 wrappers are unwrapped only long enough to prove the
-    # underlying BSA owner, then restored for real call-time validation.
-    from . import core_bsa_compat, core_bsa_preprocess_compat
+    # owns narrowly source-gated compatibility audits for the exact reviewed BSA,
+    # Untwist preprocessor and Flow block-wrapper composition. Any unknown source
+    # or ownership remains actual-only.
+    from . import core_bsa_flow_compat, core_bsa_preprocess_compat
 
-    if core_bsa_compat.has_core_bsa_evidence(options):
+    if core_bsa_flow_compat.has_core_bsa_evidence(options):
         audit, reason = core_bsa_preprocess_compat.probe(options, layout, model)
         if audit is not None:
             return audit.identity, audit.safe, audit
@@ -99,14 +98,16 @@ def _debug_core_bsa_preflight(runtime, run_id, step_id, identity, safe, audit):
         return
     if audit is not None:
         routes = ",".join(str(spec[0]) for spec in audit.route_specs)
+        flow_mode = getattr(audit, "flow_mixed", None)
         LOG.warning(
             "Spectrum H3 core-BSA preflight run_id=%s step=%s result=audited safe=%s "
-            "seq_len=%s routes=%s failure=%s",
+            "seq_len=%s routes=%s flow_mixed=%s failure=%s",
             run_id,
             step_id,
             bool(safe),
             audit.seq_len,
             routes,
+            flow_mode,
             audit.failure,
         )
         return
@@ -141,9 +142,11 @@ def prepare(runtime, run_id, step_id, options, layout, model):
 
     prepared = {**options, RECEIPTS: []}
     if audit is not None:
-        from . import core_bsa_compat
+        from . import core_bsa_flow_compat
 
-        prepared = core_bsa_compat.instrument_actual_options(prepared, audit, RECEIPTS)
+        prepared = core_bsa_flow_compat.instrument_actual_options(
+            prepared, audit, RECEIPTS
+        )
     return prepared, (identity, safe)
 
 
