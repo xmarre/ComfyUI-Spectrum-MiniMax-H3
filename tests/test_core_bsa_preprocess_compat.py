@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -187,6 +188,24 @@ def test_reviewed_untwist_wrapper_keeps_stable_backend_identity():
     # Smooth Untwist schedule progress is handled by Spectrum's external-patch
     # runtime contract, not by forcing a backend-history reset on every call.
     assert first.identity == second.identity
+
+
+def test_comfy_loader_namespaced_untwist_module_is_accepted(monkeypatch):
+    model, _patch, bsa_override, options = _installation()
+    options, outer = _with_untwist(options, bsa_override)
+    transform, _previous = outer.attention_preprocess_v1
+    original_module_name = transform.__module__
+    module = sys.modules[original_module_name]
+    namespaced_module_name = (
+        "/home/toor/ComfyUI/custom_nodes/comfyui-untwisting-rope"
+        ".flux_untwist.patches"
+    )
+    monkeypatch.setitem(sys.modules, namespaced_module_name, module)
+    monkeypatch.setattr(transform, "__module__", namespaced_module_name)
+
+    audit, reason = core_bsa_preprocess_compat.probe(options, _layout(), model)
+    assert reason is None and audit is not None and audit.safe
+    assert audit.current_override is outer
 
 
 def test_backend_history_uses_reviewed_untwist_aware_core_bsa_probe():
