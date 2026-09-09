@@ -95,6 +95,7 @@ jobs:
             tests/test_external_patch_transaction_parity.py \
             --ignore I001,UP037
           python -m ruff check \
+            comfyui_spectrum_h3/backend_history.py \
             comfyui_spectrum_h3/comfy_compiler_compat.py \
             comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/generic_correction.py \
@@ -118,6 +119,7 @@ jobs:
             comfyui_spectrum_h3/runtime.py \
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
+            tests/test_backend_history.py \
             tests/test_comfy_compiler_compat.py \
             tests/test_config.py \
             tests/test_continuum_interop.py \

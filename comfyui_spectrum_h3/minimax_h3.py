@@ -455,7 +455,7 @@ def _execute_actual(
         dit_replacements[("double_block", first_index)] = capture_state_input
 
     def capture_replacement(args, replacement_context):
-        nonlocal actual_target, observed, state_input_target
+        nonlocal actual_target, observed, state_input_target, residual_probe
         output = existing(args, replacement_context) if existing is not None else replacement_context["original_block"](args)
         if not isinstance(output, dict) or "img" not in output or not torch.is_tensor(output["img"]):
             raise RuntimeError("final MiniMax H3 block replacement did not return {'img': tensor}")
@@ -468,6 +468,12 @@ def _execute_actual(
         # second full target tensor on the GPU before the required CPU archive.
         target = hidden[aa:vb].unsqueeze(0)
         actual_target = target
+        from .backend_history import observe
+        resets_before = runtime.stats.backend_history_resets
+        observe(runtime, run_id, step_id, local_options,
+                local_options.get("attention_backend_preflight_v1"))
+        if runtime.stats.backend_history_resets != resets_before:
+            residual_probe = None  # discard old-backend shadow/hold evidence
         if runtime.active_state_conditioned_residual:
             try:
                 if state_input_target is None:
@@ -686,6 +692,10 @@ def diffusion_model_wrapper(
     labels = branch_labels(options)
     expected_shape = (1, (ab - aa) + (vb - va), int(inner.hidden_size))
     topology = topology_signature(inner, video_x, audio_x, context, layout, options, payload)
+    from .backend_history import prepare
+    options, backend_policy = prepare(runtime, int(run_id), int(step_id), options, layout, inner)
+    if backend_policy is not None:
+        options["attention_backend_preflight_v1"] = backend_policy
     call_id, actual = runtime.begin_model_call(
         int(run_id),
         int(step_id),

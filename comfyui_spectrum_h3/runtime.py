@@ -8,7 +8,9 @@ from typing import Any
 
 import torch
 
+from .backend_history import BackendHistory
 from .config import SpectrumH3Config
+from .er_sde_stochastic import ERSDEStepDescriptor
 from .experiments import (
     OfflineFeatureArchive,
     OfflineSmoother,
@@ -16,7 +18,6 @@ from .experiments import (
     measure_stream_residual,
     tensor_all_finite,
 )
-from .er_sde_stochastic import ERSDEStepDescriptor
 from .forecast import ForecasterSnapshot, HistoryWeightForecaster
 from .model_aware import (
     ModelAwareController,
@@ -78,6 +79,8 @@ class RuntimeStats:
     actual_steps: int = 0
     forecast_steps: int = 0
     actual_transformer_calls: int = 0
+    backend_history_resets: int = 0
+    backend_opaque_actual_calls: int = 0
     forecast_model_calls: int = 0
     forecast_fallbacks: int = 0
     bypassed_steps: int = 0
@@ -279,6 +282,7 @@ class _RunState:
 class RuntimeRollbackSnapshot:
     next_step_id: int
     forecaster: ForecasterSnapshot
+    backend_history: BackendHistory
     history_topology: tuple[Any, ...] | None
     history_labels: tuple[Any, ...] | None
     current_window: float
@@ -319,6 +323,7 @@ class SpectrumH3Runtime:
         self._run_counter = 0
         self._run: _RunState | None = None
         self._step: _StepState | None = None
+        self._backend_history = BackendHistory()
         self._history_topology: tuple[Any, ...] | None = None
         self._history_labels: tuple[Any, ...] | None = None
         self._current_window = float(self.config.window_size)
@@ -1088,6 +1093,7 @@ class SpectrumH3Runtime:
                 )
                 controller.set_profile(self._model_profile)
                 self._stage_model_aware[stage_index] = controller
+        self._backend_history = BackendHistory()
         self._history_topology = None
         self._history_labels = None
         self._current_window = float(self.config.window_size)
@@ -1170,6 +1176,7 @@ class SpectrumH3Runtime:
         self._primary_model_aware.reset()
         self._primary_model_aware.set_profile(self._model_profile)
         self.model_aware = self._primary_model_aware
+        self._backend_history = BackendHistory()
         self._history_topology = None
         self._history_labels = None
         self._consecutive_forecasts = 0
@@ -1618,6 +1625,65 @@ class SpectrumH3Runtime:
     def fallback_current_step(self, run_id: int, step_id: int, reason: str) -> None:
         step = self._require_step(run_id, step_id)
         self._fallback_or_retry(step, reason)
+
+    def _reset_backend_history(self, step, reason):
+        # Clear every stage and feedback controller. Keeping a stage bank here
+        # would allow an old numerical backend to reappear after stage switching.
+        if step.mode == "replay":
+            raise OfflineReplayAbort(reason)
+        if any(call.used_forecast for call in step.calls):
+            raise ForecastRetryActual(reason)
+        for forecaster in [self._primary_forecaster, self.forecaster, *self._stage_forecasters.values()]:
+            forecaster.reset()
+        for controller in [self._primary_model_aware, self.model_aware, *self._stage_model_aware.values()]:
+            controller.reset()
+            controller.set_profile(self._model_profile)
+        self._history_topology = None
+        self._history_labels = None
+        self._consecutive_forecasts = 0
+        self._required_feedback_actuals = 0
+        self._rollback_requested = False
+        if self._offline_archive is not None:
+            self._offline_archive.invalidate(reason)
+        self._offline_smoother = None
+        step.mode = "actual"
+        step.reason = reason
+        step.bootstrap_forecast = False
+        step.model_aware_decision = None
+        step.residual_expected = False
+        step.residual_records.clear()
+        if step.actual_records:
+            step.retain_history = False
+            step.actual_records.clear()
+        self.stats.backend_history_resets += 1
+
+    def prepare_backend_history(self, run_id, step_id, identity, safe):
+        step = self._require_step(run_id, step_id)
+        old = self._backend_history
+        if old.policy != identity:
+            self._reset_backend_history(step, "numerical backend policy transition")
+            self._backend_history = BackendHistory(policy=identity)
+        if not safe or not self._backend_history.forecast_safe:
+            if step.mode == "replay":
+                raise OfflineReplayAbort("unpredictable numerical attention backend")
+            if any(call.used_forecast for call in step.calls):
+                raise ForecastRetryActual("numerical backend requires an actual call")
+            step.mode = "actual"
+            step.bootstrap_forecast = False
+            step.reason = "numerical backend requires an actual call"
+            self.stats.backend_opaque_actual_calls += 1
+
+    def observe_backend_history(self, run_id, step_id, identity, receipts, safe):
+        step = self._require_step(run_id, step_id)
+        old = self._backend_history
+        if old.receipt is not None and old.receipt != receipts:
+            self._reset_backend_history(step, "actual numerical backend receipt transition")
+            # Multiple conditioning subcalls with distinct routing cannot share a
+            # single anchor. Execute the step, but do not retain a mixed anchor.
+            if step.actual_records:
+                step.retain_history = False
+                step.actual_records.clear()
+        self._backend_history = BackendHistory(identity, receipts, safe)
 
     def begin_model_call(
         self,
@@ -2879,6 +2945,8 @@ class SpectrumH3Runtime:
         return RuntimeRollbackSnapshot(
             next_step_id=self._run.next_step_id,
             forecaster=self.forecaster.snapshot(),
+            backend_history=BackendHistory(self._backend_history.policy, self._backend_history.receipt,
+                                           self._backend_history.forecast_safe),
             history_topology=self._history_topology,
             history_labels=self._history_labels,
             current_window=self._current_window,
@@ -3012,6 +3080,8 @@ class SpectrumH3Runtime:
 
         self._run.next_step_id = snapshot.next_step_id
         self.forecaster.restore(snapshot.forecaster)
+        self._backend_history = BackendHistory(snapshot.backend_history.policy, snapshot.backend_history.receipt,
+                                               snapshot.backend_history.forecast_safe)
         self._history_topology = snapshot.history_topology
         self._history_labels = snapshot.history_labels
         self._current_window = snapshot.current_window

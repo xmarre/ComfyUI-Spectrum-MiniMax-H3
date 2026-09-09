@@ -1,0 +1,390 @@
+# Spectrum MiniMax H3 v0.2.25
+
+v0.2.25 restores stable Spectrum operation with current ComfyUI DynamicVRAM/Comfy Compiler by keeping Spectrum-managed MiniMax H3 solver steps out of Aimdo malloc-graph capture without disabling either system globally.
+
+## Comfy Compiler / DynamicVRAM compatibility
+
+PR #102 fixes issue #99, where current ComfyUI could segfault in `comfy_aimdo.malloc_graph.MallocGraph.pop()` during Spectrum H3 sampling. The first narrow candidate only moved retained Spectrum history allocation outside the active malloc graph; real CUDA testing showed that was insufficient because the first prompt could complete while a second prompt in the same process still crashed during `malloc_graph_end()`.
+
+The final integration uses a broader, structural boundary:
+
+- Spectrum lazily wraps `comfy.model_prefetch.malloc_graph_enabled` and returns `False` only while a supported Spectrum H3 solver step is active on the current worker thread;
+- native MiniMax H3 therefore does not enter or pop an Aimdo malloc graph for Spectrum-managed forwards, where actual and forecast/replay calls intentionally have different allocation/control topology;
+- DynamicVRAM remains enabled;
+- Comfy Compiler remains enabled for non-Spectrum work;
+- normal compiler behavior is restored after every finalized Spectrum step;
+- `end_run` and the next `start_run` both clear stale thread-local bypass state so aborted workflows cannot leak the compatibility scope into later work;
+- the compatibility layer is installed last/outermost so existing Spectrum runtime wrappers cannot replace its cleanup boundary.
+
+This deliberately trades the Comfy Compiler malloc-graph optimization away only for Spectrum-managed H3 denoiser calls. It does not globally apply the `--disable-comfy-compiler` workaround and does not require `--highvram`.
+
+## Current-Core compatibility coverage
+
+The reviewed CI matrix now includes ComfyUI `15eb748b3ec5f8a0a2d470b7fb280e2d7579f916` with Python 3.12, `comfy-kitchen==0.2.33`, and `comfy-aimdo==0.5.2`. Native MiniMax test fixtures were also aligned with the current `attention` block argument and current transient H3 transformer-option metadata while preserving caller-owned option values.
+
+Older reviewed ComfyUI revisions that predate Comfy Compiler remain supported; the compiler contract test skips only where that API does not yet exist.
+
+## Validation
+
+- PR #102 final head `be607cf485dc720cf2557c45e01f21404d75e871` passed GitHub Actions run **#589** across all **9** reviewed ComfyUI/Python matrix jobs.
+- CodeRabbit completed the final diff review with **no actionable comments** and rated merge risk minimal.
+- Real CUDA/runtime validation confirmed that the revised compatibility boundary fixed the crash; the tester also reported no obvious performance regression in normal use.
+- The original failing issue is closed after the accepted runtime retest.
+
+Existing Spectrum forecasting policies, sampler equations, Continuum prefix semantics, external-patch exactness rules, generic correction, offline replay semantics, and non-Spectrum Comfy Compiler behavior are unchanged outside this compatibility boundary.
+
+---
+
+# Spectrum MiniMax H3 v0.2.24
+
+v0.2.24 removes two unnecessary actual-evaluation barriers in validated few-step and progressive workflows while preserving the exact anchors required by the underlying samplers and external-patch contracts.
+
+## Qualified terminal Untwist PECE deferral
+
+PR #98 adds a narrow, versioned exception to Spectrum's normal hard external-patch transition rule for active SA-Solver PECE.
+
+- ComfyUI-Untwisting-RoPE v0.2.3 can declare `terminal_pece_exact_corrector_safe=true` only for its reviewed weak terminal spatial-only envelope.
+- Spectrum independently proves that the current call is the terminal predicted PECE phase and that the immediate next logical call is the exact corrected phase for the same outer step before allowing the predictor to remain forecasted.
+- The corrected call remains an actual H3 evaluation and becomes the persistent endpoint. Native SA-Solver sigma/tau/noise/RNG ordering and Adams history remain intact.
+- Missing or malformed capability metadata, PEC/non-PECE sampling, missing correctors, unknown topology, interior transitions, replay, or any stacked unsafe transition retain the ordinary exact hard-boundary promotion.
+- DiffAid's current strong interior hard transition remains exact.
+
+The follow-up short-lifetime regression found that the deferral layer was clearing Spectrum's already-selected one-point bootstrap mechanism under `max_speed`. That turned a valid one-anchor hold into the ordinary multi-point forecaster and produced `Spectrum forecaster does not have enough actual history`. The final fix changes only the external-patch reason and preserves the forecast mechanism chosen by `begin_step()`.
+
+The corrected progressive high stages now execute the intended two-outer-step PECE topology:
+
+```text
+P0  A
+P1  F
+C1  A
+```
+
+Both exercised high-stage invocations completed as **2 actual / 1 forecast**, confirmed the exact same-outer corrector, and reported zero terminal fail-safe events and zero Spectrum fallbacks. Across the complete corrected progressive workflow, metrics reported **22 logical sampler calls, 17 actual transformer NFEs, 5 Spectrum forecasts, and 2 exact handoff-probe NFEs**.
+
+The terminal-deferral semantic change also passed matched decoded-media A/B testing. In the validated 0.5 MP four-pass workflow, the new policy produced **32 actual / 16 forecast** calls versus **36 / 12** under the previous terminal-transition policy, saving four real H3 transformer evaluations without a discernible quality regression.
+
+## RES final-tail policy
+
+PR #100 removes the obsolete RES-specific three-step final-tail floor that originated as an empirical safeguard for the old monolithic RES path.
+
+- `tail_actual_steps` is now authoritative for `sample_res_multistep` and `sample_res_multistep_cfg_pp`; Spectrum no longer silently raises the RES final tail to three actual calls.
+- The separate RES recurrence safeguard is unchanged: after a forecast, one exact H3 evaluation still refreshes native `old_denoised` before another forecast may occur.
+- Continuum prefixes, warmup, external-patch transitions, fallbacks, force-actual conditions, and other independent correctness boundaries still take precedence.
+
+A three-step progressive high-resolution RES stage with one exact Continuum prefix and `tail_actual_steps=1` can therefore use:
+
+```text
+A F A
+```
+
+The production progressive RES validation exercised four stages as `A F A F A`, `A F A`, `A A F A A`, and `A F A`. That is **16 logical sampler calls = 11 actual + 5 forecast**; two exact handoff probes bring the workflow to **13 actual transformer NFEs** overall. All four stages reported zero Spectrum fallbacks. Decoded video and audio were reviewed as excellent, with the RES result preferred over the matched Euler control.
+
+## Step/NFE documentation and release process
+
+PR #95 is also included in this release archive. It is documentation/release-process only: it clarifies that UI scheduler steps are outer sigma intervals rather than necessarily one H3 model call, records the `2N - 1` / `3N - 2` multistage call counts, and hardens documentation-only release-note refreshes against stale workflow runs. It does not change sampler or forecasting behavior.
+
+The release workflow now also keeps the level-1 version heading in `RELEASE_NOTES.md` for repository history and version validation while removing that heading from the GitHub release body. The GitHub release title therefore appears only once.
+
+## Validation
+
+- PR #100: GitHub Actions run **576** passed the full eight-lane reviewed ComfyUI/Python matrix, followed by the successful production-stack RES media validation.
+- PR #98: final PR-head GitHub Actions run **575** passed all eight matrix jobs; the corrected real `max_speed` short-lifetime workflow completed without the prior under-history failure.
+- Combined post-merge `main`: GitHub Actions run **578** passed after PR #100 and PR #98 were both present on `main`.
+- Companion ComfyUI-Untwisting-RoPE #5: merged `main` tests run **23** passed.
+
+Existing Euler, ER-SDE, SEEDS, ordinary SA-Solver PEC, RefDelta ownership, Continuum prefix semantics, native/all-actual fallbacks, and unsafe external-patch transition handling remain unchanged outside the specific policies above.
+
+---
+
+# Spectrum MiniMax H3 v0.2.23
+
+v0.2.23 completes the SA-Solver PECE and RefDelta multi-backend integration and makes **`balanced` the default active-PECE forecast policy** after matched MiniMax-H3 production testing.
+
+## Important: outer steps are not H3 model-call counts
+
+The ComfyUI scheduler's **steps** value counts outer sigma intervals. Some of the newly
+supported solvers expose additional logical H3 model-call opportunities inside those
+intervals, so raw step counts are not NFE-equivalent across sampler families.
+
+For the usual terminal-zero schedule, with `N = len(sigmas) - 1`:
+
+| Sampler topology | Native H3 model-call opportunities | 10 outer steps | 19 outer steps |
+| --- | ---: | ---: | ---: |
+| Euler / RES multistep / ER-SDE | `N` | 10 | 19 |
+| SA-Solver PEC / inactive PECE (`use_pece = false` or `corrector_order = 0`) | `N` | 10 | 19 |
+| SEEDS-2 | `2N - 1` | 19 | 37 |
+| SEEDS-3 | `3N - 2` | 28 | 55 |
+| Active SA-Solver PECE (`use_pece = true`, `corrector_order > 0`) | `2N - 1` | 19 | 37 |
+
+SEEDS omits its internal stage calls on the final sigma-to-zero interval. Active PECE
+with `corrector_order > 0` executes `P0`, then predicted/corrected pairs
+`P1/C1, P2/C2, ...`, giving `N` predicted opportunities plus `N - 1` corrected
+opportunities. With `corrector_order = 0`, PECE collapses to `N`.
+
+Spectrum's actual/forecast ratios are therefore counted over logical H3 model-call opportunities.
+A clean 10-outer-step PECE run contains **19** logical H3 calls: `balanced` is nominally
+**11 actual / 8 forecast** and `max_speed` **10 / 9**. Production safety boundaries may
+promote forecasts to actual, changing the split without changing the 10 outer steps.
+
+## Active SA-Solver PECE
+
+Spectrum now models native ComfyUI PECE as explicit predicted/corrected evaluations:
+
+```text
+P0
+P1 C1
+P2 C2
+...
+```
+
+- `P0` and exact corrected `C_i` evaluations own persistent Spectrum/Adams history.
+- Later predicted `P_i` evaluations are ephemeral current-corrector inputs and never become persistent Adams evidence.
+- Forecasted predicted phases use causal solver-space dense output derived only from exact persistent endpoints; Spectrum's raw hidden-feature forecast is not consumed numerically by SA at that boundary.
+- Every corrected phase remains an exact H3 re-anchor.
+- Native sigma/tau/noise/RNG ordering, stochastic variance, predictor/corrector equations, PECE endpoint replacement, callbacks, and terminal behavior remain unchanged.
+- H3 Continuum prefixes and DiffAid/Untwist hard transitions remain authoritative actual-evaluation boundaries.
+
+## PECE quality/speed policy
+
+`sa_pece_forecast_policy` exposes three reviewed start cadences:
+
+- **`balanced` (default):** P0/P1 exact; clean 10-outer topology is 11 actual / 8 forecast.
+- `max_speed`: P0 exact; clean 10-outer topology is 10 actual / 9 forecast.
+- `stable_start`: P0/P1/P2 exact; clean 10-outer topology is 12 actual / 7 forecast.
+
+Real production stacks may be more conservative because Continuum prefixes, external hard transitions, user warmup, fallbacks, and force-actual conditions take precedence.
+
+Final matched 10-outer testing with runtime LoRA/DoRA hooks, DiffAid, Untwist-RoPE, RefDelta SA-Solver PECE, Spectrum full/model-aware mode, and H3 Continuum produced acceptable decoded output with both `max_speed` and `balanced`. The **balanced run was perceptually better** in the tested workflow, so it is now the release default. The early coarse/colored-shape previews seen during the first few denoising steps also occur with other MiniMax-H3 samplers and are not treated as a PECE correctness failure.
+
+The reviewed maximum-speed production trace completed at 12 actual / 7 forecast for the initial chunk and 13 actual / 6 forecast for the Continuum chunk after hard-transition and Continuum promotions, with zero fallbacks, bypasses, rollbacks, speculative calls, discarded actual calls, or external-patch contract failures.
+
+## RefDelta SEEDS / SA-Solver composition
+
+Spectrum now composes with the RefDelta Solver v0.6.0 sampler family:
+
+- `sample_refdelta_seeds_2`;
+- `sample_refdelta_seeds_3`;
+- `sample_refdelta_sa_solver`;
+- `sample_refdelta_sa_solver_pece`.
+
+RefDelta keeps its own reviewed evidence topology while Spectrum owns forecast scheduling. For PECE, RefDelta persistent evidence mirrors native endpoint replacement—`P0, C1, C2, ...`—and later predicted calls remain ephemeral even when a safety boundary makes one actual. Forecasted persistent endpoints fail closed.
+
+RefDelta SEEDS/SA composition remains causal-only under Spectrum, and unsupported multi-GPU clone paths bypass Spectrum rather than weakening the interop contract. ER-SDE's existing exact-gated-increment contract is unchanged.
+
+The cross-repository CI fixture is pinned to RefDelta Solver v0.6.0 commit:
+
+```text
+21d0191d933fedf2885df082d33eb1bc2fffd529
+```
+
+## Scheduler evidence
+
+The companion RefDelta dedicated SA-Solver scheduler media gate also completed. Exact `simple_control` was slightly preferred over `simple_adams_bounded`, while both produced acceptable decoded output. Spectrum does not own that outer scheduler choice; its PECE forecast policy remains independent.
+
+## Validation
+
+The final release branch retains the eight-lane reviewed ComfyUI/Python matrix, native MiniMax-H3 fixtures, RefDelta cross-repository fixtures, Ruff, compileall, and wheel build. Existing Euler, ER-SDE, RES multistep, native SEEDS, ordinary SA-Solver PEC, Continuum, external-patch, generic-correction, and saved-workflow behavior remain isolated from the new active-PECE policy.
+
+---
+
+# Spectrum MiniMax H3 v0.2.22
+
+v0.2.22 adds reviewed native Spectrum support for ComfyUI **SEEDS-2, SEEDS-3, and SA-Solver**, including the stochastic MiniMax H3 paths that required sampler-specific state handling rather than ordinary one-call forecasting.
+
+## Native SEEDS-2 / SEEDS-3 support
+
+Spectrum now understands the native multistage SEEDS solver geometry instead of treating each H3 model call as an independent diffusion step.
+
+For stochastic SEEDS:
+
+- native stochastic increments, noise draws, stage equations, and callback ordering remain untouched;
+- Spectrum forecasts the H3 **transformer residual** while rebuilding the exact current-state target input embedding from the native solver latent;
+- stochastic stages share one residual history over the true interleaved model-call coordinates;
+- the outer SEEDS stage remains exact, while supported internal stages may be forecast;
+- one-point bootstrap remains disabled;
+- hard external-patch transitions, Continuum prefix requirements, warmup/readiness, and final-tail exactness remain authoritative;
+- the ordinary model-aware scheduler veto is advisory on the sampler-specific stochastic internal-stage path, while model-aware telemetry, adaptive fit/blend, and generic correction remain active;
+- stochastic SEEDS does not use offline smoothing replay because replaying the model-call sequence independently of the native noise-conditioned stage trajectory would break solver geometry.
+
+The final real SEEDS-2 validation completed cleanly with DiffAid, Untwist-RoPE, and H3 Continuum:
+
+- initial chunk: **11 actual / 8 forecast**, **0 fallbacks**;
+- Continuum chunk: **12 actual / 7 forecast**, **0 fallbacks**;
+- stage 0 stayed exact throughout;
+- the previously observed delayed heavy-noise pattern did not recur.
+
+SEEDS-3 is supported under the same reviewed state-conditioned residual architecture, but remains more conservative because its two consecutive internal stages do not have an exact outer-stage anchor between them.
+
+## Native SA-Solver support
+
+Spectrum now supports native SA-Solver without allowing approximate H3 denoisers to become recursive persistent Adams observations.
+
+The stochastic SA integration uses:
+
+- **actual-only persistent Adams history**;
+- forecast values only as bounded solver-local/ephemeral inputs;
+- causal solver-space dense output built from exact H3 anchors during stochastic intervals;
+- exact native tau/noise draws, predictor/corrector equations, callback ordering, sigma schedule, and final denoising semantics;
+- a one-forecast maximum streak with an exact H3 re-anchor after each skipped transformer call;
+- fail-closed/native behavior for unsupported active PECE corrector configurations.
+
+For H3 Continuum continuation chunks, every SA forecast coordinate uses a latest-exact solver-space hold and ignores the raw Spectrum hidden-feature denoised value at the SA boundary. This removes the remaining continuation-specific instability while preserving the 11/8 NFE target.
+
+Final real-media SA validation completed with:
+
+- initial chunk: **11 actual / 8 forecast**, **0 fallbacks**;
+- Continuum chunk: **11 actual / 8 forecast**, **0 fallbacks**;
+- all eight Continuum forecast coordinates using the reviewed all-forecast latest-exact isolation path;
+- no recurrence of the delayed heavy-noise corruption;
+- no recurrence of the later whole-frame vertical shake/flashing artifact.
+
+## Validation and compatibility
+
+PR #86 is the reviewed SEEDS-2/3 implementation and passed Actions **#495** across all seven supported ComfyUI/Python lanes. PR #87 is the stacked SA-Solver implementation and passed Actions **#511** on its final one-commit head.
+
+Both PRs were additionally validated with real MiniMax H3 media using the production workflow with DiffAid, Untwist-RoPE, H3 Continuum, runtime LoRA hooks, and the current PDD-capable ComfyUI H3 path.
+
+Existing Euler, RES multistep, ER-SDE, RefDelta, Continuum, generic-correction defaults, trust-shrinkage default-off behavior, and ordinary sampler scheduling remain unchanged outside the new sampler-specific paths.
+
+---
+
+# Spectrum MiniMax H3 v0.2.21
+
+v0.2.21 restores Spectrum forecast execution with current ComfyUI MiniMax H3 after the PDD LoRA update changed the native output-head contract.
+
+## ComfyUI 0.34 PDD final-layer compatibility
+
+- Fixes `FinalLayer.forward() missing 3 required positional arguments: 'sigma', 'sample_sigmas', and 'shifts'` on the first eligible Spectrum forecast with ComfyUI 0.34.0 and later PDD-capable H3 cores.
+- Spectrum now detects the reviewed native FinalLayer contract and forwards the same current sigma, exact sampler sigma schedule, and video/audio sigma shifts used by native H3.
+- Reviewed older ComfyUI revisions retain the existing four-argument FinalLayer path.
+- An incomplete future PDD argument contract fails explicitly instead of guessing.
+- No H3 Continuum-side workaround is required; Continuum exposed the stale Spectrum forecast output-head call.
+
+## Validation
+
+PR #84 adds focused regression coverage for the PDD projection call and adds ComfyUI commit `2504e68d4d9dedb514e172692f13436623f25aed` to the compatibility matrix with its required `comfy-kitchen` and `comfy-aimdo` versions. All seven ComfyUI/Python lanes pass, including the historical legacy FinalLayer contracts. CodeRabbit reported no actionable code finding.
+
+PR #84 supersedes #83; thanks to @bun-dev for independently identifying the same Core contract break and proposing the compatible call shape.
+
+---
+
+## v0.2.20
+
+v0.2.20 fixes the RefDelta API-v1 step-provenance handoff after a tracked ER-SDE model call.
+
+## RefDelta tracked-step provenance
+
+- Fixes `RefDelta requested a model-result classification for the wrong step` immediately after the first successful Spectrum/RefDelta model evaluation.
+- The real runtime trace showed Spectrum's ER-SDE stochastic tracker had already consumed and logged step 0 while the separate RefDelta bridge-local descriptor had not been mirrored reliably through the surrounding ComfyUI/Continuum model-options path.
+- For stochastic RefDelta runs, provenance is now recorded directly from the exact `ERSDEStepDescriptor` that the ER-SDE stochastic tracker successfully consumes. RefDelta therefore uses the same authoritative step classification that Spectrum used for stochastic-state ownership.
+- The existing post-model bridge update remains a redundant consistency path instead of the sole source of RefDelta provenance.
+- Deterministic `s_noise=0` RefDelta runs keep their direct bridge descriptor path because no stochastic tracker exists in that mode.
+- Stale-step and external-increment source validation remain strict; diagnostics now include requested/source and observed step IDs.
+- No model-path, Continuum, RefDelta Solver, prompt, sampler-setting, or workflow changes are required.
+
+## Validation
+
+PR #78 adds regression coverage for the exact failure mode: the tracker consumes step 0 successfully without a separate bridge update, and RefDelta must still classify the same step correctly. Coverage also verifies stale-step rejection, external-increment source checking, replay provenance, and deterministic no-tracker behavior.
+
+The complete six-lane Spectrum ComfyUI/Python matrix passes, including Ruff, compileall, focused external compatibility suites, and native MiniMax H3 fixtures. CodeRabbit reported no actionable merge-blocking finding and rated the runtime change minimal risk.
+
+---
+
+## v0.2.19
+
+v0.2.19 fixes RefDelta Solver discovery in the actual ComfyUI custom-node loading layout.
+
+## RefDelta custom-node namespace discovery
+
+- Fixes the runtime failure `RefDelta interop API is unavailable: No module named 'comfyui_refdelta_solver'` that could occur even though the RefDelta sampler itself was already loaded and usable by ComfyUI.
+- Spectrum now recognizes the already-loaded RefDelta implementation when ComfyUI has placed it under a package-relative custom-node namespace instead of exposing `comfyui_refdelta_solver` as a top-level package.
+- Canonical RefDelta imports reuse the exact live config class, sampler function, and interop contract objects instead of importing the same files a second time under a different module identity.
+- The existing strict RefDelta API-v1 checks remain unchanged: function identity, config provenance, interop version, option allowlist, stochastic ownership, and wrapper ordering still fail closed on drift.
+- No `PYTHONPATH` changes, pip installation, duplicated model path, or workflow changes are required.
+
+## Validation
+
+PR #76 adds a regression for the exact nested ComfyUI package layout that produced the failure. The complete six-lane Spectrum ComfyUI/Python matrix passes, including Ruff, compileall, focused external compatibility tests, and native MiniMax H3 fixtures. CodeRabbit reported no actionable findings on the substantive compatibility change.
+
+This patch changes discovery only. RefDelta solver behavior, Spectrum forecasting policy, stochastic compensation, Continuum interoperability, Diff-Aid handling, Untwisting RoPE handling, and offline replay semantics remain unchanged.
+
+---
+
+## v0.2.18
+
+v0.2.18 adds explicit compatibility with MiniMax H3 RefDelta Solver v0.2.0+.
+
+## RefDelta API v1
+
+- `sample_refdelta_er_sde` is admitted only when the installed function, config type, option set, and versioned interop marker match the reviewed contract.
+- Spectrum passes actual/forecast/replay provenance to RefDelta. Forecasted denoised values continue through ER-SDE solver history but cannot enter RefDelta's raw-model risk or correction evidence.
+- RefDelta publishes the exact stochastic increment after its risk and endpoint gates. Spectrum retains that tensor for the next skipped-state compensation instead of reconstructing an ungated native increment.
+- Native-equivalence RefDelta configurations continue through the reviewed native ER-SDE ownership path.
+- Deterministic `s_noise=0` RefDelta runs still receive actual/forecast provenance without allocating a stochastic tracker.
+- Offline replay preserves source-actual provenance and aborts safely to the completed first pass if interop state becomes inconsistent.
+
+## Validation and failure policy
+
+The test matrix covers the shared API contract, exact gated-increment transfer, missing-publication rejection, actual/forecast/replay classification, native ComfyUI contracts, Python 3.12/3.13, Ruff, compileall, and wheel construction. Unreviewed RefDelta versions, options, stochastic callbacks, wrapper ordering, or bridge state disable forecasting or fail explicitly rather than silently changing stochastic ownership.
+The cross-repository jobs pin the exact RefDelta API-v1 commit reviewed for this release.
+Release validation covers six Spectrum matrix jobs and the four-job RefDelta native fixture matrix.
+
+Existing native ER-SDE, Euler, RES multistep, Turbo, Continuum, Diff-Aid, Untwisting RoPE, masked H3, refinement, model-aware, and offline-replay behavior remains unchanged.
+
+---
+
+## v0.2.17
+
+v0.2.17 completes the current H3 Continuum interoperability work: native masked continuation can remain forecast-capable where the installed ComfyUI core exposes the required per-token H3 mask helper, and the learned-latent sampler-2 refinement path can use Spectrum without inheriting sampler-1's Continuum actual-prefix policy.
+
+## Native Masked H3 forecasting
+
+Spectrum now reconstructs native MiniMax H3 FinalLayer modulation for mixed VIDEO/AUDIO denoise masks instead of disabling forecasting for the entire masked continuation chunk.
+
+- Per-row VIDEO and AUDIO timestep selections follow native H3 mask semantics.
+- Scalar fully-generating paths retain the existing fast path.
+- Residual/shadow output-head evaluation uses the same reconstruction.
+- Per-row timestep index tensors are placed on the target latent device, avoiding CPU/CUDA index-device mismatches in FinalLayer implementations that use `index_select`.
+- On older reviewed ComfyUI cores that do not expose `mask_row_values`, a masked forecast fails closed to one native H3 transformer evaluation instead of raising during output-head reconstruction.
+- Malformed audio mask layouts continue to fail explicitly.
+
+## Short learned-latent refinement
+
+The integrated MiniMax H3 latent upscaler/refiner supplies an explicit `h3_refinement` API-v1 marker on a clone of Continuum's exact per-chunk MODEL. Spectrum validates that contract and lets its sampler-2 actual-prefix policy override the generation-only Continuum prefix carried by sampler 1.
+
+Normal Continuum generation still preserves its two-step actual prefix. A valid three-step sampler-2 refinement can therefore use:
+
+```text
+actual -> forecast -> actual
+```
+
+with the normal warmup/final-tail safety rules.
+
+Spectrum continues to honor genuine external-patch hard transitions. DiffAid v1.0.7 removes the artificial partial-denoise transition at its source by evaluating marked refinement against the full H3 sigma reference; Spectrum does not bypass a real model-function transition.
+
+## Coordinated runtime validation
+
+The complete real CUDA path was validated with:
+
+- H3 Continuum exact `refine_state` handoff;
+- MiniMax H3 learned latent upscale + internal sampler-2 refinement;
+- DiffAid marked-refinement sigma semantics;
+- Untwisting RoPE external-patch metadata;
+- native ER-SDE;
+- Spectrum enabled on both the main Continuum generation and sampler 2.
+
+A three-step high-resolution refinement produced `2 actual + 1 forecast` per refined chunk, with no inherited Continuum-prefix force-actual and no artificial DiffAid middle-step transition. The resulting media quality was user-validated as impeccable.
+
+The tested 0.7 MP native -> 1.75x learned-upscale workflow reduced the Refine node from roughly 302.5 s with three native refinement NFEs to roughly 212.7 s with the middle NFE forecast, while preserving the tested output quality.
+
+## Validation and compatibility
+
+The PR test matrix covers Python 3.10-3.13, the forecaster smoke test, Ruff/compileall, focused H3/external compatibility suites, and native MiniMax H3 fixtures across the reviewed ComfyUI revisions.
+
+This release is coordinated with:
+
+- ComfyUI-DiffAid-Patches v1.0.7;
+- H3 Continuum v3.4.1;
+- the integrated MiniMax H3 Latent Upscaler + Refine release.
+
+Existing Spectrum defaults, generic-correction defaults, normal 19-step Continuum forecasting policy, ER-SDE stochastic ownership, offline-replay policy, and real external-patch transition barriers remain unchanged.
