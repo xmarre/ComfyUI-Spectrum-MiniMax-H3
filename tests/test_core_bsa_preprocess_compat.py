@@ -266,3 +266,22 @@ def test_midforward_untwist_owner_swap_invalidates_receipts():
     second(args, context)
     assert audit.failure == "actual_route_mismatch"
     assert not core_bsa_compat.accepts_actual(audit, tuple(prepared[RECEIPTS]))
+
+
+def test_untwist_introspection_failure_is_actual_only(monkeypatch):
+    def fail(_options):
+        raise RuntimeError("introspection exploded")
+
+    monkeypatch.setattr(core_bsa_preprocess_compat, "_unwrap_reviewed_untwist", fail)
+    audit, reason = core_bsa_preprocess_compat.probe({}, None, None)
+    assert audit is None
+    assert reason == "untwist_introspection_failed"
+
+
+def test_untwist_introspection_oom_propagates(monkeypatch):
+    def fail(_options):
+        raise torch.cuda.OutOfMemoryError("oom")
+
+    monkeypatch.setattr(core_bsa_preprocess_compat, "_unwrap_reviewed_untwist", fail)
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        core_bsa_preprocess_compat.probe({}, None, None)
