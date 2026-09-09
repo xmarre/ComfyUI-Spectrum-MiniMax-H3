@@ -40,6 +40,19 @@ def _audited_nodes():
     return nodes
 
 
+def _untwist_factory():
+    try:
+        from flux_untwist import patches
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"reviewed Untwist fixture is unavailable: {exc}")
+    if (
+        core_bsa_compat._module_blob_sha(patches)
+        not in core_bsa_preprocess_compat.AUDITED_UNTWIST_GIT_BLOBS
+    ):
+        pytest.skip("this Untwist fixture is not the reviewed v0.2.4 source")
+    return patches.make_minimax_h3_attention_override
+
+
 def _layout(seq_len=128):
     return SimpleNamespace(
         seq_len=seq_len,
@@ -84,16 +97,28 @@ def _installation(*, count=2, sigma=1.0):
     return model, patch, override, options
 
 
-def _make_recreated_preprocess(previous):
-    def preprocess(q, k, v, heads, **kwargs):
-        return q, k, v
-
-    def override(original, q, k, v, heads, *args, **kwargs):
-        q, k, v = preprocess(q, k, v, heads, **kwargs)
-        return previous(original, q, k, v, heads, *args, **kwargs)
-
-    override.attention_preprocess_v1 = (preprocess, previous)
-    return override
+def _with_untwist(
+    options,
+    bsa_override,
+    *,
+    progress=0.5,
+    instance_id="untwist-h3-1",
+    active=True,
+):
+    outer = _untwist_factory()(bsa_override)
+    out = dict(options)
+    out["optimized_attention_override"] = outer
+    out["minimax_h3_untwist_rope"] = {"enabled": bool(active), "progress": float(progress)}
+    out["spectrum_h3_visual_reference_patch_runtime"] = (
+        {
+            "schema_version": 2,
+            "provider": "comfyui-flux2-untwisting-rope",
+            "instance_id": instance_id,
+            "schedule_progress": float(progress),
+            "active": bool(active),
+        },
+    )
+    return out, outer
 
 
 def _actual_args(options, layout, seq_len=128):
@@ -106,28 +131,26 @@ def _actual_args(options, layout, seq_len=128):
     }
 
 
-def test_recreated_preprocess_wrapper_keeps_stable_backend_identity():
+def test_reviewed_untwist_wrapper_keeps_stable_backend_identity():
     model, _patch, bsa_override, options = _installation()
-    first_options = dict(options)
-    first_outer = _make_recreated_preprocess(bsa_override)
-    first_options["optimized_attention_override"] = first_outer
+    first_options, first_outer = _with_untwist(options, bsa_override, progress=0.25)
     first, reason = core_bsa_preprocess_compat.probe(first_options, _layout(), model)
     assert reason is None and first is not None and first.safe
     assert first.current_override is first_outer
 
-    second_options = dict(options)
-    second_outer = _make_recreated_preprocess(bsa_override)
+    second_options, second_outer = _with_untwist(options, bsa_override, progress=0.75)
     assert second_outer is not first_outer
-    second_options["optimized_attention_override"] = second_outer
     second, reason = core_bsa_preprocess_compat.probe(second_options, _layout(), model)
     assert reason is None and second is not None and second.safe
     assert second.current_override is second_outer
+    # Smooth Untwist schedule progress is handled by Spectrum's external-patch
+    # runtime contract, not by forcing a backend-history reset on every call.
     assert first.identity == second.identity
 
 
-def test_backend_history_uses_preprocess_aware_core_bsa_probe():
+def test_backend_history_uses_reviewed_untwist_aware_core_bsa_probe():
     model, _patch, bsa_override, options = _installation()
-    options["optimized_attention_override"] = _make_recreated_preprocess(bsa_override)
+    options, _outer = _with_untwist(options, bsa_override)
     identity, safe = preflight(options, _layout(), model)
     assert safe
     assert identity[0] == core_bsa_compat.ADAPTER_KEY
@@ -143,36 +166,66 @@ def test_uncontracted_outer_attention_stays_fail_closed():
     options["optimized_attention_override"] = outer
     audit, reason = core_bsa_preprocess_compat.probe(options, _layout(), model)
     assert audit is None
-    assert reason == "outer_attention_uncontracted"
+    assert reason == "ownership_unproven"
 
 
-def test_preprocess_with_unstable_closure_stays_fail_closed():
+def test_unknown_preprocess_contract_stays_fail_closed():
     model, _patch, bsa_override, options = _installation()
-    mutable_owner = object()
 
     def preprocess(q, k, v, heads, **kwargs):
-        if mutable_owner is None:
-            raise AssertionError
         return q, k, v
 
     def outer(original, q, k, v, heads, *args, **kwargs):
-        q, k, v = preprocess(q, k, v, heads, **kwargs)
         return bsa_override(original, q, k, v, heads, *args, **kwargs)
 
     outer.attention_preprocess_v1 = (preprocess, bsa_override)
     options["optimized_attention_override"] = outer
     audit, reason = core_bsa_preprocess_compat.probe(options, _layout(), model)
     assert audit is None
-    assert reason == "outer_preprocess_identity_unproven"
+    assert reason == "untwist_preprocess_unreviewed"
 
 
-def test_dense_actual_receipt_accepts_real_outer_preprocess_owner():
-    model, _patch, bsa_override, options = _installation(count=1)
-    outer = _make_recreated_preprocess(bsa_override)
+def test_reviewed_untwist_requires_spectrum_runtime_descriptor():
+    model, _patch, bsa_override, options = _installation()
+    outer = _untwist_factory()(bsa_override)
     options["optimized_attention_override"] = outer
+    options["minimax_h3_untwist_rope"] = {"enabled": True, "progress": 0.5}
+    audit, reason = core_bsa_preprocess_compat.probe(options, _layout(), model)
+    assert audit is None
+    assert reason == "untwist_runtime_unproven"
+
+
+def test_inactive_untwist_runtime_stays_fail_closed_if_wrapper_is_present():
+    model, _patch, bsa_override, options = _installation()
+    options, _outer = _with_untwist(options, bsa_override, active=False)
+    audit, reason = core_bsa_preprocess_compat.probe(options, _layout(), model)
+    assert audit is None
+    assert reason == "untwist_runtime_unproven"
+
+
+def test_untwist_instance_change_changes_backend_identity():
+    model, _patch, bsa_override, options = _installation()
+    first_options, _outer = _with_untwist(
+        options, bsa_override, instance_id="untwist-h3-1"
+    )
+    first, reason = core_bsa_preprocess_compat.probe(first_options, _layout(), model)
+    assert reason is None and first is not None
+
+    second_options, _outer = _with_untwist(
+        options, bsa_override, instance_id="untwist-h3-2"
+    )
+    second, reason = core_bsa_preprocess_compat.probe(second_options, _layout(), model)
+    assert reason is None and second is not None
+    assert first.identity != second.identity
+
+
+def test_dense_actual_receipt_accepts_real_untwist_owner():
+    model, _patch, bsa_override, options = _installation(count=1)
+    options, outer = _with_untwist(options, bsa_override)
     layout = _layout()
     audit, reason = core_bsa_preprocess_compat.probe(options, layout, model)
     assert reason is None and audit is not None and audit.safe
+    assert audit.current_override is outer
     assert audit.route_specs[0][0] == "h3_dense"
 
     prepared = {**options, RECEIPTS: []}
@@ -188,10 +241,9 @@ def test_dense_actual_receipt_accepts_real_outer_preprocess_owner():
     assert core_bsa_compat.accepts_actual(audit, tuple(prepared[RECEIPTS]))
 
 
-def test_midforward_outer_preprocess_swap_invalidates_receipts():
+def test_midforward_untwist_owner_swap_invalidates_receipts():
     model, _patch, bsa_override, options = _installation(count=2)
-    outer = _make_recreated_preprocess(bsa_override)
-    options["optimized_attention_override"] = outer
+    options, _outer = _with_untwist(options, bsa_override)
     layout = _layout()
     audit, reason = core_bsa_preprocess_compat.probe(options, layout, model)
     assert reason is None and audit is not None
@@ -205,9 +257,11 @@ def test_midforward_outer_preprocess_swap_invalidates_receipts():
     first(args, context)
     assert audit.failure is None
 
-    args["transformer_options"]["optimized_attention_override"] = _make_recreated_preprocess(
-        bsa_override
-    )
+    replacement_options, replacement_outer = _with_untwist(options, bsa_override)
+    assert replacement_outer is not audit.current_override
+    args["transformer_options"]["optimized_attention_override"] = replacement_options[
+        "optimized_attention_override"
+    ]
     second = prepared["patches_replace"]["dit"][("double_block", 1)]
     second(args, context)
     assert audit.failure == "actual_route_mismatch"
