@@ -3,7 +3,7 @@
 Core MiniMax-H3 BSA owns the block replacements, but model-function wrappers may
 legitimately place an ``attention_preprocess_v1`` provider above BSA at call time.
 The outer provider can be recreated for every model call, so object identity is
-not a stable numerical identity.  This module unwraps only the explicit generic
+not a stable numerical identity. This module unwraps only the explicit generic
 preprocess contract, asks the source-gated core-BSA auditor to prove the actual
 BSA owner, then restores the real call-time provider for actual-call validation.
 Unknown wrappers still fail closed.
@@ -11,6 +11,7 @@ Unknown wrappers still fail closed.
 from __future__ import annotations
 
 import hashlib
+import marshal
 import math
 import types
 from typing import Any
@@ -18,25 +19,27 @@ from typing import Any
 from . import core_bsa_compat
 
 _MISSING = object()
+_UNPROVEN = object()
 
 
 def _freeze_contract_value(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, bool)):
         return value
     if isinstance(value, float):
-        return value if math.isfinite(value) else None
+        return value if math.isfinite(value) else _UNPROVEN
     if isinstance(value, (tuple, list)):
         frozen = tuple(_freeze_contract_value(item) for item in value)
-        return None if any(item is None and source is not None for item, source in zip(frozen, value)) else frozen
+        return _UNPROVEN if any(item is _UNPROVEN for item in frozen) else frozen
     if isinstance(value, dict):
         items = []
         for key, item in value.items():
-            frozen = _freeze_contract_value(item)
-            if frozen is None and item is not None:
-                return None
-            items.append((str(key), frozen))
-        return tuple(sorted(items))
-    return None
+            frozen_key = _freeze_contract_value(key)
+            frozen_item = _freeze_contract_value(item)
+            if frozen_key is _UNPROVEN or frozen_item is _UNPROVEN:
+                return _UNPROVEN
+            items.append((frozen_key, frozen_item))
+        return tuple(sorted(items, key=repr))
+    return _UNPROVEN
 
 
 def _stable_callable_semantics(function: Any) -> tuple[Any, ...] | None:
@@ -54,20 +57,17 @@ def _stable_callable_semantics(function: Any) -> tuple[Any, ...] | None:
         if value is _MISSING:
             return None
         frozen = _freeze_contract_value(value)
-        if frozen is None and value is not None:
+        if frozen is _UNPROVEN:
             return None
         frozen_closure.append((name, frozen))
 
-    digest = hashlib.sha256()
-    digest.update(code.co_code)
-    digest.update(repr(code.co_names).encode("utf-8"))
-    digest.update(repr(code.co_freevars).encode("utf-8"))
-    digest.update(repr(code.co_argcount).encode("ascii"))
-    digest.update(repr(code.co_kwonlyargcount).encode("ascii"))
+    # marshal captures constants/nested code as well as bytecode. History is
+    # process-local, so cross-Python-version serialization stability is irrelevant.
+    digest = hashlib.sha256(marshal.dumps(code)).hexdigest()
     return (
         str(getattr(base, "__module__", type(base).__module__)),
         str(getattr(base, "__qualname__", type(base).__qualname__)),
-        digest.hexdigest(),
+        digest,
         tuple(frozen_closure),
     )
 
@@ -120,7 +120,7 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
     if audit is None:
         return None, reason
 
-    # The underlying BSA ownership was proven against the reviewed source.  Add
+    # The underlying BSA ownership was proven against the reviewed source. Add
     # the semantic preprocess chain to history without using the recreated outer
     # wrapper's address, then validate the exact real wrapper during this actual
     # call so a mid-forward provider swap still fails closed.
