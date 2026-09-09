@@ -16,6 +16,8 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
+import torch
+
 from . import core_bsa_compat
 
 AUDITED_UNTWIST_GIT_BLOBS = frozenset(
@@ -42,6 +44,8 @@ def _audited_untwist_preprocess(transform: Any) -> tuple[Any, ...] | None:
         return None
     try:
         module = importlib.import_module(_UNTWIST_MODULE)
+    except torch.cuda.OutOfMemoryError:
+        raise
     except Exception:  # noqa: BLE001 - optional external provider stays fail-closed
         return None
     blob = core_bsa_compat._module_blob_sha(module)
@@ -125,8 +129,13 @@ def _unwrap_reviewed_untwist(
 
 def probe(options: dict[str, Any], layout: Any, model: Any):
     """Prove core BSA ownership through one reviewed active Untwist wrapper."""
-    real_override = options.get("optimized_attention_override")
-    bsa_override, preprocess_identity, reason = _unwrap_reviewed_untwist(options)
+    try:
+        real_override = options.get("optimized_attention_override")
+        bsa_override, preprocess_identity, reason = _unwrap_reviewed_untwist(options)
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception:  # noqa: BLE001 - optional-provider introspection fails closed
+        return None, "untwist_introspection_failed"
     if bsa_override is None:
         return None, reason
     if preprocess_identity is None:
