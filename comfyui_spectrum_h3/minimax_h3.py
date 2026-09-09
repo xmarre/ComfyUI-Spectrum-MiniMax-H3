@@ -20,6 +20,8 @@ from .sampling import (
 LOG = logging.getLogger(__name__)
 
 _STATE_BASIS_CHUNK_BYTES = 16 * 1024 * 1024
+_SANITIZE_CHUNK_BYTES = 16 * 1024 * 1024
+_FORECAST_HEAD_CHUNK_BYTES = 16 * 1024 * 1024
 
 
 def locate_minimax_h3_inner(model: Any) -> tuple[Any | None, str | None]:
@@ -387,6 +389,54 @@ def _prepare_output_state(
 def _sanitize_prediction(feature: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor | None, dict[str, Any] | None]:
     if not dtype.is_floating_point:
         return None, {"reason": "target dtype is not floating point"}
+    if not feature.dtype.is_floating_point:
+        return None, {"reason": "forecast dtype is not floating point"}
+
+    # Spectrum predicts directly in the native H3/context dtype. Keep that
+    # full forecast in BF16/FP16 and validate it in bounded chunks instead of
+    # materializing a second full-size FP32 tensor plus full-size masks.
+    #
+    # A finite value already stored in the target dtype is necessarily within
+    # that dtype's representable range, so same-dtype forecasts only need a
+    # finiteness check. Repair is in-place and only touches chunks containing
+    # NaN/Inf values.
+    if feature.dtype == dtype:
+        flat = feature.reshape(-1)
+        element_size = max(1, feature.element_size())
+        chunk_elements = max(1, _SANITIZE_CHUNK_BYTES // element_size)
+        finite_values = 0
+        nonfinite = 0
+        bad_chunks: list[tuple[int, int]] = []
+
+        for start in range(0, flat.numel(), chunk_elements):
+            stop = min(flat.numel(), start + chunk_elements)
+            chunk = flat[start:stop]
+            finite = torch.isfinite(chunk)
+            if bool(finite.all().item()):
+                finite_values += chunk.numel()
+            else:
+                finite_count = int(finite.sum().item())
+                finite_values += finite_count
+                nonfinite += chunk.numel() - finite_count
+                bad_chunks.append((start, stop))
+
+        if finite_values == 0:
+            return None, {"reason": "forecast contains no finite values"}
+        if nonfinite == 0:
+            return feature, None
+
+        finfo = torch.finfo(dtype)
+        for start, stop in bad_chunks:
+            torch.nan_to_num_(
+                flat[start:stop],
+                nan=0.0,
+                posinf=finfo.max,
+                neginf=finfo.min,
+            )
+        return feature, {"nonfinite": nonfinite, "below": 0, "above": 0}
+
+    # Compatibility fallback for an unexpected dtype mismatch. The normal H3
+    # forecast path above avoids this full-size FP32 conversion entirely.
     fp32 = feature.to(torch.float32)
     finite = torch.isfinite(fp32)
     if not bool(finite.any().item()):
@@ -467,13 +517,17 @@ def _execute_actual(
         # packed tail. Keep a view here; materializing torch.cat would create a
         # second full target tensor on the GPU before the required CPU archive.
         target = hidden[aa:vb].unsqueeze(0)
-        actual_target = target
         from .backend_history import observe
         resets_before = runtime.stats.backend_history_resets
         observe(runtime, run_id, step_id, local_options,
                 local_options.get("attention_backend_preflight_v1"))
         if runtime.stats.backend_history_resets != resets_before:
             residual_probe = None  # discard old-backend shadow/hold evidence
+        # The target is a view into the final packed hidden state. Keeping it in
+        # this closure pins the entire final-hidden CUDA storage, so retain it
+        # only for the optional residual-probe comparison that consumes it
+        # immediately after the transformer returns.
+        actual_target = target if residual_probe is not None else None
         if runtime.active_state_conditioned_residual:
             try:
                 if state_input_target is None:
@@ -517,14 +571,18 @@ def _execute_actual(
         return output
 
     dit_replacements[("double_block", last_index)] = capture_replacement
-    result = executor(
-        x,
-        timestep,
-        context,
-        local_options,
-        minimax_payload=minimax_payload,
-        **kwargs,
-    )
+    try:
+        result = executor(
+            x,
+            timestep,
+            context,
+            local_options,
+            minimax_payload=minimax_payload,
+            **kwargs,
+        )
+    except Exception:
+        actual_target = None
+        raise
     if not observed:
         raise RuntimeError("native MiniMax H3 final transformer block was not executed")
     if residual_probe is not None and actual_target is not None:
@@ -543,8 +601,17 @@ def _execute_actual(
             )
             output_head_started = time.perf_counter()
             try:
-                shadow_output = _execute_forecast(inner, residual_probe.shadow, state, x[0], x[1])
-                hold_output = _execute_forecast(inner, residual_probe.hold, state, x[0], x[1])
+                residual_state_scale = (
+                    1.0 if runtime.active_state_conditioned_residual else 0.0
+                )
+                shadow_output = _execute_forecast(
+                    inner, residual_probe.shadow, state, x[0], x[1],
+                    state_embedding_scale=residual_state_scale,
+                )
+                hold_output = _execute_forecast(
+                    inner, residual_probe.hold, state, x[0], x[1],
+                    state_embedding_scale=residual_state_scale,
+                )
             finally:
                 runtime.record_residual_output_head_seconds(
                     time.perf_counter() - output_head_started
@@ -563,6 +630,11 @@ def _execute_actual(
             raise
         except (RuntimeError, TypeError, ValueError) as exc:
             runtime.disable_experiment(f"residual output-head evaluation failed: {exc}")
+        finally:
+            # Break the replacement-closure reference immediately. Otherwise a
+            # retained patches_replace callback can pin the full final-hidden
+            # CUDA storage across later sampler steps.
+            actual_target = None
     return result
 
 
@@ -587,24 +659,19 @@ def _final_layer_uses_pdd_contract(module: Any) -> bool:
     return False
 
 
-def _execute_forecast(
+def _final_layer_project(
     inner: Any,
-    predicted: torch.Tensor,
+    module: Any,
+    compact: torch.Tensor,
     state: _OutputState,
-    video_x: torch.Tensor,
-    audio_x: torch.Tensor,
-):
-    module = _native_module(inner)
-    (aa, ab), (va, vb) = target_segments(state.layout)
-    audio_rows = ab - aa
-    video_rows = vb - va
-    compact = predicted[0]
-    if compact.shape != (audio_rows + video_rows, inner.hidden_size):
-        raise RuntimeError("forecasted MiniMax H3 target feature has an invalid compact shape")
-    audio_segment = (0, audio_rows, state.audio_timestep_row)
-    video_segment = (audio_rows, audio_rows + video_rows, state.video_timestep_row)
+    video_segment: tuple[int, int, Any],
+    audio_segment: tuple[int, int, Any],
+    *,
+    forward_override: Any | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    forward = forward_override if forward_override is not None else inner.final_layer
     if _final_layer_uses_pdd_contract(module):
-        video_projected, audio_projected = inner.final_layer(
+        return forward(
             compact,
             state.t_emb,
             video_segment,
@@ -613,13 +680,398 @@ def _execute_forecast(
             sample_sigmas=state.sample_sigmas,
             shifts=(state.shift_v, state.shift_a),
         )
-    else:
-        video_projected, audio_projected = inner.final_layer(
+    return forward(
+        compact,
+        state.t_emb,
+        video_segment,
+        audio_segment,
+    )
+
+
+def _callable_marker(callable_obj: Any, name: str, default: Any = None) -> Any:
+    value = getattr(callable_obj, name, None)
+    if value is None:
+        value = getattr(getattr(callable_obj, "__func__", None), name, None)
+    return default if value is None else value
+
+
+def _resolve_final_layer_stream_compat(
+    inner: Any,
+    video_rows: int,
+) -> tuple[Any | None, Any | None, bool, int | None]:
+    """Recover H3-Optimizations' original FinalLayer for cube-order streaming."""
+    forward = inner.final_layer.forward
+    if not bool(_callable_marker(forward, "_h3_optimizations_final_layer", False)):
+        return None, None, False, None
+
+    signature = _callable_marker(
+        forward,
+        "_h3_optimizations_final_layer_signature",
+        None,
+    )
+    chunk_rows = None if signature is None else int(signature)
+    cube_state = _callable_marker(
+        forward,
+        "_h3_optimizations_cube_order_state",
+        None,
+    )
+    if cube_state is None:
+        # FinalLayer-memory-only patching accepts arbitrary input sizes, so keep
+        # the installed wrapper and let it further chunk Spectrum's small slab.
+        return None, None, False, chunk_rows
+
+    original = _callable_marker(
+        forward,
+        "_h3_optimizations_final_layer_original",
+        None,
+    )
+    if not callable(original):
+        raise RuntimeError(
+            "H3-Optimizations FinalLayer cube-order wrapper has no recoverable original"
+        )
+    topology, active = cube_state.resolve(int(video_rows))
+    if len(topology.forward) != int(video_rows):
+        raise RuntimeError("H3 cube-order topology does not match Spectrum video rows")
+    return original, topology, not bool(active), chunk_rows
+
+
+def _slice_mod_selector(
+    selector: Any,
+    start: int,
+    stop: int,
+    stream_rows: int,
+    *,
+    topology: Any | None = None,
+) -> Any:
+    """Slice per-token modulation selectors while preserving scalar selectors."""
+    if (
+        torch.is_tensor(selector)
+        and selector.ndim > 0
+        and int(selector.shape[0]) == int(stream_rows)
+    ):
+        if topology is not None:
+            index = torch.tensor(
+                topology.forward[int(start) : int(stop)],
+                dtype=torch.long,
+                device=selector.device,
+            )
+            return selector.index_select(0, index)
+        return selector[int(start) : int(stop)]
+    return selector
+
+
+def _prepare_exact_state_rows_cpu(
+    inner: Any,
+    video_x: torch.Tensor,
+    audio_x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build exact H3 input rows in system RAM for streamed residual reconstruction."""
+    module = _native_module(inner)
+    common_dit = importlib.import_module("comfy.ldm.common_dit")
+    video_cpu = video_x.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    audio_cpu = audio_x.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    padded_video = common_dit.pad_to_patch_size(video_cpu, tuple(inner.patch_size))
+    video_rows = module.patchify_video(
+        padded_video,
+        tuple(inner.patch_size),
+    ).contiguous()
+    audio_rows = module.pack_audio(audio_cpu).contiguous()
+    if audio_rows.ndim != 2 or video_rows.ndim != 2:
+        raise ValueError("native H3 patch helpers returned an unexpected row layout")
+    return audio_rows, video_rows
+
+
+def _copy_cpu_chunk_to_workspace_(
+    workspace: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """Copy into reusable CUDA storage; pageable CPU sources stay synchronous."""
+    count = int(source.shape[0])
+    if count > int(workspace.shape[0]):
+        raise RuntimeError("Spectrum streaming workspace is smaller than its chunk")
+    target = workspace[:count]
+    target.copy_(source, non_blocking=bool(source.is_pinned()))
+    return target
+
+
+def _project_cpu_forecast_stream(
+    inner: Any,
+    module: Any,
+    compact_cpu: torch.Tensor,
+    state: _OutputState,
+    *,
+    global_start: int,
+    stream_rows: int,
+    selector: Any,
+    video: bool,
+    device: torch.device,
+    forward_override: Any | None = None,
+    topology: Any | None = None,
+    reorder_selector: bool = False,
+    chunk_rows_override: int | None = None,
+    state_rows_cpu: torch.Tensor | None = None,
+    state_projection: Any | None = None,
+    state_scale: float = 0.0,
+    hidden_workspace: torch.Tensor | None = None,
+    state_workspace: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Project one forecast stream without materializing its hidden state on CUDA."""
+    rows = int(stream_rows)
+    hidden = int(inner.hidden_size)
+    if rows <= 0:
+        head = inner.final_layer.video_out if video else inner.final_layer.audio_out
+        return torch.empty(
+            (0, int(head.out_features)),
+            device=device,
+            dtype=torch.float32,
+        )
+
+    bytes_per_row = max(1, hidden * compact_cpu.element_size())
+    chunk_rows = max(1, _FORECAST_HEAD_CHUNK_BYTES // bytes_per_row)
+    if chunk_rows_override is not None and int(chunk_rows_override) > 0:
+        chunk_rows = min(chunk_rows, int(chunk_rows_override))
+    if state_rows_cpu is not None and int(state_rows_cpu.shape[0]) != rows:
+        raise ValueError("streamed exact-state rows do not match the target stream")
+    if hidden_workspace is not None:
+        if (
+            hidden_workspace.device != device
+            or hidden_workspace.dtype != compact_cpu.dtype
+            or int(hidden_workspace.shape[1]) != hidden
+        ):
+            raise ValueError("Spectrum hidden streaming workspace is incompatible")
+        chunk_rows = min(chunk_rows, int(hidden_workspace.shape[0]))
+    projected = None
+
+    for local_start in range(0, rows, chunk_rows):
+        local_stop = min(rows, local_start + chunk_rows)
+        count = local_stop - local_start
+        hidden_source = compact_cpu[
+            int(global_start) + local_start : int(global_start) + local_stop
+        ]
+        if hidden_workspace is None:
+            hidden_chunk = hidden_source.to(
+                device=device,
+                dtype=compact_cpu.dtype,
+                non_blocking=bool(hidden_source.is_pinned()),
+            )
+        else:
+            hidden_chunk = _copy_cpu_chunk_to_workspace_(
+                hidden_workspace,
+                hidden_source,
+            )
+        if state_rows_cpu is not None:
+            if state_projection is None:
+                raise RuntimeError("streamed exact-state rows have no patch projection")
+            if topology is None:
+                state_chunk_cpu = state_rows_cpu[local_start:local_stop]
+            else:
+                state_index = torch.tensor(
+                    topology.forward[local_start:local_stop],
+                    dtype=torch.long,
+                    device=state_rows_cpu.device,
+                )
+                state_chunk_cpu = state_rows_cpu.index_select(0, state_index)
+            if state_workspace is None:
+                state_chunk = state_chunk_cpu.to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=bool(state_chunk_cpu.is_pinned()),
+                )
+            else:
+                if (
+                    state_workspace.device != device
+                    or state_workspace.dtype != torch.float32
+                    or int(state_workspace.shape[1]) != int(state_chunk_cpu.shape[1])
+                ):
+                    raise ValueError(
+                        "Spectrum exact-state streaming workspace is incompatible"
+                    )
+                state_chunk = _copy_cpu_chunk_to_workspace_(
+                    state_workspace,
+                    state_chunk_cpu,
+                )
+            embedded = state_projection(state_chunk).to(hidden_chunk.dtype)
+            hidden_chunk.add_(embedded, alpha=float(state_scale))
+            del state_chunk, embedded
+
+        row_selector = _slice_mod_selector(
+            selector,
+            local_start,
+            local_stop,
+            rows,
+            topology=(topology if reorder_selector else None),
+        )
+        # FinalLayer is row-local. Give the inactive stream an empty range with
+        # a scalar selector so no full-stream modulation tensor is broadcast
+        # into the empty slice.
+        if video:
+            video_segment = (0, count, row_selector)
+            audio_segment = (count, count, 0)
+        else:
+            video_segment = (count, count, 0)
+            audio_segment = (0, count, row_selector)
+
+        video_chunk, audio_chunk = _final_layer_project(
+            inner,
+            module,
+            hidden_chunk,
+            state,
+            video_segment,
+            audio_segment,
+            forward_override=forward_override,
+        )
+        selected = video_chunk if video else audio_chunk
+        if projected is None:
+            projected = selected.new_empty((rows, *selected.shape[1:]))
+        if video and topology is not None:
+            # topology.forward maps cube-major row -> raster row. Restore each
+            # projected slab directly, avoiding another full output allocation.
+            restore_index = torch.tensor(
+                topology.forward[local_start:local_stop],
+                dtype=torch.long,
+                device=selected.device,
+            )
+            projected.index_copy_(0, restore_index, selected)
+        else:
+            projected[local_start:local_stop].copy_(selected)
+        del hidden_source, hidden_chunk, video_chunk, audio_chunk, selected
+
+    if projected is None:
+        raise RuntimeError("streamed Spectrum FinalLayer projection produced no rows")
+    return projected
+
+
+def _execute_forecast(
+    inner: Any,
+    predicted: torch.Tensor,
+    state: _OutputState,
+    video_x: torch.Tensor,
+    audio_x: torch.Tensor,
+    *,
+    state_embedding_scale: float = 0.0,
+):
+    module = _native_module(inner)
+    (aa, ab), (va, vb) = target_segments(state.layout)
+    audio_rows = ab - aa
+    video_rows = vb - va
+    compact = predicted[0]
+    if compact.shape != (audio_rows + video_rows, inner.hidden_size):
+        raise RuntimeError("forecasted MiniMax H3 target feature has an invalid compact shape")
+
+    # Keep the complete hidden forecast in system RAM and transfer only bounded
+    # row slabs. This path also handles offline replay, exact-state residual
+    # reconstruction and H3-Optimizations cube-order FinalLayer compatibility.
+    if compact.device.type == "cpu" and video_x.device.type == "cuda":
+        forward_override, video_topology, reorder_selector, h3_chunk_rows = (
+            _resolve_final_layer_stream_compat(inner, video_rows)
+        )
+        state_audio_rows = None
+        state_video_rows = None
+        if float(state_embedding_scale) != 0.0:
+            state_audio_rows, state_video_rows = _prepare_exact_state_rows_cpu(
+                inner,
+                video_x,
+                audio_x,
+            )
+            if (
+                int(state_audio_rows.shape[0]) != audio_rows
+                or int(state_video_rows.shape[0]) != video_rows
+            ):
+                raise ValueError(
+                    "state-conditioned residual input rows do not match forecast topology"
+                )
+
+        # Allocate the CUDA staging tensors once for this forecast and reuse
+        # them for every audio/video slab. Keeping them local prevents Spectrum
+        # from reserving VRAM across the following actual transformer call.
+        bytes_per_hidden_row = max(1, int(inner.hidden_size) * compact.element_size())
+        workspace_rows = max(
+            1,
+            _FORECAST_HEAD_CHUNK_BYTES // bytes_per_hidden_row,
+        )
+        if h3_chunk_rows is not None and int(h3_chunk_rows) > 0:
+            workspace_rows = min(workspace_rows, int(h3_chunk_rows))
+        workspace_rows = min(workspace_rows, max(audio_rows, video_rows))
+        hidden_workspace = torch.empty(
+            (workspace_rows, int(inner.hidden_size)),
+            device=video_x.device,
+            dtype=compact.dtype,
+        )
+        audio_state_workspace = None
+        video_state_workspace = None
+        if state_audio_rows is not None:
+            audio_state_workspace = torch.empty(
+                (min(workspace_rows, audio_rows), int(state_audio_rows.shape[1])),
+                device=video_x.device,
+                dtype=torch.float32,
+            )
+            video_state_workspace = torch.empty(
+                (min(workspace_rows, video_rows), int(state_video_rows.shape[1])),
+                device=video_x.device,
+                dtype=torch.float32,
+            )
+
+        audio_projected = _project_cpu_forecast_stream(
+            inner,
+            module,
             compact,
-            state.t_emb,
+            state,
+            global_start=0,
+            stream_rows=audio_rows,
+            selector=state.audio_timestep_row,
+            video=False,
+            device=video_x.device,
+            forward_override=forward_override,
+            chunk_rows_override=h3_chunk_rows,
+            state_rows_cpu=state_audio_rows,
+            state_projection=inner.audio_patch_proj,
+            state_scale=state_embedding_scale,
+            hidden_workspace=hidden_workspace,
+            state_workspace=audio_state_workspace,
+        )
+        video_projected = _project_cpu_forecast_stream(
+            inner,
+            module,
+            compact,
+            state,
+            global_start=audio_rows,
+            stream_rows=video_rows,
+            selector=state.video_timestep_row,
+            video=True,
+            device=video_x.device,
+            forward_override=forward_override,
+            topology=video_topology,
+            reorder_selector=reorder_selector,
+            chunk_rows_override=h3_chunk_rows,
+            state_rows_cpu=state_video_rows,
+            state_projection=inner.video_patch_proj,
+            state_scale=state_embedding_scale,
+            hidden_workspace=hidden_workspace,
+            state_workspace=video_state_workspace,
+        )
+        del hidden_workspace
+        del audio_state_workspace, video_state_workspace
+        del state_audio_rows, state_video_rows
+    else:
+        if float(state_embedding_scale) != 0.0:
+            _apply_exact_state_input_embedding_(
+                predicted,
+                inner,
+                video_x,
+                audio_x,
+                scale=float(state_embedding_scale),
+            )
+        audio_segment = (0, audio_rows, state.audio_timestep_row)
+        video_segment = (audio_rows, audio_rows + video_rows, state.video_timestep_row)
+        video_projected, audio_projected = _final_layer_project(
+            inner,
+            module,
+            compact,
+            state,
             video_segment,
             audio_segment,
         )
+
     latent_t, latent_h, latent_w = state.padded_video_shape
     video_out = module.unpatchify_video(
         video_projected,
@@ -716,11 +1168,16 @@ def diffusion_model_wrapper(
         )
 
     if actual:
+        residual_prediction_device = (
+            torch.device("cpu")
+            if video_x.device.type == "cuda"
+            else video_x.device
+        )
         residual_probe = runtime.prepare_residual_probe(
             int(run_id),
             int(step_id),
             call_id,
-            device=video_x.device,
+            device=residual_prediction_device,
             dtype=context.dtype,
         )
         return _execute_actual(
@@ -761,11 +1218,18 @@ def diffusion_model_wrapper(
                 kwargs,
             )
 
+    # Keep every complete Spectrum prediction out of CUDA: causal forecasts,
+    # state-conditioned residuals, offline replay and bootstrap/model-aware
+    # forecasts all use the same bounded output-head streamer below.
+    prediction_device = (
+        torch.device("cpu") if video_x.device.type == "cuda" else video_x.device
+    )
+
     predicted = runtime.predict(
         int(run_id),
         int(step_id),
         call_id,
-        device=video_x.device,
+        device=prediction_device,
         dtype=context.dtype,
     )
     if predicted is None:
@@ -784,39 +1248,6 @@ def diffusion_model_wrapper(
             minimax_payload,
             kwargs,
         )
-
-    if runtime.active_state_conditioned_residual:
-        try:
-            _apply_exact_state_input_embedding_(
-                predicted,
-                inner,
-                video_x,
-                audio_x,
-                scale=1.0,
-            )
-        except torch.cuda.OutOfMemoryError:
-            raise
-        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
-            runtime.fallback_current_step(
-                int(run_id),
-                int(step_id),
-                f"state-conditioned residual forecast reconstruction failed: {exc}",
-            )
-            return _execute_actual(
-                executor,
-                inner,
-                runtime,
-                int(run_id),
-                int(step_id),
-                call_id,
-                layout,
-                x,
-                timestep,
-                context,
-                options,
-                minimax_payload,
-                kwargs,
-            )
 
     sanitized, event = _sanitize_prediction(predicted, context.dtype)
     if sanitized is None:
@@ -851,7 +1282,19 @@ def diffusion_model_wrapper(
             denoise_mask=kwargs.get("denoise_mask"),
             audio_denoise_mask=kwargs.get("audio_denoise_mask"),
         )
-        output = _execute_forecast(inner, sanitized, state, video_x, audio_x)
+        output = _execute_forecast(
+            inner,
+            sanitized,
+            state,
+            video_x,
+            audio_x,
+            state_embedding_scale=(
+                1.0 if runtime.active_state_conditioned_residual else 0.0
+            ),
+        )
+        del state
+        del sanitized
+        del predicted
     except torch.cuda.OutOfMemoryError:
         raise
     except (RuntimeError, TypeError, ValueError) as exc:
