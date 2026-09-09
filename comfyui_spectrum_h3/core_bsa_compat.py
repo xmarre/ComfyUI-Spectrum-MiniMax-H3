@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
 import importlib
+import math
 from pathlib import Path
 import types
 from typing import Any
@@ -42,14 +43,11 @@ class CoreBSAAudit:
     layout_identity: tuple[Any, ...]
     settings_identity: tuple[Any, ...]
     route_specs: tuple[tuple[str, tuple[int, int], tuple[int, int]], ...]
-    pool_specs: tuple[tuple[int, int, str], ...]
+    pool_specs: tuple[tuple[int, int, str | None], ...]
     expected_receipts: tuple[tuple[Any, ...], ...]
     source_blob: str
     current_override: Any
     failure: str | None = None
-    actual_options_id: int | None = None
-    actual_metadata_ok: bool | None = None
-    actual_inside_window: bool | None = None
 
 
 def has_core_bsa_callback(options: dict[str, Any]) -> bool:
@@ -60,6 +58,34 @@ def has_core_bsa_callback(options: dict[str, Any]) -> bool:
         return any("block_sparse_attention" in group for group in callbacks.values())
     except Exception:  # noqa: BLE001 - malformed metadata is not trusted
         return False
+
+
+def _looks_like_core_bsa_callable(function: Any, owner: str, local_name: str) -> bool:
+    base = getattr(function, "__func__", function)
+    return (
+        getattr(base, "__module__", None) == "comfy_extras.nodes_sparse_attention"
+        and getattr(base, "__qualname__", None) == f"{owner}.<locals>.{local_name}"
+    )
+
+
+def has_core_bsa_evidence(options: dict[str, Any]) -> bool:
+    """Detect current core BSA even if another node dropped its callback metadata."""
+    if has_core_bsa_callback(options):
+        return True
+    if _looks_like_core_bsa_callable(
+        options.get("optimized_attention_override"), "make_attention_override", "override"
+    ):
+        return True
+    patches_replace = options.get("patches_replace", {})
+    if not isinstance(patches_replace, dict):
+        return False
+    dit = patches_replace.get("dit", {})
+    if not isinstance(dit, dict):
+        return False
+    return any(
+        _looks_like_core_bsa_callable(replacement, "make_h3_block_patch", "block_patch")
+        for replacement in dit.values()
+    )
 
 
 @lru_cache(maxsize=8)
@@ -232,7 +258,8 @@ def _sigma_value(options: dict[str, Any]) -> float | None:
     try:
         if len(sigmas) == 0:
             return None
-        return float(sigmas[0])
+        value = float(sigmas[0])
+        return value if math.isfinite(value) else None
     except torch.cuda.OutOfMemoryError:
         raise
     except (TypeError, ValueError, RuntimeError):
@@ -242,13 +269,19 @@ def _sigma_value(options: dict[str, Any]) -> float | None:
 def _settings_identity(patch: Any) -> tuple[Any, ...] | None:
     try:
         dense_blocks = tuple(sorted(int(index) for index in patch.dense_blocks))
+        tau = float(patch.tau)
+        topk_ratio = float(patch.topk_ratio)
+        sigma_start = float(patch.sigma_start)
+        sigma_end = float(patch.sigma_end)
+        if not all(math.isfinite(value) for value in (tau, topk_ratio, sigma_start, sigma_end)):
+            return None
         settings = (
             bool(patch.vsa),
-            float(patch.tau),
-            float(patch.topk_ratio),
+            tau,
+            topk_ratio,
             int(patch.extra_tokens),
-            float(patch.sigma_start),
-            float(patch.sigma_end),
+            sigma_start,
+            sigma_end,
             int(patch.min_tokens),
             dense_blocks,
             str(patch.sink_conditioning),
@@ -267,13 +300,17 @@ def _runtime_execution_identity(model: Any) -> tuple[Any, ...] | None:
     try:
         for block in blocks:
             attn = block.attn
+            projection = attn.qkv_proj
+            weight = projection.weight
             forwards.append(_callable_identity(attn.forward))
-            weight = attn.qkv_proj.weight
             qkv.append(
                 (
                     int(attn.head_dim),
-                    str(weight.device),
                     str(weight.dtype),
+                    type(projection).__module__,
+                    type(projection).__qualname__,
+                    type(weight).__module__,
+                    type(weight).__qualname__,
                 )
             )
     except (AttributeError, TypeError, ValueError):
@@ -285,6 +322,29 @@ def _runtime_execution_identity(model: Any) -> tuple[Any, ...] | None:
     )
 
 
+def _candidate_cuda_device(blocks: Any) -> torch.device | None:
+    try:
+        cuda_devices = {
+            torch.device(block.attn.qkv_proj.weight.device)
+            for block in blocks
+            if torch.device(block.attn.qkv_proj.weight.device).type == "cuda"
+        }
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return None
+    if len(cuda_devices) == 1:
+        return next(iter(cuda_devices))
+    if len(cuda_devices) > 1:
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        return torch.device("cuda", torch.cuda.current_device())
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except (RuntimeError, TypeError, ValueError):
+        return None
+
+
 def _sparse_runtime_eligible(model: Any, module: Any) -> bool:
     blocks = getattr(model, "blocks", ())
     if not blocks:
@@ -292,7 +352,6 @@ def _sparse_runtime_eligible(model: Any, module: Any) -> bool:
     compute_dtype = getattr(model, "dtype", None)
     try:
         weight_dtypes = {block.attn.qkv_proj.weight.dtype for block in blocks}
-        devices = {block.attn.qkv_proj.weight.device for block in blocks}
         head_dims = {int(block.attn.head_dim) for block in blocks}
     except (AttributeError, TypeError, ValueError):
         return False
@@ -300,10 +359,10 @@ def _sparse_runtime_eligible(model: Any, module: Any) -> bool:
         compute_dtype = next(iter(weight_dtypes))
     if compute_dtype is not torch.bfloat16:
         return False
-    if head_dims != {int(module.HEAD_DIM)} or len(devices) != 1:
+    if head_dims != {int(module.HEAD_DIM)}:
         return False
-    device = next(iter(devices))
-    if device.type != "cuda":
+    device = _candidate_cuda_device(blocks)
+    if device is None:
         return False
     try:
         return bool(module.ck.sol_attn_is_available(device))
@@ -422,7 +481,7 @@ def _replacement_ownership(
 def _pool_entry(
     patch: Any,
     key: tuple[Any, ...],
-    expected: tuple[int, int, str] | None = None,
+    expected: tuple[int, int, str | None] | None = None,
 ) -> tuple[Any, ...]:
     pooled = getattr(patch, "pooled", None)
     if not isinstance(pooled, dict):
@@ -442,7 +501,7 @@ def _pool_entry(
         if any(
             tuple(value.shape) != required_shape
             or value.dtype is not torch.float32
-            or str(value.device) != device
+            or (device is not None and str(value.device) != device)
             for value in entry
         ):
             return ("invalid",)
@@ -458,6 +517,31 @@ def _pool_entry(
         raise
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return ("invalid",)
+
+
+def _pool_ownership_identity(
+    patch: Any,
+    block_count: int,
+    seq_len: int,
+    uuids: tuple[Any, ...],
+    pool_specs: tuple[tuple[int, int, str | None], ...],
+) -> tuple[Any, ...]:
+    ownership = []
+    for index in range(block_count):
+        state = _pool_entry(patch, (index, seq_len, uuids), pool_specs[index])
+        if state[0] == "present":
+            ownership.append(
+                (
+                    index,
+                    id(state[1]),
+                    id(state[2]),
+                    str(state[1].device),
+                    str(state[2].device),
+                )
+            )
+        else:
+            ownership.append((index, state[0]))
+    return tuple(ownership)
 
 
 def _classify_pool_transition(before: tuple[Any, ...], after: tuple[Any, ...]) -> str:
@@ -490,7 +574,7 @@ def _route_specs(
     layout_identity: tuple[Any, ...],
     options: dict[str, Any],
     sparse_runtime_ok: bool,
-    pool_specs: tuple[tuple[int, int, str], ...],
+    pool_specs: tuple[tuple[int, int, str | None], ...],
 ) -> tuple[tuple[tuple[str, tuple[int, int], tuple[int, int]], ...], bool] | None:
     sigma = _sigma_value(options)
     if sigma is None:
@@ -563,11 +647,15 @@ def probe(
                 (
                     int(block.attn.heads),
                     int(block.attn.head_dim),
-                    str(block.attn.qkv_proj.weight.device),
+                    (
+                        str(block.attn.qkv_proj.weight.device)
+                        if torch.device(block.attn.qkv_proj.weight.device).type == "cuda"
+                        else None
+                    ),
                 )
                 for block in model.blocks
             )
-        except (AttributeError, TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError, RuntimeError):
             return None, "pool_shape_unproven"
 
         sparse_runtime_ok = _sparse_runtime_eligible(model, module)
@@ -584,6 +672,9 @@ def probe(
         if routed is None:
             return None, "route_unproven"
         route_specs, safe = routed
+        pool_ownership = _pool_ownership_identity(
+            patch, len(model.blocks), seq_len, uuids, pool_specs
+        )
         expected_receipts = tuple(
             (
                 ADAPTER_KEY,
@@ -608,6 +699,7 @@ def probe(
             ("layout", layout_identity),
             ("uuids", _freeze(uuids)),
             ("routes", route_specs),
+            ("pool_ownership", pool_ownership),
             ("ownership", ownership_identity),
             ("execution", execution_identity),
         )
@@ -645,44 +737,39 @@ def _current_route_matches(
     if not torch.is_tensor(hidden) or hidden.ndim < 1 or int(hidden.shape[0]) != audit.seq_len:
         return False
 
-    options_id = id(call_options)
-    if audit.actual_options_id != options_id or audit.actual_metadata_ok is None:
-        metadata_ok = True
-        if _normalize_uuids(call_options) != audit.uuids:
-            metadata_ok = False
-        if _settings_identity(audit.patch) != audit.settings_identity:
-            metadata_ok = False
-        if call_options.get("optimized_attention_override") is not audit.current_override:
-            metadata_ok = False
-        actual_layout = _normalize_layout(call_options.get("minimax_h3_layout"))
-        if (
-            actual_layout is None
-            or actual_layout[1] != audit.layout_identity
-            or actual_layout[0] != audit.seq_len
-        ):
-            metadata_ok = False
-        sigma = _sigma_value(call_options)
-        if sigma is None:
-            metadata_ok = False
-            inside_window = False
-        else:
-            sigma_start = audit.settings_identity[4]
-            sigma_end = audit.settings_identity[5]
-            inside_window = sigma_end <= sigma <= sigma_start
-        audit.actual_options_id = options_id
-        audit.actual_metadata_ok = metadata_ok
-        audit.actual_inside_window = inside_window
+    metadata_ok = True
+    if _normalize_uuids(call_options) != audit.uuids:
+        metadata_ok = False
+    if _settings_identity(audit.patch) != audit.settings_identity:
+        metadata_ok = False
+    if call_options.get("optimized_attention_override") is not audit.current_override:
+        metadata_ok = False
+    actual_layout = _normalize_layout(call_options.get("minimax_h3_layout"))
+    if (
+        actual_layout is None
+        or actual_layout[1] != audit.layout_identity
+        or actual_layout[0] != audit.seq_len
+    ):
+        metadata_ok = False
+    sigma = _sigma_value(call_options)
+    if sigma is None:
+        metadata_ok = False
+        inside_window = False
+    else:
+        sigma_start = audit.settings_identity[4]
+        sigma_end = audit.settings_identity[5]
+        inside_window = sigma_end <= sigma <= sigma_start
 
-    if not audit.actual_metadata_ok:
-        return False
     min_tokens = audit.settings_identity[6]
     dense_blocks = audit.settings_identity[7]
-    dense = (
-        not bool(audit.actual_inside_window)
-        or audit.seq_len < min_tokens
-        or index in dense_blocks
-    )
+    dense = not inside_window or audit.seq_len < min_tokens or index in dense_blocks
     expected_route = audit.route_specs[index][0]
+    if expected_route != "h3_dense" and (
+        hidden.dtype is not torch.bfloat16 or hidden.device.type != "cuda"
+    ):
+        metadata_ok = False
+    if not metadata_ok:
+        return False
     if expected_route == "h3_dense":
         return dense
     return not dense
