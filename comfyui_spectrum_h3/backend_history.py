@@ -6,11 +6,14 @@ Actual attention providers append hashable receipts before the last block return
 Opaque routing is actual-only per call; it never aborts sampling.
 """
 from dataclasses import dataclass
+import logging
 
 import torch
 
 POLICIES = "attention_backend_history_v1"
 RECEIPTS = "attention_backend_receipts_v1"
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -59,26 +62,69 @@ def _runtime_has_backend_evidence(runtime) -> bool:
     return runtime._offline_smoother is not None
 
 
-def preflight(options, layout, model):
+def _preflight(options, layout, model):
     policies = options.get(POLICIES, {})
-    if not policies:
-        # Core BSA predates the provider contract. Preserve its operator while
-        # requiring actual execution; never forecast across its unreported schedule.
-        callbacks = options.get("callbacks", {})
-        if any("block_sparse_attention" in group for group in callbacks.values()):
-            return ("core_bsa_unreported",), False
-        return None, True
-    identities = []
-    safe = True
-    for name, provider in sorted(policies.items()):
-        identity = _provider_identity(provider, layout=layout, options=options, model=model)
-        safe = safe and identity is not None
-        identities.append((name, identity))
-    return tuple(identities), safe
+    if policies:
+        identities = []
+        safe = True
+        for name, provider in sorted(policies.items()):
+            identity = _provider_identity(provider, layout=layout, options=options, model=model)
+            safe = safe and identity is not None
+            identities.append((name, identity))
+        return tuple(identities), safe, None
+
+    # Core ComfyUI BSA does not publish the generic provider contract. Spectrum
+    # owns a narrowly version-gated compatibility audit for the exact reviewed
+    # implementation; any unknown source/ownership remains actual-only.
+    from . import core_bsa_compat
+
+    if core_bsa_compat.has_core_bsa_evidence(options):
+        audit, reason = core_bsa_compat.probe(options, layout, model)
+        if audit is not None:
+            return audit.identity, audit.safe, audit
+        return ("core_bsa_unreported", reason or "unrecognized"), False, None
+
+    return None, True, None
+
+
+def preflight(options, layout, model):
+    identity, safe, _audit = _preflight(options, layout, model)
+    return identity, safe
+
+
+def _debug_core_bsa_preflight(runtime, run_id, step_id, identity, safe, audit):
+    if not runtime.config.debug:
+        return
+    if audit is not None:
+        routes = ",".join(str(spec[0]) for spec in audit.route_specs)
+        LOG.warning(
+            "Spectrum H3 core-BSA preflight run_id=%s step=%s result=audited safe=%s "
+            "seq_len=%s routes=%s failure=%s",
+            run_id,
+            step_id,
+            bool(safe),
+            audit.seq_len,
+            routes,
+            audit.failure,
+        )
+        return
+    if (
+        isinstance(identity, tuple)
+        and len(identity) >= 2
+        and identity[0] == "core_bsa_unreported"
+    ):
+        LOG.warning(
+            "Spectrum H3 core-BSA preflight run_id=%s step=%s result=unreported "
+            "safe=False reason=%s",
+            run_id,
+            step_id,
+            identity[1],
+        )
 
 
 def prepare(runtime, run_id, step_id, options, layout, model):
-    identity, safe = preflight(options, layout, model)
+    identity, safe, audit = _preflight(options, layout, model)
+    _debug_core_bsa_preflight(runtime, run_id, step_id, identity, safe, audit)
     if identity is None:
         if runtime._backend_history.policy is None:
             return options, None
@@ -90,7 +136,13 @@ def prepare(runtime, run_id, step_id, options, layout, model):
     if runtime._backend_history.policy is None and not _runtime_has_backend_evidence(runtime):
         runtime._backend_history = BackendHistory(policy=identity)
     runtime.prepare_backend_history(run_id, step_id, identity, safe)
-    return {**options, RECEIPTS: []}, (identity, safe)
+
+    prepared = {**options, RECEIPTS: []}
+    if audit is not None:
+        from . import core_bsa_compat
+
+        prepared = core_bsa_compat.instrument_actual_options(prepared, audit, RECEIPTS)
+    return prepared, (identity, safe)
 
 
 def observe(runtime, run_id, step_id, options, policy):
@@ -98,11 +150,50 @@ def observe(runtime, run_id, step_id, options, policy):
         return
     identity, safe = policy
     receipts = tuple(options.get(RECEIPTS, ()))
-    # A fallback is not proof that the next call follows the same route. Until a
-    # provider can predict it, execute actuals and re-enable forecasts after SOL
-    # eligibility returns. Stable dense warmup is predictable through its policy.
-    safe = safe and bool(receipts) and all(
-        _provider_accepts(provider, receipts)
-        for provider in options.get(POLICIES, {}).values()
-    )
+
+    from . import core_bsa_compat
+
+    audit = options.get(core_bsa_compat.PRIVATE_AUDIT_KEY)
+    if audit is not None:
+        accepted = core_bsa_compat.accepts_actual(audit, receipts)
+        safe = safe and accepted
+        if runtime.config.debug:
+            routes = ",".join(
+                str(item[4]) if isinstance(item, tuple) and len(item) > 4 else "malformed"
+                for item in receipts
+            )
+            LOG.warning(
+                "Spectrum H3 core-BSA observe run_id=%s step=%s accepted=%s "
+                "preflight_safe=%s receipts=%s expected=%s failure=%s routes=%s",
+                run_id,
+                step_id,
+                bool(accepted),
+                bool(policy[1]),
+                len(receipts),
+                len(audit.expected_receipts),
+                audit.failure,
+                routes,
+            )
+    else:
+        # A fallback is not proof that the next call follows the same route. Until
+        # a provider can predict it, execute actuals and re-enable forecasts after
+        # the provider reports a stable route.
+        safe = safe and bool(receipts) and all(
+            _provider_accepts(provider, receipts)
+            for provider in options.get(POLICIES, {}).values()
+        )
+        if (
+            runtime.config.debug
+            and isinstance(identity, tuple)
+            and len(identity) >= 2
+            and identity[0] == "core_bsa_unreported"
+        ):
+            LOG.warning(
+                "Spectrum H3 core-BSA observe run_id=%s step=%s accepted=False "
+                "reason=%s receipts=%s",
+                run_id,
+                step_id,
+                identity[1],
+                len(receipts),
+            )
     runtime.observe_backend_history(run_id, step_id, identity, receipts, safe)
