@@ -1297,9 +1297,32 @@ def diffusion_model_wrapper(
         del predicted
     except torch.cuda.OutOfMemoryError:
         raise
-    except (RuntimeError, TypeError, ValueError) as exc:
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
         if runtime.offline_phase == "replay":
-            raise OfflineReplayAbort(f"offline replay output-head evaluation failed: {exc}") from exc
+            raise OfflineReplayAbort(
+                f"offline replay output-head evaluation failed: {exc}"
+            ) from exc
+        if runtime.active_state_conditioned_residual:
+            runtime.fallback_current_step(
+                int(run_id),
+                int(step_id),
+                f"state-conditioned residual forecast reconstruction failed: {exc}",
+            )
+            return _execute_actual(
+                executor,
+                inner,
+                runtime,
+                int(run_id),
+                int(step_id),
+                call_id,
+                layout,
+                x,
+                timestep,
+                context,
+                options,
+                minimax_payload,
+                kwargs,
+            )
         raise
     if runtime.config.debug:
         LOG.warning(
