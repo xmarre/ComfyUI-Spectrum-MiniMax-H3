@@ -102,6 +102,25 @@ def test_reviewed_core_bsa_dense_route_is_structurally_recognized():
     assert {spec[0] for spec in audit.route_specs} == {"h3_dense"}
 
 
+def test_structural_bsa_evidence_survives_missing_callback():
+    _nodes, model, _patch, options = _installation(sigma=1.0)
+    options["callbacks"] = {}
+    assert core_bsa_compat.has_core_bsa_evidence(options)
+    identity, safe = preflight(options, _layout(), model)
+    assert identity[0] == core_bsa_compat.ADAPTER_KEY
+    assert safe
+
+
+def test_structural_bsa_evidence_fails_closed_after_override_replacement():
+    _nodes, model, _patch, options = _installation(sigma=1.0)
+    options["callbacks"] = {}
+    options["optimized_attention_override"] = lambda *args, **kwargs: None
+    assert core_bsa_compat.has_core_bsa_evidence(options)
+    identity, safe = preflight(options, _layout(), model)
+    assert identity == ("core_bsa_unreported", "ownership_unproven")
+    assert not safe
+
+
 def test_explicit_provider_contract_keeps_precedence(monkeypatch):
     class Provider:
         def __call__(self, **_kwargs):
@@ -184,6 +203,16 @@ def test_inherited_attention_owner_change_changes_policy_identity():
     assert first.identity != second.identity
 
 
+def test_execution_identity_ignores_transient_weight_residency():
+    model = _FakeModel(1)
+    first = core_bsa_compat._runtime_execution_identity(model)
+    model.blocks[0].attn.qkv_proj.weight = torch.empty(
+        1, dtype=torch.bfloat16, device="meta"
+    )
+    second = core_bsa_compat._runtime_execution_identity(model)
+    assert first == second
+
+
 def test_dense_sparse_and_cold_primed_transitions_change_identity(monkeypatch):
     _nodes, model, patch, options = _installation(sigma=1.0)
     dense, reason = core_bsa_compat.probe(options, _layout(), model)
@@ -212,6 +241,29 @@ def test_dense_sparse_and_cold_primed_transitions_change_identity(monkeypatch):
     assert cold.identity != primed.identity
 
 
+def test_pool_tensor_replacement_changes_policy_identity(monkeypatch):
+    monkeypatch.setattr(
+        core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True
+    )
+    _nodes, model, patch, options = _installation(sigma=0.5, count=1)
+    shape = (model.blocks[0].attn.heads, model.blocks[0].attn.head_dim)
+    key = (0, 128, ("positive",))
+    patch.pooled[key] = (
+        torch.zeros(shape, dtype=torch.float32),
+        torch.zeros(shape, dtype=torch.float32),
+    )
+    first, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and first is not None and first.safe
+
+    patch.pooled[key] = (
+        torch.zeros(shape, dtype=torch.float32),
+        torch.zeros(shape, dtype=torch.float32),
+    )
+    second, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and second is not None and second.safe
+    assert first.identity != second.identity
+
+
 def test_layout_and_uuid_changes_change_policy_identity(monkeypatch):
     monkeypatch.setattr(
         core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True
@@ -237,6 +289,11 @@ def test_layout_and_uuid_changes_change_policy_identity(monkeypatch):
     layout_identity, reason = core_bsa_compat.probe(options, layout_changed, model)
     assert reason is None and layout_identity is not None
     assert uuid_changed.identity != layout_identity.identity
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_sigma_is_unproven(value):
+    assert core_bsa_compat._sigma_value({"sigmas": [value]}) is None
 
 
 def test_pool_transition_classifier_rejects_ambiguous_state():
@@ -377,6 +434,29 @@ def test_actual_attention_owner_change_invalidates_receipt():
     args["transformer_options"]["optimized_attention_override"] = lambda *args, **kwargs: None
     wrapped = prepared["patches_replace"]["dit"][("double_block", 0)]
     wrapped(args, {"original_block": lambda call_args: {"img": call_args["img"]}})
+
+    assert audit.failure == "actual_route_mismatch"
+    assert not core_bsa_compat.accepts_actual(audit, tuple(prepared[RECEIPTS]))
+
+
+def test_midforward_attention_owner_change_is_revalidated_per_block():
+    _nodes, model, _patch, options = _installation(sigma=1.0, count=2)
+    layout = _layout()
+    audit, reason = core_bsa_compat.probe(options, layout, model)
+    assert reason is None and audit is not None
+
+    prepared = {**options, RECEIPTS: []}
+    prepared = core_bsa_compat.instrument_actual_options(prepared, audit, RECEIPTS)
+    args = _actual_args(prepared, layout, 128)
+    context = {"original_block": lambda call_args: {"img": call_args["img"]}}
+
+    first = prepared["patches_replace"]["dit"][("double_block", 0)]
+    first(args, context)
+    assert audit.failure is None
+
+    args["transformer_options"]["optimized_attention_override"] = lambda *args, **kwargs: None
+    second = prepared["patches_replace"]["dit"][("double_block", 1)]
+    second(args, context)
 
     assert audit.failure == "actual_route_mismatch"
     assert not core_bsa_compat.accepts_actual(audit, tuple(prepared[RECEIPTS]))
