@@ -2,14 +2,14 @@
 
 Untwist v0.2.4 deliberately composes with an existing MiniMax-H3 attention
 provider through ``attention_preprocess_v1``. In the production stack this puts
-Untwist above core BlockSparseAttention at model-call time while BSA still owns
-the H3 block replacements. The core-BSA auditor therefore cannot require BSA to
-remain the top-level ``optimized_attention_override``.
+Untwist above core BlockSparseAttention at model-call time while BSA can itself
+sit below reviewed Flow block wrappers. The auditor therefore proves both
+wrapper layers before accepting backend history.
 
 This module does not accept arbitrary preprocess contracts. It recognizes only
 the reviewed Untwist source and requires Untwist's Spectrum runtime descriptor,
-then temporarily exposes the underlying BSA override to the existing exact
-source/closure audit. Unknown preprocessors remain actual-only.
+then temporarily exposes the underlying BSA override to the source-gated
+BSA/Flow audit. Unknown preprocessors remain actual-only.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from typing import Any
 
 import torch
 
-from . import core_bsa_compat
+from . import core_bsa_compat, core_bsa_flow_compat
 
 AUDITED_UNTWIST_GIT_BLOBS = frozenset(
     {"49a6eeda841a9dffe52974dceb3bce78bf02f25d"}
@@ -154,7 +154,7 @@ def _unwrap_reviewed_untwist(
 
 
 def probe(options: dict[str, Any], layout: Any, model: Any):
-    """Prove core BSA ownership through one reviewed active Untwist wrapper."""
+    """Prove core BSA through reviewed Untwist and Flow composition."""
     try:
         real_override = options.get("optimized_attention_override")
         bsa_override, preprocess_identity, reason = _unwrap_reviewed_untwist(options)
@@ -165,18 +165,17 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
     if bsa_override is None:
         return None, reason
     if preprocess_identity is None:
-        return core_bsa_compat.probe(options, layout, model)
+        return core_bsa_flow_compat.probe(options, layout, model)
 
     normalized = dict(options)
     normalized["optimized_attention_override"] = bsa_override
-    audit, reason = core_bsa_compat.probe(normalized, layout, model)
+    audit, reason = core_bsa_flow_compat.probe(normalized, layout, model)
     if audit is None:
         return None, reason
 
-    # The underlying BSA source, block replacements, patch owner and route are now
-    # proven by the existing auditor. Add only the stable reviewed Untwist owner to
-    # backend history, then restore the actual call-time provider so every actual
-    # block receipt still fails closed if ownership changes during the forward.
+    # Underlying BSA/Flow ownership and numerical route are now proven. Add only
+    # the stable reviewed Untwist owner, then restore the real call-time provider
+    # so receipt instrumentation still rejects a mid-forward owner change.
     audit.identity = (*audit.identity, ("outer_preprocess", preprocess_identity))
     audit.current_override = real_override
     return audit, None
