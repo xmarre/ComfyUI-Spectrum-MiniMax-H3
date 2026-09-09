@@ -75,7 +75,7 @@ def _preflight(options, layout, model):
     # implementation; any unknown source/ownership remains actual-only.
     from . import core_bsa_compat
 
-    if core_bsa_compat.has_core_bsa_callback(options):
+    if core_bsa_compat.has_core_bsa_evidence(options):
         audit, reason = core_bsa_compat.probe(options, layout, model)
         if audit is not None:
             return audit.identity, audit.safe, audit
