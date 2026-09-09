@@ -75,11 +75,13 @@ def _preflight(options, layout, model):
 
     # Core ComfyUI BSA does not publish the generic provider contract. Spectrum
     # owns a narrowly version-gated compatibility audit for the exact reviewed
-    # implementation; any unknown source/ownership remains actual-only.
-    from . import core_bsa_compat
+    # implementation; any unknown source/ownership remains actual-only. Explicit
+    # attention_preprocess_v1 wrappers are unwrapped only long enough to prove the
+    # underlying BSA owner, then restored for real call-time validation.
+    from . import core_bsa_compat, core_bsa_preprocess_compat
 
     if core_bsa_compat.has_core_bsa_evidence(options):
-        audit, reason = core_bsa_compat.probe(options, layout, model)
+        audit, reason = core_bsa_preprocess_compat.probe(options, layout, model)
         if audit is not None:
             return audit.identity, audit.safe, audit
         return ("core_bsa_unreported", reason or "unrecognized"), False, None
