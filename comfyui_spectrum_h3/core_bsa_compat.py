@@ -597,11 +597,13 @@ def probe(
             )
             for index, (route, sink, sink_q) in enumerate(route_specs)
         )
+        mode = "sol-attn" if settings_identity[2] == 0.0 else "sla"
         identity = (
             ADAPTER_KEY,
             ADAPTER_VERSION,
             source_blob,
             id(patch),
+            ("mode", mode),
             ("settings", settings_identity),
             ("layout", layout_identity),
             ("uuids", _freeze(uuids)),
