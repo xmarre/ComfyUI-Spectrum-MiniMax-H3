@@ -194,13 +194,36 @@ def test_inherited_attention_owner_change_changes_policy_identity():
     first, reason = core_bsa_compat.probe(options, _layout(), model)
     assert reason is None and first is not None
 
-    replacement_previous = lambda *args, **kwargs: None
+    def replacement_previous(*args, **kwargs):
+        return None
+
     override = nodes.make_attention_override(patch, replacement_previous)
     patch.installed.add(override)
     options["optimized_attention_override"] = override
     second, reason = core_bsa_compat.probe(options, _layout(), model)
     assert reason is None and second is not None
     assert first.identity != second.identity
+
+
+def test_lifetime_generation_and_callable_identity_are_stable_and_unique():
+    class Owner:
+        pass
+
+    first_owner = Owner()
+    second_owner = Owner()
+    first_generation = core_bsa_compat._lifetime_generation(first_owner)
+    assert first_generation == core_bsa_compat._lifetime_generation(first_owner)
+    assert first_generation != core_bsa_compat._lifetime_generation(second_owner)
+
+    def first_callable():
+        return None
+
+    def second_callable():
+        return None
+
+    first_identity = core_bsa_compat._callable_identity(first_callable)
+    assert first_identity == core_bsa_compat._callable_identity(first_callable)
+    assert first_identity != core_bsa_compat._callable_identity(second_callable)
 
 
 def test_execution_identity_ignores_transient_weight_residency():
@@ -237,6 +260,7 @@ def test_dense_sparse_and_cold_primed_transitions_change_identity(monkeypatch):
     assert {spec[0] for spec in primed.route_specs} == {
         "h3_chunked_sparse_primed"
     }
+    assert primed.expected_receipts[0][2] == primed.patch_generation
     assert dense.identity != cold.identity
     assert cold.identity != primed.identity
 
