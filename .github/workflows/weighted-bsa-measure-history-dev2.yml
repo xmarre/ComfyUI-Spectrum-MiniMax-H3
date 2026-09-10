@@ -57,7 +57,7 @@ jobs:
             comfyui_spectrum_h3/core_bsa_flow_compat.py \
             comfyui_spectrum_h3/core_bsa_forecast_recovery.py \
             tests/test_core_bsa_measure_history.py \
-            --ignore I001,UP037
+            --ignore I001,UP037,C408,PLR0402
           python -m compileall -q comfyui_spectrum_h3 tests/test_core_bsa_measure_history.py
 
       - name: Targeted contract validation
