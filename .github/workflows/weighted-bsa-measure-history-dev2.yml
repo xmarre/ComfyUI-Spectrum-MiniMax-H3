@@ -76,7 +76,7 @@ jobs:
       - name: Commit validated production patch
         if: success()
         run: |
-          git rm tools/apply_core_bsa_measure_history.py
+          git rm -f tools/apply_core_bsa_measure_history.py
           git rm tools/fix_core_bsa_measure_history_generated.py
           git rm .github/workflows/weighted-bsa-measure-history-dev.yml
           git rm .github/workflows/weighted-bsa-measure-history-dev2.yml
