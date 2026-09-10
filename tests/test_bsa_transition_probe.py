@@ -29,13 +29,12 @@ def test_transaction_restores_rng_and_pool_when_shadow_raises(error):
     tensor = patch.pooled[0][0]
     rng = torch.get_rng_state().clone()
     python_rng = random.getstate()
-    with pytest.raises(error):
-        with probe.isolated_pool(patch, torch.device("cpu")):
-            tensor.zero_()
-            torch.rand(5)
-            random.random()
-            patch.pooled[1] = (tensor, tensor)
-            raise error("shadow failed")
+    with pytest.raises(error), probe.isolated_pool(patch, torch.device("cpu")):
+        tensor.zero_()
+        torch.rand(5)
+        random.random()
+        patch.pooled[1] = (tensor, tensor)
+        raise error("shadow failed")
     assert torch.equal(torch.get_rng_state(), rng)
     assert random.getstate() == python_rng
     assert list(patch.pooled) == [0]
@@ -51,17 +50,18 @@ def test_primary_oom_is_not_masked_by_restore_failure(monkeypatch):
         raise RuntimeError("synthetic restore failure")
 
     monkeypatch.setattr(probe.PoolSnapshot, "restore", broken_restore)
-    with pytest.raises(torch.cuda.OutOfMemoryError, match="primary oom") as caught:
-        with probe.isolated_pool(patch, torch.device("cpu")):
-            raise torch.cuda.OutOfMemoryError("primary oom")
+    with (
+        pytest.raises(torch.cuda.OutOfMemoryError, match="primary oom") as caught,
+        probe.isolated_pool(patch, torch.device("cpu")),
+    ):
+        raise torch.cuda.OutOfMemoryError("primary oom")
     assert any("synthetic restore failure" in note for note in getattr(caught.value, "__notes__", ()))
 
 
 def test_malformed_pool_fails_before_diagnostic_mutation():
     patch = N(pooled={0: (None, torch.zeros(1, 1))})
-    with pytest.raises(ValueError, match="malformed"):
-        with probe.isolated_pool(patch, torch.device("cpu")):
-            pytest.fail("should never enter")
+    with pytest.raises(ValueError, match="malformed"), probe.isolated_pool(patch, torch.device("cpu")):
+        pytest.fail("should never enter")
 
 
 def test_chunked_error_metrics_and_nonfinite():
@@ -148,7 +148,7 @@ def test_candidate_and_next_actual_measurements_preserve_control(tmp_path):
 
 @pytest.mark.parametrize("change", ["layout", "nonadjacent", "owner", "dense"])
 def test_candidate_requires_adjacent_matching_cold_anchor(tmp_path, change):
-    p, rt, patch, audit = _fixture(tmp_path)
+    p, rt, _patch, audit = _fixture(tmp_path)
     cold = probe.Actual(p, rt, 2, 0, audit("h3_chunked_sparse_cold"))
     cold.capture_hidden(torch.ones(1, 4, 2), 1)
     cold.complete(True)
