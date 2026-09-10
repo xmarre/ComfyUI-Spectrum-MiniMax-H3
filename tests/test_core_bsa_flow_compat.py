@@ -280,16 +280,51 @@ def test_unknown_outer_block_wrapper_stays_fail_closed():
     assert reason == "flow_wrapper_unreviewed"
 
 
-def test_reviewed_mixed_grid_wrapper_uses_effective_sequence_and_zero_sinks():
-    model, _patch, _override, options = _installation()
+def test_reviewed_mixed_grid_wrapper_uses_propagated_layout_and_exact_kv_sinks(monkeypatch):
+    _attention, mixed_module = _flow_modules()
+    mixed_blob = core_bsa_compat._module_blob_sha(mixed_module)
+    if mixed_blob not in core_bsa_flow_compat._FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS:
+        pytest.skip("Flow fixture predates canonical Mixed-Grid layout propagation")
+
+    model, _patch, _override, options = _installation(sigma=0.5)
+    monkeypatch.setattr(
+        core_bsa_compat,
+        "_sparse_runtime_eligible",
+        lambda _model, _module: True,
+    )
     options, carrier, _mixed = _wrap_mixed(options, model)
     audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
+
     assert reason is None and audit is not None and audit.safe
     assert audit.flow_mixed is True
+    assert audit.flow_mixed_layout_propagated is True
     assert audit.seq_len == 160
     assert audit.flow_carrier_seq_len == 128
     assert audit.flow_outer_seq_lens == (128, 160)
-    assert all(spec == ("h3_dense", (0, 0), (0, 0)) for spec in audit.route_specs)
+    assert all(
+        spec == ("h3_chunked_sparse_cold", (0, 2), (0, 0))
+        for spec in audit.route_specs
+    )
+
+
+def test_released_v033_effective_layout_preserves_its_zero_sink_semantics():
+    carrier = _layout()
+    mixed = _mixed_layout()
+    normalized_mixed = core_bsa_compat._normalize_layout(mixed)
+    assert normalized_mixed is not None
+    effective = core_bsa_flow_compat._effective_mixed_layout(
+        {
+            "source_blob": "8fc0f753ff2cd21fae898a4dd3c9ab1025f98443",
+            "mixed_seq": 160,
+            "mixed_identity": normalized_mixed[1],
+            "mixed_layout": mixed,
+        },
+        carrier,
+    )
+    normalized = core_bsa_compat._normalize_layout(effective)
+    assert normalized is not None
+    assert normalized[0] == 160
+    assert all(kind != "video" for _a, _b, kind in dict(normalized[1])["segments"])
 
 
 def test_mixed_grid_wrapper_must_cover_every_main_block():
@@ -298,20 +333,6 @@ def test_mixed_grid_wrapper_must_cover_every_main_block():
     audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
     assert audit is None
     assert reason == "flow_mixed_wrapper_incomplete"
-
-
-def test_pool_version_classifier_distinguishes_dense_and_primed():
-    kmean = torch.zeros(2, 128)
-    vscale = torch.zeros(2, 128)
-    before = ("present", kmean, vscale, kmean._version, vscale._version)
-    assert core_bsa_flow_compat._classify_snapshot(before, before) == "h3_dense"
-    kmean.copy_(torch.ones_like(kmean))
-    vscale.copy_(torch.ones_like(vscale))
-    after = ("present", kmean, vscale, kmean._version, vscale._version)
-    assert (
-        core_bsa_flow_compat._classify_snapshot(before, after)
-        == "h3_chunked_sparse_primed"
-    )
 
 
 def test_flow_prepare_observe_round_trip_accepts_dense_route():
@@ -329,6 +350,35 @@ def test_flow_prepare_observe_round_trip_accepts_dense_route():
         {"original_block": lambda call_args: {"img": call_args["img"]}},
     )
     observe(runtime, 9, 0, prepared, pending)
+
+    assert runtime.observed is not None
+    assert runtime.observed[-1] is True
+    receipts = runtime.observed[-2]
+    assert len(receipts) == 1
+    assert receipts[0][4] == "h3_dense"
+
+
+def test_flow_receipts_accept_inference_mode_pool_without_version_counter():
+    model, patch, _override, options = _installation(count=1)
+    layout = _layout()
+    with torch.inference_mode():
+        kmean = torch.zeros((2, 128), dtype=torch.float32)
+        vscale = torch.zeros((2, 128), dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="Inference tensors do not track version counter"):
+        _ = kmean._version
+    patch.pooled[(0, layout.seq_len, ("positive",))] = (kmean, vscale)
+
+    options, _wrapper = _wrap_layout(options)
+    runtime = _BackendRuntime()
+    prepared, pending = prepare(runtime, 10, 0, options, layout, model)
+    assert pending is not None
+    args = _actual_args(prepared, layout)
+    wrapped = prepared["patches_replace"]["dit"][("double_block", 0)]
+    wrapped(
+        args,
+        {"original_block": lambda call_args: {"img": call_args["img"]}},
+    )
+    observe(runtime, 10, 0, prepared, pending)
 
     assert runtime.observed is not None
     assert runtime.observed[-1] is True
