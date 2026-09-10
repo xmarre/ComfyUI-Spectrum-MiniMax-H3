@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 
 from comfyui_spectrum_h3.config import SpectrumH3Config
-from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
+from comfyui_spectrum_h3.runtime import SolverCallDescriptor, SpectrumH3Runtime
 
 TOPOLOGY = (
     ("video", (1, 24, 2, 4, 4)),
@@ -197,6 +197,35 @@ def test_backend_vetoed_forecast_attempt_does_not_consume_entitlement():
     runtime.end_run(run_id)
 
 
+def test_fallback_to_actual_after_prediction_does_not_consume_entitlement():
+    runtime = _runtime(tail_actual_steps=0)
+    run_id = _start(runtime, 3)
+    _complete(runtime, 1.0)
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    assert not decision["actual"] and runtime._bootstrap_entitlement_unused
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"], decision["step_id"], topology=TOPOLOGY,
+        labels=LABEL, expected_shape=(1, 3, 4),
+    )
+    assert not actual
+    assert runtime.predict(
+        decision["run_id"], decision["step_id"], call_id,
+        device=torch.device("cpu"), dtype=torch.float32,
+    ) is not None
+    runtime.prepare_actual_retry(decision["run_id"], decision["step_id"], "test retry")
+    retry_id, retry_actual = runtime.begin_model_call(
+        decision["run_id"], decision["step_id"], topology=TOPOLOGY,
+        labels=LABEL, expected_shape=(1, 3, 4),
+    )
+    assert retry_actual
+    runtime.observe_actual(
+        decision["run_id"], decision["step_id"], retry_id, torch.ones(1, 3, 4)
+    )
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+    assert runtime._bootstrap_entitlement_unused is True
+    runtime.end_run(run_id)
+
+
 def test_abort_does_not_consume_entitlement_and_backend_reset_never_replenishes_it():
     runtime = _runtime(tail_actual_steps=0)
     run_id = _start(runtime, 5)
@@ -223,6 +252,59 @@ def test_rollback_restores_entitlement_transactionally():
     _complete(runtime, 0.75, policy="a")
     assert runtime._bootstrap_entitlement_unused is False
     runtime.restore_rollback_snapshot(snapshot)
+    assert runtime._bootstrap_entitlement_unused is True
+    runtime.end_run(run_id)
+
+
+def test_sampler_required_exact_stage_dominates_and_does_not_consume_entitlement():
+    runtime = _runtime(tail_actual_steps=0)
+    run_id = _start(
+        runtime,
+        3,
+        forecastable_stage_indices=(),
+        history_stage_indices=(0,),
+    )
+    first, _, first_mode = _complete(runtime, 1.0)
+    second, _, second_mode = _complete(runtime, 0.5)
+    assert first_mode == second_mode == "actual"
+    assert second["reason"] == "sampler-required exact stage"
+    assert runtime._bootstrap_entitlement_unused is True
+    runtime.end_run(run_id)
+
+
+def test_sa_pece_state_conditioned_topology_does_not_acquire_ordinary_bootstrap():
+    runtime = _runtime(tail_actual_steps=0)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+    topology = (
+        SolverCallDescriptor(0, 0, "predicted"),
+        SolverCallDescriptor(1, 0, "predicted"),
+        SolverCallDescriptor(1, 1, "corrected"),
+    )
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_sa_solver_pece",
+        supported_sampler=True,
+        expected_model_calls=len(topology),
+        stage_count=2,
+        logical_call_topology=topology,
+        state_conditioned_residual=True,
+        separate_stage_histories=False,
+        forecastable_stage_indices=(0,),
+        history_stage_indices=(0, 1),
+        history_step_ids=(0, 2),
+        tail_actual_stage_indices=(1,),
+        allow_state_conditioned_bootstrap=False,
+        min_actual_prefix_steps=1,
+        min_actual_steps_after_forecast=0,
+        max_consecutive_forecasts=1,
+        model_aware_can_force_actual=False,
+    )
+    first, _, first_mode = _complete(runtime, 1.0)
+    predicted, _, predicted_mode = _complete(runtime, 0.5)
+    corrected, _, corrected_mode = _complete(runtime, 0.5)
+    assert first_mode == predicted_mode == corrected_mode == "actual"
+    assert predicted["reason"] == "insufficient actual history"
+    assert corrected["reason"] == "sampler-required exact stage"
     assert runtime._bootstrap_entitlement_unused is True
     runtime.end_run(run_id)
 
