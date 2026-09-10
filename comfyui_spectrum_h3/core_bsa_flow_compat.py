@@ -3,8 +3,8 @@
 Flow-Aligned Regenerate legitimately wraps MiniMax-H3 ``double_block`` replacements.
 Core BSA can therefore be numerically active without remaining the top-level block
 replacement. This module recognizes only reviewed Flow wrapper code, unwraps it
-for BSA preflight, and verifies the actual route from BSA pooled-state transitions
-around the real outer wrapper chain.
+for BSA preflight, and verifies the actual route around the real outer wrapper
+chain without depending on inference-tensor version counters.
 """
 from __future__ import annotations
 
@@ -407,6 +407,9 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
         audit.flow_outer_replacements = tuple(
             dit[("double_block", index)] for index in range(len(blocks))
         )
+        audit.flow_bsa_replacements = tuple(
+            normalized_dit[("double_block", index)] for index in range(len(blocks))
+        )
         audit.flow_outer_seq_lens = outer_seq_lens
         audit.flow_carrier_seq_len = carrier_seq
         audit.flow_carrier_layout_identity = carrier_identity
@@ -423,42 +426,14 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
         return None, "flow_introspection_failed"
 
 
-def _pool_snapshot(
+def _pool_entry(
     audit: core_bsa_compat.CoreBSAAudit, index: int
 ) -> tuple[Any, ...]:
-    key = (index, audit.seq_len, audit.uuids)
-    state = core_bsa_compat._pool_entry(
-        audit.patch, key, audit.pool_specs[index]
+    return core_bsa_compat._pool_entry(
+        audit.patch,
+        (index, audit.seq_len, audit.uuids),
+        audit.pool_specs[index],
     )
-    if state[0] != "present":
-        return state
-    return (
-        "present",
-        state[1],
-        state[2],
-        int(state[1]._version),
-        int(state[2]._version),
-    )
-
-
-def _classify_snapshot(before: tuple[Any, ...], after: tuple[Any, ...]) -> str:
-    if before[0] == "missing":
-        if after[0] == "missing":
-            return "h3_dense"
-        if after[0] == "present":
-            return "h3_chunked_sparse_cold"
-        return "unknown"
-    if before[0] != "present" or after[0] != "present":
-        return "unknown"
-    if before[1] is not after[1] or before[2] is not after[2]:
-        return "unknown"
-    k_delta = int(after[3]) - int(before[3])
-    v_delta = int(after[4]) - int(before[4])
-    if k_delta == 0 and v_delta == 0:
-        return "h3_dense"
-    if k_delta > 0 and v_delta > 0:
-        return "h3_chunked_sparse_primed"
-    return "unknown"
 
 
 def _current_metadata_matches(
@@ -516,12 +491,18 @@ def _make_actual_wrapper(
     audit: core_bsa_compat.CoreBSAAudit,
     index: int,
     replacement: Any,
+    bsa_replacement: Any,
     receipts: list[Any],
 ):
+    bsa_closure = core_bsa_compat._closure_values(bsa_replacement)
+    expected_attention = (
+        bsa_closure.get("attention") if isinstance(bsa_closure, dict) else None
+    )
+
     def audited_replacement(args, replacement_context):
         try:
             metadata_ok = _current_metadata_matches(audit, index, args)
-            before = _pool_snapshot(audit, index)
+            before = _pool_entry(audit, index)
         except torch.cuda.OutOfMemoryError:
             raise
         except Exception:  # noqa: BLE001 - observation remains fail-closed
@@ -529,11 +510,35 @@ def _make_actual_wrapper(
             before = ("invalid",)
             audit.failure = "actual_metadata_failed"
 
-        output = replacement(args, replacement_context)
+        sparse_selected = False
+        original_block_calls = 0
+        try:
+            original_block = replacement_context.get("original_block")
+        except Exception:  # noqa: BLE001 - malformed observation context fails closed
+            original_block = None
+        if not callable(expected_attention) or not callable(original_block):
+            metadata_ok = False
+            output = replacement(args, replacement_context)
+        else:
+            def audited_original_block(call_args):
+                nonlocal sparse_selected, original_block_calls
+                original_block_calls += 1
+                sparse_selected = call_args.get("attention") is expected_attention
+                return original_block(call_args)
+
+            observed_context = dict(replacement_context)
+            observed_context["original_block"] = audited_original_block
+            output = replacement(args, observed_context)
+            if original_block_calls != 1:
+                metadata_ok = False
 
         try:
-            after = _pool_snapshot(audit, index)
-            observed = _classify_snapshot(before, after)
+            after = _pool_entry(audit, index)
+            observed = core_bsa_compat._classify_pool_transition(
+                before,
+                after,
+                sparse_selected=sparse_selected,
+            )
             expected_route, expected_sink, expected_sink_q = audit.route_specs[index]
             if not metadata_ok or observed != expected_route:
                 audit.failure = "actual_route_mismatch"
@@ -575,6 +580,11 @@ def instrument_actual_options(
     if not isinstance(dit, dict):
         audit.failure = "dit_replacement_table_missing"
         return prepared
+    bsa_replacements = getattr(audit, "flow_bsa_replacements", None)
+    if not isinstance(bsa_replacements, tuple) or len(bsa_replacements) != audit.block_count:
+        audit.failure = "flow_bsa_replacement_evidence_missing"
+        return prepared
+
     local_patches = dict(patches)
     local_dit = dict(dit)
     for index in range(audit.block_count):
@@ -592,7 +602,11 @@ def instrument_actual_options(
                 segments=list(dict(audit.flow_carrier_layout_identity).get("segments", ())),
             ),
         )
-        if underlying is None or identities != audit.flow_wrapper_specs[index]:
+        if (
+            underlying is None
+            or underlying is not bsa_replacements[index]
+            or identities != audit.flow_wrapper_specs[index]
+        ):
             audit.failure = reason or "flow_wrapper_chain_changed"
             return prepared
         if bool(mixed is not None) != bool(audit.flow_mixed):
@@ -605,7 +619,13 @@ def instrument_actual_options(
         ):
             audit.failure = "flow_mixed_layout_mode_changed"
             return prepared
-        local_dit[key] = _make_actual_wrapper(audit, index, replacement, receipts)
+        local_dit[key] = _make_actual_wrapper(
+            audit,
+            index,
+            replacement,
+            underlying,
+            receipts,
+        )
     local_patches["dit"] = local_dit
     prepared["patches_replace"] = local_patches
     prepared[core_bsa_compat.PRIVATE_AUDIT_KEY] = audit
