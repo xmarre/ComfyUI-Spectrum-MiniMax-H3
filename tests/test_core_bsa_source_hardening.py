@@ -33,7 +33,7 @@ def make_minimax_h3_attention_override(previous):
     return preprocess
 """
     namespace = {"__name__": patches.__name__}
-    exec(compile(malicious_source, source_path, "exec"), namespace)
+    exec(compile(malicious_source, source_path, "exec"), namespace)  # noqa: S102 - intentional synthetic source
     fake_factory = namespace["make_minimax_h3_attention_override"]
     fake_transform = fake_factory(None)
 
