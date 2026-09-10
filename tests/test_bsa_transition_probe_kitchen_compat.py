@@ -1,4 +1,7 @@
 from types import ModuleType, SimpleNamespace as N
+import json
+
+import torch
 
 from comfyui_spectrum_h3 import bsa_transition_probe as probe
 from comfyui_spectrum_h3 import bsa_transition_probe_compat as compat
@@ -63,3 +66,79 @@ def test_installed_probe_uses_compatibility_provenance_without_exact_build_pin(
     finally:
         current.close()
         runtime._bsa_transition_probe = None
+
+
+def test_one_jsonl_is_shared_by_all_runtime_segments_of_one_generation(monkeypatch, tmp_path):
+    compat._close_sinks()
+    monkeypatch.setattr(compat, "_execution_generation_id", lambda: "prompt-generation-123")
+    config = N()
+
+    first = probe.Probe(tmp_path, 1, config)
+    first.write("marker", segment="low")
+    first.close()
+    second = probe.Probe(tmp_path, 3, config)
+    second.write("marker", segment="high")
+    second.close()
+
+    try:
+        assert first.path == second.path
+        assert len(list(tmp_path.glob("bsa-*.jsonl"))) == 1
+        events = [json.loads(line) for line in first.path.read_text().splitlines()]
+        starts = [event for event in events if event["event"] == "start"]
+        assert len(starts) == 2
+        assert {event["run_id"] for event in starts} == {1, 3}
+        assert len({event["run_instance"] for event in starts}) == 2
+        assert all(event["schema_version"] == 4 for event in starts)
+        markers = [event["segment"] for event in events if event["event"] == "marker"]
+        assert markers == ["low", "high"]
+    finally:
+        compat._close_sinks()
+
+
+def test_new_prompt_generation_gets_a_new_jsonl(monkeypatch, tmp_path):
+    compat._close_sinks()
+    generation = ["prompt-a"]
+    monkeypatch.setattr(compat, "_execution_generation_id", lambda: generation[0])
+
+    first = probe.Probe(tmp_path, 1, N())
+    first.close()
+    generation[0] = "prompt-b"
+    second = probe.Probe(tmp_path, 1, N())
+    second.close()
+
+    try:
+        assert first.path != second.path
+        assert len(list(tmp_path.glob("bsa-*.jsonl"))) == 2
+    finally:
+        compat._close_sinks()
+
+
+def test_next_actual_measurement_can_cross_settings_identity_with_same_pool_owners(
+    monkeypatch, tmp_path
+):
+    compat._close_sinks()
+    monkeypatch.setattr(compat, "_execution_generation_id", lambda: None)
+    diagnostic = probe.Probe(tmp_path, 3, N())
+    entry = (torch.ones(1, 2), torch.ones(1, 2))
+    patch = N(pooled={(0, 4, ("positive",)): entry})
+    diagnostic.pending = {
+        "identity": ("settings", "previous"),
+        "step": 1,
+        "stale": {0: (entry, tuple(tensor.clone() for tensor in entry))},
+    }
+    runtime = N()
+    audit = N(
+        identity=("settings", "current"),
+        route_specs=(("h3_chunked_sparse_primed", (0, 0), (0, 0)),),
+        patch=patch,
+        seq_len=4,
+        uuids=("positive",),
+    )
+
+    try:
+        current = probe.Actual(diagnostic, runtime, 2, 0, audit)
+        assert current.next_actual is True
+        assert current.next_actual_identity_changed is True
+    finally:
+        diagnostic.close()
+        compat._close_sinks()
