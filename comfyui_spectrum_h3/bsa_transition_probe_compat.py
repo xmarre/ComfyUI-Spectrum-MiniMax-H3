@@ -28,7 +28,7 @@ def _source_provenance():
     cuda = importlib.import_module("comfy_kitchen.backends.cuda")
     function = getattr(cuda, "sol_attn_chunked", None)
     if not callable(function):
-        raise RuntimeError(
+        raise TypeError(
             "BSA diagnostics require a comfy-kitchen CUDA backend exposing sol_attn_chunked"
         )
 
