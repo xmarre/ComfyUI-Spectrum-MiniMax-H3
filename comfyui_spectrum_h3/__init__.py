@@ -1,4 +1,5 @@
 from .bsa_transition_probe_compat import install_bsa_transition_probe_compat
+from .bsa_transition_probe_manual import install_bsa_transition_probe_manual_only
 from .comfy_compiler_compat import install_comfy_compiler_compat
 from .config import AGGRESSIVE_PRESET, CONSERVATIVE_PRESET, SpectrumH3Config
 from .core_bsa_forecast_recovery import install_core_bsa_forecast_recovery
@@ -28,6 +29,7 @@ from .trust_probe import install_forecast_trust_probe
 
 install_core_bsa_loader_compat()
 install_bsa_transition_probe_compat()
+install_bsa_transition_probe_manual_only()
 install_generic_residual_correction()
 install_postrun_safety()
 install_forecast_trust_probe()
