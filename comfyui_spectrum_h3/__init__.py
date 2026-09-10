@@ -1,3 +1,4 @@
+from .bsa_transition_probe_compat import install_bsa_transition_probe_compat
 from .comfy_compiler_compat import install_comfy_compiler_compat
 from .config import AGGRESSIVE_PRESET, CONSERVATIVE_PRESET, SpectrumH3Config
 from .core_bsa_loader_compat import install_core_bsa_loader_compat
@@ -25,6 +26,7 @@ from .runtime import SpectrumH3Runtime
 from .trust_probe import install_forecast_trust_probe
 
 install_core_bsa_loader_compat()
+install_bsa_transition_probe_compat()
 install_generic_residual_correction()
 install_postrun_safety()
 install_forecast_trust_probe()
