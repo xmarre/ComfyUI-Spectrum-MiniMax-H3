@@ -72,6 +72,63 @@ def _calibration_state(values):
     return {"kmean": _tensor_state(values[0]), "vscale": _tensor_state(values[1])}
 
 
+def _same_bytes(tensor, saved):
+    return torch.equal(
+        tensor.contiguous().view(torch.uint8),
+        saved.contiguous().view(torch.uint8),
+    )
+
+
+def _pool_entry(patch, key):
+    pooled = getattr(patch, "pooled", None)
+    if not isinstance(pooled, dict):
+        return None
+    entry = pooled.get(key)
+    if (not isinstance(entry, (tuple, list)) or len(entry) != 2
+            or not all(torch.is_tensor(value) and value.dtype == torch.float32
+                       and value.ndim == 2 for value in entry)):
+        return None
+    return entry
+
+
+def _capture_cold_successor(audit, routes):
+    """Retain exact post-cold pool owners and bytes for the adjacent transition proof."""
+    state = {}
+    for index, route in enumerate(routes):
+        if route != "h3_chunked_sparse_cold":
+            continue
+        key = (index, audit.seq_len, audit.uuids)
+        entry = _pool_entry(audit.patch, key)
+        if entry is None:
+            raise RuntimeError(
+                f"BSA diagnostic lost accepted cold pool state for block {index}"
+            )
+        state[index] = (
+            entry[0],
+            entry[1],
+            entry[0].detach().clone(),
+            entry[1].detach().clone(),
+        )
+    return state
+
+
+def _verify_cold_successor(audit, sparse, predecessor):
+    """Prove current primed state is exactly the previous accepted cold output."""
+    for index in sparse:
+        expected = predecessor.get(index)
+        if expected is None:
+            return False, index, "predecessor_snapshot_missing"
+        key = (index, audit.seq_len, audit.uuids)
+        entry = _pool_entry(audit.patch, key)
+        if entry is None:
+            return False, index, "current_pool_missing_or_malformed"
+        if entry[0] is not expected[0] or entry[1] is not expected[1]:
+            return False, index, "pool_tensor_owner_changed"
+        if not _same_bytes(entry[0], expected[2]) or not _same_bytes(entry[1], expected[3]):
+            return False, index, "pool_tensor_contents_changed"
+    return True, None, None
+
+
 class PoolSnapshot:
     """Preserve dict, entry and tensor identities as well as tensor contents."""
     def __init__(self, patch):
@@ -104,8 +161,7 @@ class PoolSnapshot:
                 raise RuntimeError("BSA diagnostic failed to restore pool entry identity")
             for tensor, saved in zip(entry, self.values[key]):
                 # Byte comparison also verifies NaN payloads, without _version.
-                if not torch.equal(tensor.contiguous().view(torch.uint8),
-                                   saved.contiguous().view(torch.uint8)):
+                if not _same_bytes(tensor, saved):
                     raise RuntimeError("BSA diagnostic failed to restore pool contents")
 
 
@@ -195,7 +251,7 @@ class Probe:
         self.started_attention_calls = 0
         self.errors = 0
         self.calls = 0
-        self.write("start", schema_version=2, torch_version=torch.__version__,
+        self.write("start", schema_version=3, torch_version=torch.__version__,
                    scope="matched-input sparse attention; full target-hidden one-point hold",
                    diagnostic_transformer_nfe=0, max_attention_calls_per_run=6,
                    production_policy="unchanged", source_revision=_revision())
@@ -262,10 +318,36 @@ class Actual:
         self.selected = {sparse[0], sparse[len(sparse)//2], sparse[-1]} if sparse else set()
         self.routes = tuple(spec[0] for spec in audit.route_specs)
         prev = probe.previous
-        self.candidate = bool(not probe.examined and prev and prev[0] == step_id - 1
-                              and prev[1] == self.identity and sparse
-                              and all(self.routes[i] == "h3_chunked_sparse_primed"
-                                      and prev[2][i] == "h3_chunked_sparse_cold" for i in sparse))
+        transition_shape = bool(
+            not probe.examined
+            and prev
+            and prev[0] == step_id - 1
+            and prev[1] == self.identity
+            and sparse
+            and all(
+                self.routes[i] == "h3_chunked_sparse_primed"
+                and prev[2][i] == "h3_chunked_sparse_cold"
+                for i in sparse
+            )
+        )
+        self.predecessor_pool_continuity = None
+        self.predecessor_pool_mismatch_block = None
+        self.predecessor_pool_mismatch_reason = None
+        if transition_shape:
+            continuity, block, reason = _verify_cold_successor(audit, sparse, prev[3])
+            self.predecessor_pool_continuity = continuity
+            self.predecessor_pool_mismatch_block = block
+            self.predecessor_pool_mismatch_reason = reason
+            if not continuity:
+                probe.write(
+                    "skipped",
+                    step=step_id,
+                    reason="cold_to_primed_pool_successor_discontinuity",
+                    block=block,
+                    mismatch=reason,
+                    identity=_identity_digest(self.identity),
+                )
+        self.candidate = bool(transition_shape and self.predecessor_pool_continuity)
         self.next_actual = bool(probe.pending and probe.pending["identity"] == self.identity
                                 and step_id == probe.pending["step"] + 1)
         self.stale = {}
@@ -371,10 +453,15 @@ class Actual:
     def complete(self, accepted):
         p = self.probe
         p.calls += 1
+        successor_state = _capture_cold_successor(self.audit, self.routes) if accepted else {}
         p.write("actual", step=self.step_id, call=self.call_id, accepted=bool(accepted),
                 receipts_expected=self.audit.block_count,
                 seq_len=self.audit.seq_len, flow_mixed=bool(getattr(self.audit, "flow_mixed", False)),
                 identity=_identity_digest(self.identity), candidate=self.candidate,
+                predecessor_pool_continuity=self.predecessor_pool_continuity,
+                predecessor_pool_mismatch_block=self.predecessor_pool_mismatch_block,
+                predecessor_pool_mismatch_reason=self.predecessor_pool_mismatch_reason,
+                captured_cold_successor_blocks=len(successor_state),
                 next_actual=self.next_actual, core_bsa_source_blob=self.audit.source_blob,
                 patch_generation=self.audit.patch_generation,
                 routes=list(self.routes), measurements=self.measurements)
@@ -400,6 +487,7 @@ class Actual:
                     state_conditioned_residual=bool(run.state_conditioned_residual),
                     policy_step=self.runtime._step.policy_step_id,
                     candidate_backend_transition="h3_chunked_sparse_cold->h3_chunked_sparse_primed",
+                    predecessor_pool_continuity=True,
                     diagnostic_transformer_nfe=0)
             p.pending = {"identity": self.identity, "step": self.step_id, "stale": self.stale}
             p.examined = True
@@ -411,7 +499,7 @@ class Actual:
             p.pending = None
         if "h3_chunked_sparse_cold" in self.routes and not p.examined:
             p.anchor = self.hidden
-        p.previous = (self.step_id, self.identity, self.routes)
+        p.previous = (self.step_id, self.identity, self.routes, successor_state)
 
 
 @contextmanager
