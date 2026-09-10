@@ -82,14 +82,19 @@ jobs:
           text = text.replace(old, new, 1)
 
           old = '''    assert audit.measure.normalized_request == {\n        "api": 1,\n'''
-          new = '''    assert audit.measure.normalized_request == core_bsa_compat._freeze({\n        "api": 1,\n'''
+          new = '''    expected_measure = {\n        "api": 1,\n'''
           if text.count(old) != 1:
               raise SystemExit(f"normalized request assertion anchor count: {text.count(old)}")
           text = text.replace(old, new, 1)
           old = '''        "coordinate_policy": "minimax_h3_native_frame_grid_v1",\n    }\n    expected_external = {\n'''
-          new = '''        "coordinate_policy": "minimax_h3_native_frame_grid_v1",\n    })\n    expected_external = {\n'''
+          new = '''        "coordinate_policy": "minimax_h3_native_frame_grid_v1",\n    }\n    assert audit.measure.normalized_request == core_bsa_compat._freeze(expected_measure)\n    expected_external = {\n'''
           if text.count(old) != 1:
               raise SystemExit(f"normalized request closing anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+          old = '''    actual["attention_measure_v1"] = dict(audit.measure.normalized_request)\n'''
+          new = '''    actual["attention_measure_v1"] = expected_measure\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"runtime request anchor count: {text.count(old)}")
           path.write_text(text.replace(old, new, 1), encoding="utf-8")
           PY
 
