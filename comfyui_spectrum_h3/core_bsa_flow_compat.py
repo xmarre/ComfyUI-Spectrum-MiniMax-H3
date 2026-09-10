@@ -701,6 +701,9 @@ def _make_actual_wrapper(
                 nonlocal sparse_selected, original_block_calls
                 original_block_calls += 1
                 sparse_selected = call_args.get("attention") is expected_attention
+                if sparse_selected:
+                    from .bsa_transition_probe import attention
+                    call_args = {**call_args, "attention": attention(expected_attention, audit, index)}
                 return original_block(call_args)
 
             observed_context = dict(replacement_context)

@@ -1163,6 +1163,8 @@ class SpectrumH3Runtime:
             return
         if self._run.run_id != int(run_id):
             raise RuntimeError("attempted to end a stale Spectrum H3 run")
+        from .bsa_transition_probe import finish
+        finish(self)
         self._step = None
         self._run = None
         for forecaster in self._stage_forecasters.values():
