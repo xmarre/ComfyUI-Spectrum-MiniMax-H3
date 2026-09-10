@@ -19,7 +19,7 @@ from typing import Any
 
 import torch
 
-from . import core_bsa_compat, core_bsa_flow_compat
+from . import core_bsa_compat, core_bsa_flow_compat, source_code_audit
 
 AUDITED_UNTWIST_GIT_BLOBS = frozenset(
     {"49a6eeda841a9dffe52974dceb3bce78bf02f25d"}
@@ -77,9 +77,16 @@ def _audited_untwist_preprocess(transform: Any) -> tuple[Any, ...] | None:
     blob = core_bsa_compat._module_blob_sha(module)
     if blob not in AUDITED_UNTWIST_GIT_BLOBS:
         return None
-    factory = getattr(module, _UNTWIST_FACTORY, None)
-    expected_code = core_bsa_compat._nested_code(factory, "preprocess")
-    if expected_code is None or getattr(base, "__code__", None) is not expected_code:
+    source = getattr(module, "__file__", None)
+    if not isinstance(source, str) or not source_code_audit.matches_nested_source_code(
+        base,
+        Path(source),
+        (_UNTWIST_FACTORY, "preprocess"),
+    ):
+        return None
+    if getattr(base, "__defaults__", None) is not None:
+        return None
+    if getattr(base, "__kwdefaults__", None):
         return None
     closure = core_bsa_compat._closure_values(base)
     if closure != {}:
