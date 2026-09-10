@@ -120,6 +120,7 @@ jobs:
             comfyui_spectrum_h3/core_bsa_compat.py \
             comfyui_spectrum_h3/core_bsa_flow_compat.py \
             comfyui_spectrum_h3/core_bsa_preprocess_compat.py \
+            comfyui_spectrum_h3/source_code_audit.py \
             comfyui_spectrum_h3/comfy_compiler_compat.py \
             comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/generic_correction.py \
@@ -146,7 +147,9 @@ jobs:
             tests/test_backend_history.py \
             tests/test_core_bsa_compat.py \
             tests/test_core_bsa_flow_compat.py \
+            tests/test_core_bsa_flow_identity.py \
             tests/test_core_bsa_preprocess_compat.py \
+            tests/test_core_bsa_source_hardening.py \
             tests/test_reviewed_bsa_fixture_gate.py \
             tests/test_comfy_compiler_compat.py \
             tests/test_config.py \
