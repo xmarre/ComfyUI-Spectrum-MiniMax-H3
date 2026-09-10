@@ -2,9 +2,9 @@
 
 Flow-Aligned Regenerate legitimately wraps MiniMax-H3 ``double_block`` replacements.
 Core BSA can therefore be numerically active without remaining the top-level block
-replacement. This module recognizes only the reviewed Flow v0.3.3 wrapper code,
-unwraps it for BSA preflight, and verifies the actual route from BSA pooled-state
-transitions around the real outer wrapper chain.
+replacement. This module recognizes only reviewed Flow wrapper code, unwraps it
+for BSA preflight, and verifies the actual route from BSA pooled-state transitions
+around the real outer wrapper chain.
 """
 from __future__ import annotations
 
@@ -21,7 +21,13 @@ AUDITED_FLOW_ATTENTION_GIT_BLOBS = frozenset(
     {"c58c652f7b7d6030a2311f4805c3443615e432eb"}
 )
 AUDITED_FLOW_MIXED_GRID_GIT_BLOBS = frozenset(
-    {"8fc0f753ff2cd21fae898a4dd3c9ab1025f98443"}
+    {
+        "8fc0f753ff2cd21fae898a4dd3c9ab1025f98443",  # released v0.3.3
+        "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",  # PR #26 canonical layout propagation
+    }
+)
+_FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS = frozenset(
+    {"66c59f26ad41154fcce7e1ce5250fa233a96dc3b"}
 )
 _FLOW_ATTENTION_TOPLEVEL = "h3_flow_regenerate.attention"
 _FLOW_ATTENTION_SUFFIX = ".h3_flow_regenerate.attention"
@@ -188,6 +194,7 @@ def _audited_mixed_wrapper(
         mixed_identity,
     )
     return previous, identity, {
+        "source_blob": blob,
         "plan": plan,
         "plan_generation": plan_generation,
         "mixed_layout": mixed_layout,
@@ -270,15 +277,24 @@ def has_core_bsa_evidence(options: dict[str, Any]) -> bool:
 
 
 def _effective_mixed_layout(mixed: dict[str, Any], carrier_layout: Any) -> Any:
-    """Mirror reviewed v0.3.3 BSA semantics inside Mixed-Grid.
+    """Return the exact layout core BSA sees for the reviewed Flow source.
 
-    Flow v0.3.3 passes the mixed layout as a direct block argument but leaves
-    ``transformer_options['minimax_h3_layout']`` on the carrier layout. Core BSA
-    therefore sees a token/layout length mismatch and uses zero conditioning
-    sinks. The opaque effective layout below reproduces that exact numerical
-    route for preflight; both real carrier and mixed identities are retained
-    separately in the policy identity.
+    Released Flow v0.3.3 passes ``mixed_layout`` as the direct block argument but
+    leaves ``transformer_options['minimax_h3_layout']`` on the carrier layout.
+    Core BSA therefore sees a token/layout mismatch and uses zero conditioning
+    sinks. PR #26 fixes the producer-side contract and publishes ``mixed_layout``
+    through the canonical transformer metadata as well. The audit preserves both
+    numerical semantics instead of pretending the released and fixed sources are
+    equivalent.
     """
+    source_blob = mixed.get("source_blob")
+    if source_blob in _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS:
+        layout = mixed.get("mixed_layout")
+        normalized = core_bsa_compat._normalize_layout(layout)
+        if normalized is None or normalized[0] != int(mixed["mixed_seq"]):
+            raise ValueError("propagated mixed layout is invalid")
+        return layout
+
     carrier = core_bsa_compat._normalize_layout(carrier_layout)
     if carrier is None:
         raise ValueError("carrier layout is invalid")
@@ -341,6 +357,7 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
                     item is None
                     or item["plan"] is not mixed["plan"]
                     or item["mixed_layout"] is not mixed["mixed_layout"]
+                    or item["source_blob"] != mixed["source_blob"]
                     or item["carrier_identity"] != mixed["carrier_identity"]
                 ):
                     return None, "flow_mixed_wrapper_inconsistent"
@@ -363,7 +380,11 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
             flow_mode = "layout_wrapped"
         else:
             outer_seq_lens = (carrier_seq, *(mixed["mixed_seq"] for _ in blocks[1:]))
-            flow_mode = "mixed_grid_v0.3.3"
+            flow_mode = (
+                "mixed_grid_layout_propagated_v1"
+                if mixed["source_blob"] in _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS
+                else "mixed_grid_v0.3.3"
+            )
 
         flow_identity = (
             "reviewed_flow_h3_wrapper_chain_v1",
@@ -390,6 +411,10 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
         audit.flow_carrier_seq_len = carrier_seq
         audit.flow_carrier_layout_identity = carrier_identity
         audit.flow_mixed = mixed is not None
+        audit.flow_mixed_layout_propagated = bool(
+            mixed is not None
+            and mixed["source_blob"] in _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS
+        )
         audit.flow_identity = flow_identity
         return audit, None
     except torch.cuda.OutOfMemoryError:
@@ -572,6 +597,13 @@ def instrument_actual_options(
             return prepared
         if bool(mixed is not None) != bool(audit.flow_mixed):
             audit.failure = "flow_wrapper_mode_changed"
+            return prepared
+        if (
+            mixed is not None
+            and bool(mixed["source_blob"] in _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS)
+            != bool(getattr(audit, "flow_mixed_layout_propagated", False))
+        ):
+            audit.failure = "flow_mixed_layout_mode_changed"
             return prepared
         local_dit[key] = _make_actual_wrapper(audit, index, replacement, receipts)
     local_patches["dit"] = local_dit
