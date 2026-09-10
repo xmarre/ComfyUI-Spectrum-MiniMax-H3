@@ -26,6 +26,20 @@ def test_source_built_comfy_kitchen_is_not_rejected_by_version_or_blob(monkeypat
     assert "kmean" in signature and "vscale" in signature
 
 
+def test_missing_sol_attn_chunked_is_a_type_contract_error(monkeypatch):
+    cuda = ModuleType("comfy_kitchen.backends.cuda")
+    monkeypatch.setattr(compat.importlib.metadata, "version", lambda _name: "0.2.33")
+    monkeypatch.setattr(compat.importlib, "import_module", lambda _name: cuda)
+
+    try:
+        compat._source_provenance()
+    except TypeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("missing sol_attn_chunked must be rejected")
+    assert "sol_attn_chunked" in message
+
+
 def test_only_required_sol_attn_chunked_api_contract_is_enforced(monkeypatch):
     cuda = ModuleType("comfy_kitchen.backends.cuda")
 
