@@ -1,4 +1,9 @@
-"""Opt-in, bounded matched-input BSA calibration and hidden-hold diagnostics.
+"""Bounded matched-input BSA calibration and hidden-hold diagnostics.
+
+On this diagnostic PR, audited-safe core-BSA CUDA runs enable the probe
+automatically and write reports below ComfyUI's normal output directory. The
+SPECTRUM_H3_BSA_DIAGNOSTICS environment variable remains only as an optional
+override/disable switch; no shell setup is required for the production handoff.
 
 Attention comparisons repeat only the reviewed sparse attention closure. They do
 not replay a transformer or simulate the downstream trajectory of a skipped NFE.
@@ -27,6 +32,26 @@ _ACTIVE = ContextVar("spectrum_bsa_transition_probe", default=None)
 _LOCK = threading.Lock()
 _SESSION = uuid.uuid4().hex[:12]
 ENV = "SPECTRUM_H3_BSA_DIAGNOSTICS"
+AUTO_OUTPUT_SUBDIR = "spectrum_h3_bsa_diagnostics"
+_DISABLED = frozenset({"", "0", "false", "off", "no", "disable", "disabled"})
+
+
+def _diagnostic_directory(*, automatic):
+    """Resolve an explicit override, or auto-enable for an audited-safe CUDA run."""
+    configured = os.environ.get(ENV)
+    if configured is not None:
+        value = configured.strip()
+        if value.lower() in _DISABLED:
+            return None
+        return Path(value).expanduser()
+    if not automatic or not torch.cuda.is_available():
+        return None
+    try:
+        import folder_paths
+        output_root = Path(folder_paths.get_output_directory())
+    except (ImportError, AttributeError, TypeError, RuntimeError):
+        output_root = Path.cwd() / "output"
+    return output_root.expanduser() / AUTO_OUTPUT_SUBDIR
 
 
 def delta(reference, candidate):
@@ -279,9 +304,9 @@ def _revision():
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
-def get_probe(runtime, run_id):
-    directory = os.environ.get(ENV)
-    if not directory:
+def get_probe(runtime, run_id, *, automatic=False):
+    directory = _diagnostic_directory(automatic=automatic)
+    if directory is None:
         return None
     run = runtime._run
     item = getattr(runtime, "_bsa_transition_probe", None)
@@ -504,12 +529,12 @@ class Actual:
 
 @contextmanager
 def actual_scope(runtime, run_id, step_id, call_id, options):
-    probe = get_probe(runtime, run_id)
+    from .core_bsa_compat import PRIVATE_AUDIT_KEY
+    audit = options.get(PRIVATE_AUDIT_KEY)
+    probe = get_probe(runtime, run_id, automatic=bool(audit is not None and audit.safe))
     if probe is None:
         yield None
         return
-    from .core_bsa_compat import PRIVATE_AUDIT_KEY
-    audit = options.get(PRIVATE_AUDIT_KEY)
     if audit is None or not audit.safe:
         probe.write("skipped", step=step_id, reason="audited safe core BSA required")
         probe.anchor = probe.previous = probe.pending = None
