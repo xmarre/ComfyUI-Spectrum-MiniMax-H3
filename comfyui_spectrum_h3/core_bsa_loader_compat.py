@@ -1,17 +1,17 @@
 """Resolve reviewed core BSA callables under ComfyUI's real builtin-node loader.
 
 ComfyUI loads builtin ``comfy_extras/nodes_*.py`` files through ``load_custom_node``
-using the file path stem as ``sys.modules`` key. Therefore the runtime
-``__module__`` for core BSA callables is normally an absolute path, not
-``comfy_extras.nodes_sparse_attention``. Importing the canonical dotted module
-creates a second module instance with different function/class identities and is
-not a valid ownership oracle for the live model.
+using the file path stem as ``sys.modules`` key. Therefore the live core-BSA
+closures can belong to an absolute-path module instead of the canonical dotted
+``comfy_extras.nodes_sparse_attention`` import. Importing the canonical module
+then creates a second module instance whose function/class identities cannot prove
+the already-installed live patch.
 
-This compatibility layer keeps the existing strict BSA audit but resolves the
-exact runtime module instance from the live replacement/override callables. The
-module is accepted only when it is the current ComfyUI checkout's
-``comfy_extras/nodes_sparse_attention.py``, has the reviewed Git blob and source
-shape, and the live nested callable semantics match that reviewed on-disk source.
+This compatibility layer preserves the existing canonical audit and adds one
+strict fallback for that real loader alias. The fallback accepts only the current
+ComfyUI checkout's reviewed ``comfy_extras/nodes_sparse_attention.py`` source,
+independently proves nested callable semantics from that on-disk source, and then
+runs the existing ownership/route audit against the exact live module instance.
 """
 from __future__ import annotations
 
@@ -35,14 +35,23 @@ _REQUIRED = (
     "PRODUCER_CHUNK",
     "ck",
 )
+_ORIGINAL_LOOKS_LIKE = core_bsa_compat._looks_like_core_bsa_callable
+_ORIGINAL_PROBE = core_bsa_compat.probe
 _INSTALLED = False
 
 
 def _comfy_extras_dir() -> Path | None:
-    try:
-        import comfy
+    """Resolve the active ComfyUI root through a concrete ``comfy`` submodule.
 
-        source = getattr(comfy, "__file__", None)
+    ``comfy`` itself is a namespace package in current ComfyUI and therefore has
+    no reliable ``__file__``. ``comfy.model_management`` is an ordinary module
+    from the active checkout and gives us an unambiguous root without importing
+    the BSA file under a second name.
+    """
+    try:
+        import comfy.model_management as model_management
+
+        source = getattr(model_management, "__file__", None)
         if not isinstance(source, str):
             return None
         root = Path(source).resolve().parent.parent
@@ -110,6 +119,10 @@ def _runtime_module_from_callable(
 
 
 def _looks_like_runtime_core_bsa_callable(function: Any, owner: str, local_name: str) -> bool:
+    # Preserve the canonical test/import path exactly. The loader-aware proof is
+    # an additive fallback, not a replacement for the already-reviewed contract.
+    if _ORIGINAL_LOOKS_LIKE(function, owner, local_name):
+        return True
     return _runtime_module_from_callable(function, owner, local_name) is not None
 
 
@@ -157,10 +170,10 @@ def _runtime_module_for_options(
     return runtime_module, runtime_blob
 
 
-def _runtime_probe(
+def _runtime_alias_probe(
     options: dict[str, Any], layout: Any, model: Any
 ) -> tuple[core_bsa_compat.CoreBSAAudit | None, str | None]:
-    """Run the existing BSA audit against the actual ComfyUI-loaded module instance."""
+    """Run the existing BSA audit against the actual path-loaded module instance."""
     try:
         resolved = _runtime_module_for_options(options, model)
         if resolved is None:
@@ -272,6 +285,16 @@ def _runtime_probe(
         raise
     except Exception:  # noqa: BLE001 - source/ownership introspection stays fail closed
         return None, "adapter_introspection_failed"
+
+
+def _runtime_probe(
+    options: dict[str, Any], layout: Any, model: Any
+) -> tuple[core_bsa_compat.CoreBSAAudit | None, str | None]:
+    """Prefer the canonical audit; use the loader alias only for its ownership miss."""
+    audit, reason = _ORIGINAL_PROBE(options, layout, model)
+    if audit is not None or reason != "ownership_unproven":
+        return audit, reason
+    return _runtime_alias_probe(options, layout, model)
 
 
 def install_core_bsa_loader_compat() -> None:
