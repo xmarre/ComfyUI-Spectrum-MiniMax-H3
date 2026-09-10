@@ -13,9 +13,10 @@ def test_pool_transaction_restores_contents_keys_and_all_identities_in_inference
         entry = (torch.ones(2, 3), torch.full((2, 3), 2.0))
         mapping = {("block",): entry}
         patch = N(pooled=mapping)
-        with probe.isolated_pool(patch, torch.device("cpu")):
+        with probe.isolated_pool(patch, torch.device("cpu")) as status:
             entry[0].zero_()
             patch.pooled = {"foreign": (torch.zeros(1, 1), torch.zeros(1, 1))}
+        assert status.pool_restored and status.rng_restored
         assert patch.pooled is mapping
         assert patch.pooled[("block",)] is entry
         assert torch.equal(entry[0], torch.ones(2, 3))
@@ -41,6 +42,21 @@ def test_transaction_restores_rng_and_pool_when_shadow_raises(error):
     assert patch.pooled[0][0] is tensor and tensor.item() == 1
 
 
+def test_primary_oom_is_not_masked_by_restore_failure(monkeypatch):
+    patch = N(pooled={0: (torch.ones(1, 1), torch.ones(1, 1))})
+    original = probe.PoolSnapshot.restore
+
+    def broken_restore(self):
+        original(self)
+        raise RuntimeError("synthetic restore failure")
+
+    monkeypatch.setattr(probe.PoolSnapshot, "restore", broken_restore)
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="primary oom") as caught:
+        with probe.isolated_pool(patch, torch.device("cpu")):
+            raise torch.cuda.OutOfMemoryError("primary oom")
+    assert any("synthetic restore failure" in note for note in getattr(caught.value, "__notes__", ()))
+
+
 def test_malformed_pool_fails_before_diagnostic_mutation():
     patch = N(pooled={0: (None, torch.zeros(1, 1))})
     with pytest.raises(ValueError, match="malformed"):
@@ -55,12 +71,14 @@ def test_chunked_error_metrics_and_nonfinite():
     assert report["max_abs"] == 2
     assert report["mae"] == 2
     assert probe.delta(torch.ones(1), torch.tensor([float("nan")]))["finite"] is False
+    empty = probe.delta(torch.empty(0), torch.empty(0))
+    assert empty["finite"] and empty["elements"] == 0
 
 
 def _fixture(tmp_path):
     config = N(bootstrap_first_forecast=True, degree=1)
     p = probe.Probe(tmp_path, 1, config)
-    rt = N(config=config, stats=N(forecast_model_calls=0),
+    rt = N(config=config, stats=N(forecast_model_calls=0, actual_transformer_calls=0),
            _run=N(min_actual_prefix_steps=2, state_conditioned_residual=False),
            _step=N(policy_step_id=0))
     patch = N(pooled={})
@@ -68,7 +86,8 @@ def _fixture(tmp_path):
         return N(identity=("source", ("layout", seq), ("routes", route),
                            ("pool_ownership", "cold" if route.endswith("cold") else "live")),
                  route_specs=((route, (0, 0), (0, 0)),), patch=patch,
-                 seq_len=seq, uuids=("positive",), block_count=1, flow_mixed=True)
+                 seq_len=seq, uuids=("positive",), block_count=1, flow_mixed=True,
+                 source_blob="reviewed-core-blob", patch_generation=7)
     return p, rt, patch, audit
 
 
@@ -93,10 +112,16 @@ def test_candidate_and_next_actual_measurements_preserve_control(tmp_path):
         return h * scale
     candidate = probe.Actual(p, rt, 3, 0, audit("h3_chunked_sparse_primed"))
     assert candidate.candidate
-    control = candidate.wrap_attention(attention, 0)(torch.ones(4, 2))
+    candidate_wrapper = candidate.wrap_attention(attention, 0)
+    control = candidate_wrapper(torch.ones(4, 2))
     assert calls == [1.0, 4.0]
     assert torch.equal(control, torch.ones(4, 2))
     assert patch.pooled[key] is entry and entry[1][0, 0] == 2
+    assert candidate.measurements[0]["pool_restored"] is True
+    assert candidate.measurements[0]["rng_restored"] is True
+    assert candidate.measurements[0]["diagnostic_transformer_nfe_delta"] == 0
+    assert candidate.measurements[0]["alternative_output_discarded"] is True
+    assert candidate.measurements[0]["alternative_supplied_calibration"] is None
     candidate.capture_hidden(torch.full((1, 4, 2), 2.0), 1)
     rt._step.policy_step_id = 3
     candidate.complete(True)
@@ -106,12 +131,17 @@ def test_candidate_and_next_actual_measurements_preserve_control(tmp_path):
     assert calls == [1, 4, 2, 1]
     assert torch.equal(control, torch.full((4, 2), 2.0))
     assert patch.pooled[key] is entry and entry[1][0, 0] == 3
+    assert next_call.measurements[0]["alternative_scale_headroom_exceeded_channels"] == 2
+    assert next_call.measurements[0]["alternative_supplied_calibration"] is not None
     next_call.complete(True)
     p.close()
     events = [json.loads(line) for line in p.path.read_text().splitlines()]
     assert len([e for e in events if e["event"] == "forecast_vs_actual"]) == 1
     kinds = [m["measurement"] for e in events if e["event"] == "actual" for m in e["measurements"]]
     assert kinds == ["cold_vs_primed", "skipped_refresh_next_actual"]
+    actual_events = [e for e in events if e["event"] == "actual"]
+    assert actual_events[0]["core_bsa_source_blob"] == "reviewed-core-blob"
+    assert actual_events[0]["patch_generation"] == 7
     assert events[-1]["diagnostic_attention_calls_completed"] == 2
     assert events[-1]["diagnostic_transformer_nfe"] == 0
 
