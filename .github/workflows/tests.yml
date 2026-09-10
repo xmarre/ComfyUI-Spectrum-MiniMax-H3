@@ -117,9 +117,13 @@ jobs:
             --ignore I001,UP037
           python -m ruff check \
             comfyui_spectrum_h3/backend_history.py \
+            comfyui_spectrum_h3/bsa_transition_probe.py \
+            comfyui_spectrum_h3/bsa_transition_probe_compat.py \
+            comfyui_spectrum_h3/bsa_transition_probe_manual.py \
             comfyui_spectrum_h3/core_bsa_compat.py \
             comfyui_spectrum_h3/core_bsa_diagnostics.py \
             comfyui_spectrum_h3/core_bsa_flow_compat.py \
+            comfyui_spectrum_h3/core_bsa_forecast_recovery.py \
             comfyui_spectrum_h3/core_bsa_preprocess_compat.py \
             comfyui_spectrum_h3/source_code_audit.py \
             comfyui_spectrum_h3/comfy_compiler_compat.py \
@@ -146,12 +150,18 @@ jobs:
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
             tests/test_backend_history.py \
+            tests/test_bsa_transition_probe.py \
+            tests/test_bsa_transition_probe_activation.py \
+            tests/test_bsa_transition_probe_kitchen_compat.py \
+            tests/test_bsa_transition_probe_manual.py \
             tests/test_core_bsa_compat.py \
             tests/test_core_bsa_flow_compat.py \
             tests/test_core_bsa_flow_identity.py \
+            tests/test_core_bsa_forecast_recovery.py \
             tests/test_core_bsa_preprocess_compat.py \
             tests/test_core_bsa_source_hardening.py \
             tests/test_reviewed_bsa_fixture_gate.py \
+            tests/test_scheduler_bootstrap_entitlement.py \
             tests/test_comfy_compiler_compat.py \
             tests/test_config.py \
             tests/test_continuum_interop.py \
