@@ -41,6 +41,12 @@ jobs:
             comfy_kitchen_version: "0.2.33"
             comfy_aimdo_version: "0.5.3"
             fixture_required: true
+          - comfy_ref: efd54b9a17ce422a2cdbed76d5e7a87671f253c2
+            comfy_repository: xmarre/ComfyUI
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.33"
+            comfy_aimdo_version: "0.5.3"
+            measure_fixture_required: true
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
@@ -52,7 +58,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          repository: comfyanonymous/ComfyUI
+          repository: ${{ matrix.comfy_repository || 'comfyanonymous/ComfyUI' }}
           ref: ${{ matrix.comfy_ref }}
           path: ComfyUI
 
@@ -158,6 +164,7 @@ jobs:
             tests/test_core_bsa_flow_compat.py \
             tests/test_core_bsa_flow_identity.py \
             tests/test_core_bsa_forecast_recovery.py \
+            tests/test_core_bsa_measure_history.py \
             tests/test_core_bsa_preprocess_compat.py \
             tests/test_core_bsa_source_hardening.py \
             tests/test_reviewed_bsa_fixture_gate.py \
@@ -219,6 +226,7 @@ jobs:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
           PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE:${{ github.workspace }}/FlowRegenerate
           SPECTRUM_REQUIRE_REVIEWED_BSA_FIXTURE: ${{ matrix.fixture_required && '1' || '0' }}
+          SPECTRUM_REQUIRE_REVIEWED_BSA_MEASURE_FIXTURE: ${{ matrix.measure_fixture_required && '1' || '0' }}
         run: |
           python -m pytest -q \
             --ignore=tests/test_external_patch_compat.py \
