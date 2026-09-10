@@ -82,6 +82,7 @@ def _fixture(tmp_path):
            _run=N(min_actual_prefix_steps=2, state_conditioned_residual=False),
            _step=N(policy_step_id=0))
     patch = N(pooled={})
+
     def audit(route, seq=4):
         return N(identity=("source", ("layout", seq), ("routes", route),
                            ("pool_ownership", "cold" if route.endswith("cold") else "live")),
@@ -91,16 +92,20 @@ def _fixture(tmp_path):
     return p, rt, patch, audit
 
 
-def test_candidate_and_next_actual_measurements_preserve_control(tmp_path):
-    p, rt, patch, audit = _fixture(tmp_path)
+def _complete_cold_anchor(p, rt, patch, audit, *, step=2):
     key = (0, 4, ("positive",))
-    # Complete cold control anchor.
-    cold = probe.Actual(p, rt, 2, 0, audit("h3_chunked_sparse_cold"))
+    cold = probe.Actual(p, rt, step, 0, audit("h3_chunked_sparse_cold"))
     patch.pooled[key] = (torch.ones(1, 2), torch.ones(1, 2))
     cold.capture_hidden(torch.ones(1, 4, 2), 1)
     cold.complete(True)
-    entry = patch.pooled[key]
+    return key, patch.pooled[key]
+
+
+def test_candidate_and_next_actual_measurements_preserve_control(tmp_path):
+    p, rt, patch, audit = _fixture(tmp_path)
+    key, entry = _complete_cold_anchor(p, rt, patch, audit)
     calls = []
+
     def attention(h):
         existing = patch.pooled.get(key)
         scale = existing[1][0, 0].item() if existing is not None else 4.0
@@ -110,8 +115,10 @@ def test_candidate_and_next_actual_measurements_preserve_control(tmp_path):
         for tensor in patch.pooled[key]:
             tensor.add_(1)
         return h * scale
+
     candidate = probe.Actual(p, rt, 3, 0, audit("h3_chunked_sparse_primed"))
     assert candidate.candidate
+    assert candidate.predecessor_pool_continuity is True
     candidate_wrapper = candidate.wrap_attention(attention, 0)
     control = candidate_wrapper(torch.ones(4, 2))
     assert calls == [1.0, 4.0]
@@ -140,24 +147,65 @@ def test_candidate_and_next_actual_measurements_preserve_control(tmp_path):
     kinds = [m["measurement"] for e in events if e["event"] == "actual" for m in e["measurements"]]
     assert kinds == ["cold_vs_primed", "skipped_refresh_next_actual"]
     actual_events = [e for e in events if e["event"] == "actual"]
+    assert actual_events[0]["captured_cold_successor_blocks"] == 1
+    assert actual_events[1]["predecessor_pool_continuity"] is True
     assert actual_events[0]["core_bsa_source_blob"] == "reviewed-core-blob"
     assert actual_events[0]["patch_generation"] == 7
+    forecast_event = next(e for e in events if e["event"] == "forecast_vs_actual")
+    assert forecast_event["predecessor_pool_continuity"] is True
     assert events[-1]["diagnostic_attention_calls_completed"] == 2
     assert events[-1]["diagnostic_transformer_nfe"] == 0
 
 
 @pytest.mark.parametrize("change", ["layout", "nonadjacent", "owner", "dense"])
 def test_candidate_requires_adjacent_matching_cold_anchor(tmp_path, change):
-    p, rt, _patch, audit = _fixture(tmp_path)
-    cold = probe.Actual(p, rt, 2, 0, audit("h3_chunked_sparse_cold"))
-    cold.capture_hidden(torch.ones(1, 4, 2), 1)
-    cold.complete(True)
+    p, rt, patch, audit = _fixture(tmp_path)
+    _complete_cold_anchor(p, rt, patch, audit)
     a = audit("h3_dense" if change == "dense" else "h3_chunked_sparse_primed",
               seq=5 if change == "layout" else 4)
     if change == "owner":
         a.identity += (("owner", "new"),)
     next_call = probe.Actual(p, rt, 4 if change == "nonadjacent" else 3, 0, a)
     assert not next_call.candidate
+    p.close()
+
+
+def test_candidate_rejects_replaced_pool_tensor_owners(tmp_path):
+    p, rt, patch, audit = _fixture(tmp_path)
+    key, entry = _complete_cold_anchor(p, rt, patch, audit)
+    patch.pooled[key] = tuple(tensor.clone() for tensor in entry)
+    candidate = probe.Actual(p, rt, 3, 0, audit("h3_chunked_sparse_primed"))
+    assert not candidate.candidate
+    assert candidate.predecessor_pool_continuity is False
+    assert candidate.predecessor_pool_mismatch_block == 0
+    assert candidate.predecessor_pool_mismatch_reason == "pool_tensor_owner_changed"
+    p.close()
+    events = [json.loads(line) for line in p.path.read_text().splitlines()]
+    skipped = [e for e in events if e["event"] == "skipped"]
+    assert skipped[-1]["reason"] == "cold_to_primed_pool_successor_discontinuity"
+    assert skipped[-1]["mismatch"] == "pool_tensor_owner_changed"
+
+
+def test_candidate_rejects_mutated_pool_tensor_contents(tmp_path):
+    p, rt, patch, audit = _fixture(tmp_path)
+    key, entry = _complete_cold_anchor(p, rt, patch, audit)
+    entry[0].add_(0.25)
+    assert patch.pooled[key] is entry
+    candidate = probe.Actual(p, rt, 3, 0, audit("h3_chunked_sparse_primed"))
+    assert not candidate.candidate
+    assert candidate.predecessor_pool_continuity is False
+    assert candidate.predecessor_pool_mismatch_block == 0
+    assert candidate.predecessor_pool_mismatch_reason == "pool_tensor_contents_changed"
+    p.close()
+
+
+def test_candidate_allows_new_container_with_same_pool_tensor_owners_and_bytes(tmp_path):
+    p, rt, patch, audit = _fixture(tmp_path)
+    key, entry = _complete_cold_anchor(p, rt, patch, audit)
+    patch.pooled[key] = [entry[0], entry[1]]
+    candidate = probe.Actual(p, rt, 3, 0, audit("h3_chunked_sparse_primed"))
+    assert candidate.candidate
+    assert candidate.predecessor_pool_continuity is True
     p.close()
 
 
