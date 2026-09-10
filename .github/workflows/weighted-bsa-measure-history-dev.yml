@@ -18,6 +18,16 @@ jobs:
 
       - name: Apply development patch
         run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("tools/apply_core_bsa_measure_history.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''def replace_once(path: str, old: str, new: str) -> None:\n    p = Path(path)\n'''
+          new = '''def replace_once(path: str, old: str, new: str) -> None:\n    if old == new:\n        return\n    p = Path(path)\n'''
+          if text.count(old) != 1:
+              raise SystemExit("development patcher replace_once anchor changed")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
           python tools/apply_core_bsa_measure_history.py
           python tools/fix_core_bsa_measure_history_generated.py
 
