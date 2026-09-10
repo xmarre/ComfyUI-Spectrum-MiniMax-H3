@@ -136,13 +136,13 @@ def isolated_pool(patch, device):
         restoration_errors = []
         try:
             random.setstate(python_rng)
-        except Exception as exc:  # pragma: no cover - stdlib state restore is deterministic
+        except (TypeError, ValueError) as exc:  # pragma: no cover - stdlib state restore is deterministic
             restoration_errors.append(f"Python RNG restore failed: {exc}")
         try:
             saved.restore()
             saved.verify()
             status.pool_restored = True
-        except Exception as exc:
+        except (RuntimeError, TypeError, ValueError) as exc:
             restoration_errors.append(f"pool restore failed: {exc}")
         try:
             cpu_ok = torch.equal(torch.get_rng_state(), cpu_rng)
@@ -153,7 +153,7 @@ def isolated_pool(patch, device):
             status.rng_restored = bool(cpu_ok and cuda_ok and python_ok)
             if not status.rng_restored:
                 restoration_errors.append("RNG state did not restore exactly")
-        except Exception as exc:
+        except (RuntimeError, TypeError, ValueError) as exc:
             restoration_errors.append(f"RNG verification failed: {exc}")
         if restoration_errors:
             message = "BSA diagnostic restoration failure: " + "; ".join(restoration_errors)
