@@ -94,7 +94,7 @@ def _flow_modules():
 def _layout(seq_len=128):
     return SimpleNamespace(
         seq_len=seq_len,
-        signature=(64, 1, 8, 8, 16),
+        signature=(64, 8, 4, 4, 16),
         segments=[
             (0, 64, "text"),
             (64, 96, "audio"),
@@ -104,14 +104,16 @@ def _layout(seq_len=128):
 
 
 def _mixed_layout():
+    positions = torch.zeros((140, 3), dtype=torch.float32)
     return SimpleNamespace(
-        seq_len=160,
-        signature=("h3_flow_mixed_grid_v1", 64, 3, 8, 8, 16, 1, 8, 8),
+        seq_len=140,
+        signature=("h3_flow_mixed_grid_v1", 64, 8, 4, 4, 16, 1, 8, 8),
         segments=[
             (0, 64, "text"),
             (64, 96, "audio"),
-            (96, 160, "video"),
+            (96, 140, "video"),
         ],
+        position_ids=positions,
     )
 
 
@@ -175,79 +177,88 @@ def _cell(value):
     return close.__closure__[0]
 
 
-def _mixed_wrapper(previous, index, carrier, mixed, model):
+def _rebind(wrapper, **changes):
+    values = core_bsa_compat._closure_values(wrapper)
+    assert isinstance(values, dict)
+    values.update(changes)
+    return types.FunctionType(
+        wrapper.__code__,
+        wrapper.__globals__,
+        name=wrapper.__name__,
+        closure=tuple(_cell(values[name]) for name in wrapper.__code__.co_freevars),
+    )
+
+
+def _mixed_shared(model, mixed):
     _attention, mixed_module = _flow_modules()
     from h3_flow_regenerate.metrics import H3FlowMetrics
+    import comfy.ldm.minimax.model as native
 
     plan = mixed_module.MixedGridPlan(
         prefix=torch.zeros(1, 24, 1, 8, 8),
-        temporal=3,
+        temporal=8,
         source_h=4,
         source_w=4,
         prefix_noise=torch.zeros(1, 24, 1, 8, 8),
         attention_measure=False,
     )
+    return {
+        "cached": {},
+        "inner": model,
+        "layout": _layout(),
+        "measure_contract": None,
+        "metrics": H3FlowMetrics(),
+        "mixed_layout": mixed,
+        "native": native,
+        "old_prefix": 4,
+        "plan": plan,
+        "positions": mixed.position_ids,
+        "va": 96,
+        "vb": 128,
+    }
+
+
+def _mixed_wrapper(previous, index, carrier, mixed, model, shared):
+    _attention, mixed_module = _flow_modules()
     code = core_bsa_compat._nested_code(mixed_module.mixed_diffusion_wrapper, "call")
     assert code is not None
     values = {name: None for name in code.co_freevars}
-    values.update(
-        cached={},
-        inner=model,
-        layer=index,
-        layout=carrier,
-        measure_contract=None,
-        metrics=H3FlowMetrics(),
-        mixed_layout=mixed,
-        native=None,
-        old_prefix=8,
-        plan=plan,
-        positions=torch.empty(0),
-        previous=previous,
-        va=96,
-        vb=128,
-    )
+    values.update(shared)
+    values.update(layer=index, layout=carrier, previous=previous)
     wrapper = types.FunctionType(
         code,
         mixed_module.__dict__,
         name=code.co_name,
         closure=tuple(_cell(values[name]) for name in code.co_freevars),
     )
-    return wrapper, plan
+    return wrapper
 
 
 def _wrap_mixed(options, model, *, include_all=True):
     carrier = _layout()
     mixed = _mixed_layout()
+    shared = _mixed_shared(model, mixed)
     out = dict(options)
     patches = dict(options["patches_replace"])
     dit = dict(patches["dit"])
-    plan = None
     limit = len(model.blocks) if include_all else len(model.blocks) - 1
     for index in range(limit):
-        wrapper, current_plan = _mixed_wrapper(
-            dit[("double_block", index)], index, carrier, mixed, model
+        dit[("double_block", index)] = _mixed_wrapper(
+            dit[("double_block", index)],
+            index,
+            carrier,
+            mixed,
+            model,
+            shared,
         )
-        if plan is None:
-            plan = current_plan
-        else:
-            # Real mixed_diffusion_wrapper shares one plan object across every
-            # generated layer closure. Rebind the synthetic closure accordingly.
-            closure = core_bsa_compat._closure_values(wrapper)
-            values = dict(closure)
-            values["plan"] = plan
-            wrapper = types.FunctionType(
-                wrapper.__code__,
-                wrapper.__globals__,
-                name=wrapper.__name__,
-                closure=tuple(_cell(values[name]) for name in wrapper.__code__.co_freevars),
-            )
-        dit[("double_block", index)] = wrapper
     patches["dit"] = dit
     out["patches_replace"] = patches
     return out, carrier, mixed
 
 
-def _actual_args(options, layout, seq_len=128):
+def _actual_args(options, layout, seq_len=None):
+    if seq_len is None:
+        seq_len = layout.seq_len
     call_options = dict(options)
     call_options["minimax_h3_layout"] = layout
     return {
@@ -298,13 +309,41 @@ def test_reviewed_mixed_grid_wrapper_uses_propagated_layout_and_exact_kv_sinks(m
     assert reason is None and audit is not None and audit.safe
     assert audit.flow_mixed is True
     assert audit.flow_mixed_layout_propagated is True
-    assert audit.seq_len == 160
+    assert audit.seq_len == 140
     assert audit.flow_carrier_seq_len == 128
-    assert audit.flow_outer_seq_lens == (128, 160)
+    assert audit.flow_outer_seq_lens == (128, 140)
     assert all(
         spec == ("h3_chunked_sparse_cold", (0, 2), (0, 0))
         for spec in audit.route_specs
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("inner", object()),
+        ("native", object()),
+        ("old_prefix", 5),
+        ("positions", torch.zeros((140, 3))),
+        ("va", 95),
+        ("vb", 127),
+        ("measure_contract", {"api": 999}),
+        ("cached", {"rope": object()}),
+    ],
+)
+def test_mixed_grid_behavior_closure_mismatch_stays_fail_closed(field, bad_value):
+    model, _patch, _override, options = _installation(count=1)
+    options, carrier, _mixed = _wrap_mixed(options, model)
+    key = ("double_block", 0)
+    replacement = options["patches_replace"]["dit"][key]
+    options["patches_replace"]["dit"][key] = _rebind(
+        replacement,
+        **{field: bad_value},
+    )
+
+    audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
+    assert audit is None
+    assert reason == "flow_wrapper_unreviewed"
 
 
 def test_released_v033_effective_layout_preserves_its_zero_sink_semantics():
@@ -315,7 +354,7 @@ def test_released_v033_effective_layout_preserves_its_zero_sink_semantics():
     effective = core_bsa_flow_compat._effective_mixed_layout(
         {
             "source_blob": "8fc0f753ff2cd21fae898a4dd3c9ab1025f98443",
-            "mixed_seq": 160,
+            "mixed_seq": 140,
             "mixed_identity": normalized_mixed[1],
             "mixed_layout": mixed,
         },
@@ -323,7 +362,7 @@ def test_released_v033_effective_layout_preserves_its_zero_sink_semantics():
     )
     normalized = core_bsa_compat._normalize_layout(effective)
     assert normalized is not None
-    assert normalized[0] == 160
+    assert normalized[0] == 140
     assert all(kind != "video" for _a, _b, kind in dict(normalized[1])["segments"])
 
 
