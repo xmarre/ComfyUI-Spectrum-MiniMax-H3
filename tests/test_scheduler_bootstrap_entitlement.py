@@ -39,6 +39,11 @@ class EntitlementRuntime(SpectrumH3Runtime):
         decision = super().begin_step(timestep)
         step = self._step
         run = self._run
+        previous_anchor = (
+            self.forecaster.latest_anchor_ids(1) == (self._last_completed_step_id,)
+            if self._last_completed_step_id is not None
+            else False
+        )
         if (
             decision["actual"]
             and decision["reason"] == "insufficient actual history"
@@ -52,6 +57,7 @@ class EntitlementRuntime(SpectrumH3Runtime):
             and self.forecaster.history_length == 1
             and self._last_completed_mode == "actual"
             and self._last_completed_step_id == step.step_id - 1
+            and previous_anchor
         ):
             step.mode = "forecast"
             step.reason = "deferred one-point bootstrap forecast"
@@ -268,6 +274,25 @@ def test_sampler_required_exact_stage_dominates_and_does_not_consume_entitlement
     second, _, second_mode = _complete(runtime, 0.5)
     assert first_mode == second_mode == "actual"
     assert second["reason"] == "sampler-required exact stage"
+    assert runtime._bootstrap_entitlement_unused is True
+    runtime.end_run(run_id)
+
+
+def test_deferred_bootstrap_requires_the_previous_actual_to_be_the_retained_anchor():
+    runtime = _runtime(tail_actual_steps=0)
+    run_id = _start(
+        runtime,
+        4,
+        forced_actual_step_ids=(1,),
+        history_step_ids=(0,),
+    )
+    _complete(runtime, 1.0)
+    exact, _, exact_mode = _complete(runtime, 0.75)
+    assert exact_mode == "actual" and exact["reason"] == "sampler-required exact step"
+    assert runtime.forecaster.latest_anchor_ids(1) == (0,)
+    candidate, _, candidate_mode = _complete(runtime, 0.5)
+    assert candidate_mode == "actual"
+    assert candidate["reason"] == "insufficient actual history"
     assert runtime._bootstrap_entitlement_unused is True
     runtime.end_run(run_id)
 
