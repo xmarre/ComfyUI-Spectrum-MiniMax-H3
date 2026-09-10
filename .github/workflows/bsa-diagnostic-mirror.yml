@@ -61,13 +61,23 @@ jobs:
           python -m pip wheel --no-deps --wheel-dir /tmp/spectrum-h3-wheel .
 
       - name: Static checks
+        id: static
+        continue-on-error: true
         run: |
           python -m ruff check \
             comfyui_spectrum_h3/bsa_transition_probe.py \
             tests/test_bsa_transition_probe.py \
             tests/test_scheduler_bootstrap_entitlement.py \
-            --ignore I001
+            --ignore I001 \
+            --output-format json > ruff.json
           python -m compileall -q comfyui_spectrum_h3 tests tools
+
+      - name: Upload static report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bsa-diagnostic-static-report
+          path: ruff.json
 
       - name: Run bounded diagnostic and scheduler tests
         env:
@@ -89,3 +99,7 @@ jobs:
             tests/test_sampling.py \
             tests/test_continuum_interop.py \
             tests/test_sa_solver_state_conditioning.py
+
+      - name: Enforce static checks
+        if: steps.static.outcome == 'failure'
+        run: exit 1
