@@ -7,6 +7,9 @@ replacements = {
     '''        provider_identity=CORE_BSA_MEASURE_PROVIDER,\n        exact_k_block_range=tuple(exact_range),\n''': '''        provider_identity=CORE_BSA_MEASURE_PROVIDER,\n        q_rows=seq_len,\n        kv_rows=seq_len,\n        exact_k_block_range=tuple(exact_range),\n''',
     '''        ("rows", len(measure.normalized_request),),\n''': '''        ("rows", measure.q_rows, measure.kv_rows),\n''',
     '''        measure.pool_keys[index][1],\n        measure.pool_keys[index][1],\n        measure.exact_range_digest,\n''': '''        measure.q_rows,\n        measure.kv_rows,\n        measure.exact_range_digest,\n''',
+    '''def _pool_key(audit: CoreBSAAudit, index: int) -> tuple[Any, ...]:\n    if audit.measure is not None:\n        return audit.measure.pool_keys[index]\n''': '''def _pool_key(audit: CoreBSAAudit, index: int) -> tuple[Any, ...]:\n    measure = getattr(audit, "measure", None)\n    if measure is not None:\n        return measure.pool_keys[index]\n''',
+    '''    measure = audit.measure\n    request = call_options.get(ATTENTION_MEASURE_KEY, _MISSING)\n''': '''    measure = getattr(audit, "measure", None)\n    request = call_options.get(ATTENTION_MEASURE_KEY, _MISSING)\n''',
+    '''    if audit.measure is None:\n        return receipt\n    return (\n        *receipt,\n        (\n            ATTENTION_MEASURE_KEY,\n            *_measure_receipt_fields(\n                audit.measure,\n''': '''    measure = getattr(audit, "measure", None)\n    if measure is None:\n        return receipt\n    return (\n        *receipt,\n        (\n            ATTENTION_MEASURE_KEY,\n            *_measure_receipt_fields(\n                measure,\n''',
     '''            expected_route, expected_sink, expected_sink_q = audit.route_specs[index]\n''': '''            expected_route, _expected_sink, _expected_sink_q = audit.route_specs[index]\n''',
 }
 for old, new in replacements.items():
