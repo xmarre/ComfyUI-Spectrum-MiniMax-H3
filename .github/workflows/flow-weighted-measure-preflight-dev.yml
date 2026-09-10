@@ -79,6 +79,17 @@ jobs:
           new = '''def test_weighted_mixed_grid_preflight_synthesizes_block_local_contracts_without_mutation(monkeypatch):\n    _attention, mixed_module = _flow_modules()\n    if not hasattr(mixed_module, "MIXED_GRID_MEASURE_PROFILE_WEIGHTED"):\n        pytest.skip("Flow fixture predates the explicit weighted measure profile")\n\n    model, _patch, _override, options = _installation(sigma=0.5)\n    nodes = _audited_nodes()\n    # Match the production lifecycle: patch/ON_PREPARE_STATE registers the\n    # owner-bound measure capability before Spectrum probes the model call.\n    nodes.install_override(_patch, options)\n\n    # This CPU fixture cannot load the candidate GPU kernel. Expose only the\n    # provider ABI that Spectrum audits; the cross-repo workflow separately\n    # source-checks the pinned CUDA/HIP candidate for this key_bias parameter.\n    def key_bias_capable_chunked(*args, key_bias=None, **kwargs):\n        raise AssertionError("CPU compatibility audit must not execute the sparse kernel")\n\n    monkeypatch.setattr(nodes.ck, "sol_attn_chunked", key_bias_capable_chunked)\n'''
           if text.count(old) != 1:
               raise SystemExit(f"weighted preflight fixture anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''    assert audit.measure.normalized_request == {\n        "api": 1,\n'''
+          new = '''    assert audit.measure.normalized_request == core_bsa_compat._freeze({\n        "api": 1,\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"normalized request assertion anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+          old = '''        "coordinate_policy": "minimax_h3_native_frame_grid_v1",\n    }\n    expected_external = {\n'''
+          new = '''        "coordinate_policy": "minimax_h3_native_frame_grid_v1",\n    })\n    expected_external = {\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"normalized request closing anchor count: {text.count(old)}")
           path.write_text(text.replace(old, new, 1), encoding="utf-8")
           PY
 
