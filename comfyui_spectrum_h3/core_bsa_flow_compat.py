@@ -608,7 +608,7 @@ def _pool_entry(
 ) -> tuple[Any, ...]:
     return core_bsa_compat._pool_entry(
         audit.patch,
-        (index, audit.seq_len, audit.uuids),
+        core_bsa_compat._pool_key(audit, index),
         audit.pool_specs[index],
     )
 
@@ -698,9 +698,17 @@ def _make_actual_wrapper(
             output = replacement(args, replacement_context)
         else:
             def audited_original_block(call_args):
-                nonlocal sparse_selected, original_block_calls
+                nonlocal sparse_selected, original_block_calls, metadata_ok
                 original_block_calls += 1
                 sparse_selected = call_args.get("attention") is expected_attention
+                if not core_bsa_compat._measure_runtime_matches(
+                    audit,
+                    index,
+                    call_args.get("transformer_options"),
+                    sparse_selected=sparse_selected,
+                ):
+                    metadata_ok = False
+                    audit.failure = "actual_measure_metadata_failed"
                 if sparse_selected:
                     from .bsa_transition_probe import attention
                     call_args = {**call_args, "attention": attention(expected_attention, audit, index)}
@@ -719,19 +727,15 @@ def _make_actual_wrapper(
                 after,
                 sparse_selected=sparse_selected,
             )
-            expected_route, expected_sink, expected_sink_q = audit.route_specs[index]
+            expected_route, _expected_sink, _expected_sink_q = audit.route_specs[index]
             if not metadata_ok or observed != expected_route:
                 audit.failure = "actual_route_mismatch"
             receipts.append(
-                (
-                    core_bsa_compat.ADAPTER_KEY,
-                    core_bsa_compat.ADAPTER_VERSION,
-                    audit.patch_generation,
+                core_bsa_compat._receipt(
+                    audit,
                     index,
                     observed,
-                    audit.seq_len,
-                    expected_sink,
-                    expected_sink_q,
+                    completed=bool(metadata_ok and observed == expected_route),
                 )
             )
         except torch.cuda.OutOfMemoryError:
