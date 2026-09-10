@@ -1,5 +1,6 @@
 from .comfy_compiler_compat import install_comfy_compiler_compat
 from .config import AGGRESSIVE_PRESET, CONSERVATIVE_PRESET, SpectrumH3Config
+from .core_bsa_loader_compat import install_core_bsa_loader_compat
 from .er_sde_offline_replay_safety import install_er_sde_offline_replay_safety
 from .er_sde_policy import install_er_sde_tail_policy
 from .external_patch_compat import install_external_patch_compat
@@ -23,6 +24,7 @@ from .replay_trust_shadow import install_replay_native_trust_shadow
 from .runtime import SpectrumH3Runtime
 from .trust_probe import install_forecast_trust_probe
 
+install_core_bsa_loader_compat()
 install_generic_residual_correction()
 install_postrun_safety()
 install_forecast_trust_probe()
