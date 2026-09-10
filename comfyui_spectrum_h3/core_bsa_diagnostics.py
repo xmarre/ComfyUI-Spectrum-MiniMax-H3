@@ -22,6 +22,39 @@ def _callable_label(value: Any) -> str:
     return f"{module}.{qualname}"
 
 
+def _callable_source_diagnostic(value: Any) -> str:
+    """Describe a rejected callable without changing any acceptance decision."""
+    if value is None:
+        return "callable=None"
+    base = getattr(value, "__func__", value)
+    module_name = getattr(base, "__module__", None)
+    qualname = getattr(base, "__qualname__", None)
+    defaults = getattr(base, "__defaults__", None)
+    kwdefaults = getattr(base, "__kwdefaults__", None)
+    code = getattr(base, "__code__", None)
+    code_name = getattr(code, "co_filename", None)
+    module = sys.modules.get(module_name) if isinstance(module_name, str) else None
+    source = getattr(module, "__file__", None) if module is not None else None
+    try:
+        source_path = str(Path(source).resolve()) if isinstance(source, str) else None
+    except (OSError, RuntimeError, TypeError, ValueError):
+        source_path = f"<unresolvable:{source!r}>"
+    try:
+        code_path = str(Path(code_name).resolve()) if isinstance(code_name, str) else None
+    except (OSError, RuntimeError, TypeError, ValueError):
+        code_path = f"<unresolvable:{code_name!r}>"
+    blob = core_bsa_compat._module_blob_sha(module) if module is not None else None
+    closure = core_bsa_compat._closure_values(base)
+    closure_keys = (
+        tuple(sorted(str(key) for key in closure)) if isinstance(closure, dict) else None
+    )
+    return (
+        f"module={module_name!r} qualname={qualname!r} registered={module is not None} "
+        f"source={source_path!r} code={code_path!r} blob={blob!r} "
+        f"defaults={defaults!r} kwdefaults={kwdefaults!r} closure_keys={closure_keys!r}"
+    )
+
+
 def _flow_layout_review_diagnostic(wrapper: Any, index: int) -> str:
     """Mirror every reviewed Flow layout-wrapper gate and report the first miss."""
     base = getattr(wrapper, "__func__", wrapper)
@@ -110,7 +143,9 @@ def _flow_layout_review_diagnostic(wrapper: Any, index: int) -> str:
         return f"layout:metrics_event={type(getattr(metrics, 'event', None)).__name__}"
     return (
         "layout:all_review_checks_passed "
-        f"blob={blob} scope={scope!r} module={module_name!r}"
+        f"blob={blob} scope={scope!r} module={module_name!r} "
+        f"previous={_callable_label(previous)} "
+        f"previous_detail=({_callable_source_diagnostic(previous)})"
     )
 
 
@@ -121,7 +156,7 @@ def _flow_wrapper_review_diagnostic(wrapper: Any, index: int) -> str:
         return _flow_layout_review_diagnostic(wrapper, index)
     if qualname == core_bsa_flow_compat._MIXED_QUALNAME:
         return "mixed:review_failed_before_detailed_diagnostic"
-    return f"unknown:qualname={qualname!r}"
+    return f"unknown:qualname={qualname!r} detail=({_callable_source_diagnostic(wrapper)})"
 
 
 def _effective_override(options: dict[str, Any]) -> tuple[Any, str]:
@@ -190,7 +225,8 @@ def ownership_diagnostic(
             if getattr(underlying, "__code__", None) is not block_patch_code:
                 return (
                     f"block[{index}]:block_patch_code_mismatch "
-                    f"underlying={_callable_label(underlying)} source={source}"
+                    f"underlying={_callable_label(underlying)} source={source} "
+                    f"underlying_detail=({_callable_source_diagnostic(underlying)})"
                 )
             closure = core_bsa_compat._closure_values(underlying)
             if closure is None:
@@ -244,7 +280,8 @@ def ownership_diagnostic(
                 "override:code_mismatch "
                 f"mode={outer_mode} current={_callable_label(current)} "
                 f"effective={_callable_label(effective)} contract={contract_shape} "
-                f"blocks=direct:{direct}/flow:{flow_wrapped}"
+                f"blocks=direct:{direct}/flow:{flow_wrapped} "
+                f"effective_detail=({_callable_source_diagnostic(effective)})"
             )
         closure = core_bsa_compat._closure_values(effective)
         if closure is None:
