@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 import random
+import sys
 import threading
 import uuid
 
@@ -127,14 +128,11 @@ def isolated_pool(patch, device):
         cuda_device = device.index if device.index is not None else torch.cuda.current_device()
         cuda_rng = torch.cuda.get_rng_state(cuda_device).clone()
     devices = [] if cuda_device is None else [cuda_device]
-    primary = None
     try:
         with torch.random.fork_rng(devices=devices):
             yield status
-    except Exception as exc:
-        primary = exc
-        raise
     finally:
+        primary = sys.exception()
         restoration_errors = []
         try:
             random.setstate(python_rng)
