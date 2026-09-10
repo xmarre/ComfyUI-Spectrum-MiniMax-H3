@@ -75,7 +75,7 @@ class PoolSnapshot:
     """Preserve dict, entry and tensor identities as well as tensor contents."""
     def __init__(self, patch):
         if not isinstance(patch.pooled, dict):
-            raise ValueError("BSA pool is not a dictionary")
+            raise TypeError("BSA pool is not a dictionary")
         self.patch, self.mapping = patch, patch.pooled
         self.entries = dict(patch.pooled)
         self.values = {}
@@ -131,20 +131,20 @@ def isolated_pool(patch, device):
     try:
         with torch.random.fork_rng(devices=devices):
             yield status
-    except BaseException as exc:
+    except Exception as exc:
         primary = exc
         raise
     finally:
         restoration_errors = []
         try:
             random.setstate(python_rng)
-        except BaseException as exc:  # pragma: no cover - stdlib state restore is deterministic
+        except Exception as exc:  # pragma: no cover - stdlib state restore is deterministic
             restoration_errors.append(f"Python RNG restore failed: {exc}")
         try:
             saved.restore()
             saved.verify()
             status.pool_restored = True
-        except BaseException as exc:
+        except Exception as exc:
             restoration_errors.append(f"pool restore failed: {exc}")
         try:
             cpu_ok = torch.equal(torch.get_rng_state(), cpu_rng)
@@ -155,7 +155,7 @@ def isolated_pool(patch, device):
             status.rng_restored = bool(cpu_ok and cuda_ok and python_ok)
             if not status.rng_restored:
                 restoration_errors.append("RNG state did not restore exactly")
-        except BaseException as exc:
+        except Exception as exc:
             restoration_errors.append(f"RNG verification failed: {exc}")
         if restoration_errors:
             message = "BSA diagnostic restoration failure: " + "; ".join(restoration_errors)
@@ -261,7 +261,7 @@ class Actual:
         self.step_id, self.call_id = step_id, call_id
         self.identity = _semantic_identity(audit.identity)
         sparse = [i for i, spec in enumerate(audit.route_specs) if spec[0] != "h3_dense"]
-        self.selected = set((sparse[0], sparse[len(sparse)//2], sparse[-1])) if sparse else set()
+        self.selected = {sparse[0], sparse[len(sparse)//2], sparse[-1]} if sparse else set()
         self.routes = tuple(spec[0] for spec in audit.route_specs)
         prev = probe.previous
         self.candidate = bool(not probe.examined and prev and prev[0] == step_id - 1
