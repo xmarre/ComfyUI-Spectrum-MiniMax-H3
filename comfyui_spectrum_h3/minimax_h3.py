@@ -468,6 +468,8 @@ def _execute_actual(
         # second full target tensor on the GPU before the required CPU archive.
         target = hidden[aa:vb].unsqueeze(0)
         actual_target = target
+        from .bsa_transition_probe import hidden
+        hidden(target, target_segments(layout)[0][1] - aa)
         from .backend_history import observe
         resets_before = runtime.stats.backend_history_resets
         observe(runtime, run_id, step_id, local_options,
@@ -517,14 +519,21 @@ def _execute_actual(
         return output
 
     dit_replacements[("double_block", last_index)] = capture_replacement
-    result = executor(
-        x,
-        timestep,
-        context,
-        local_options,
-        minimax_payload=minimax_payload,
-        **kwargs,
-    )
+    from .bsa_transition_probe import actual_scope
+    with actual_scope(runtime, run_id, step_id, call_id, local_options) as diagnostic:
+        result = executor(
+            x,
+            timestep,
+            context,
+            local_options,
+            minimax_payload=minimax_payload,
+            **kwargs,
+        )
+        if diagnostic is not None:
+            from .core_bsa_compat import accepts_actual
+            diagnostic.complete(accepts_actual(
+                diagnostic.audit, tuple(local_options.get("attention_backend_receipts_v1", ()))
+            ))
     if not observed:
         raise RuntimeError("native MiniMax H3 final transformer block was not executed")
     if residual_probe is not None and actual_target is not None:
