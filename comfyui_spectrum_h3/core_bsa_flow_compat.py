@@ -15,7 +15,7 @@ from typing import Any
 
 import torch
 
-from . import core_bsa_compat
+from . import core_bsa_compat, source_code_audit
 
 AUDITED_FLOW_ATTENTION_GIT_BLOBS = frozenset(
     {"c58c652f7b7d6030a2311f4805c3443615e432eb"}
@@ -35,6 +35,25 @@ _FLOW_MIXED_TOPLEVEL = "h3_flow_regenerate.mixed_grid"
 _FLOW_MIXED_SUFFIX = ".h3_flow_regenerate.mixed_grid"
 _LAYOUT_QUALNAME = "make_layout_block_wrapper.<locals>.wrapper"
 _MIXED_QUALNAME = "mixed_diffusion_wrapper.<locals>.wrap.<locals>.call"
+_LAYOUT_CLOSURE_SCHEMA = frozenset({"layer", "metrics", "previous", "record_layout"})
+_MIXED_CLOSURE_SCHEMA = frozenset(
+    {
+        "cached",
+        "inner",
+        "layer",
+        "layout",
+        "measure_contract",
+        "metrics",
+        "mixed_layout",
+        "native",
+        "old_prefix",
+        "plan",
+        "positions",
+        "previous",
+        "va",
+        "vb",
+    }
+)
 
 
 def _loaded_source_module(
@@ -75,6 +94,15 @@ def _loaded_source_module(
     return module, blob
 
 
+def _source_matches(base: Any, module: Any, lexical_path: tuple[str, ...]) -> bool:
+    source = getattr(module, "__file__", None)
+    return isinstance(source, str) and source_code_audit.matches_nested_source_code(
+        base,
+        Path(source),
+        lexical_path,
+    )
+
+
 def _audited_layout_wrapper(
     wrapper: Any, index: int
 ) -> tuple[Any, tuple[Any, ...]] | None:
@@ -92,15 +120,18 @@ def _audited_layout_wrapper(
     if loaded is None:
         return None
     module, blob = loaded
-    expected = core_bsa_compat._nested_code(
-        getattr(module, "make_layout_block_wrapper", None), "wrapper"
-    )
-    if expected is None or getattr(base, "__code__", None) is not expected:
+    if not _source_matches(base, module, ("make_layout_block_wrapper", "wrapper")):
+        return None
+    if getattr(base, "__defaults__", None) is not None or getattr(base, "__kwdefaults__", None):
         return None
     closure = core_bsa_compat._closure_values(base)
-    if closure is None or closure.get("layer") != index:
+    if closure is None or frozenset(closure) != _LAYOUT_CLOSURE_SCHEMA:
         return None
-    previous = closure.get("previous")
+    if type(closure["layer"]) is not int or closure["layer"] != index:
+        return None
+    if type(closure["record_layout"]) is not bool:
+        return None
+    previous = closure["previous"]
     if getattr(wrapper, "_h3_flow_layout_wrapper", False) is not True:
         return None
     if getattr(wrapper, "_h3_flow_previous", None) is not previous:
@@ -108,8 +139,12 @@ def _audited_layout_wrapper(
     scope = getattr(wrapper, "_h3_flow_layout_scope", None)
     if scope not in {"layout", "attention"}:
         return None
-    metrics = closure.get("metrics")
+    metrics = closure["metrics"]
     if getattr(wrapper, "_h3_flow_metrics", None) is not metrics:
+        return None
+    if not callable(getattr(metrics, "increment", None)) or not callable(
+        getattr(metrics, "event", None)
+    ):
         return None
     return previous, (
         "flow_layout_wrapper",
@@ -121,10 +156,85 @@ def _audited_layout_wrapper(
     )
 
 
+def _plan_geometry(plan: Any) -> dict[str, Any] | None:
+    try:
+        prefix = plan.prefix
+        prefix_noise = plan.prefix_noise
+        temporal = plan.temporal
+        source_h = plan.source_h
+        source_w = plan.source_w
+        attention_measure = plan.attention_measure
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    if not torch.is_tensor(prefix) or prefix.ndim != 5:
+        return None
+    if not torch.is_tensor(prefix_noise) or tuple(prefix_noise.shape) != tuple(prefix.shape):
+        return None
+    if (
+        type(temporal) is not int
+        or type(source_h) is not int
+        or type(source_w) is not int
+        or type(attention_measure) is not bool
+    ):
+        return None
+    prefix_t = int(prefix.shape[2])
+    target_h, target_w = map(int, prefix.shape[-2:])
+    if (
+        temporal <= prefix_t
+        or prefix_t <= 0
+        or min(source_h, source_w, target_h, target_w) < 2
+        or any(value % 2 for value in (source_h, source_w, target_h, target_w))
+    ):
+        return None
+    source_rows = source_h * source_w // 4
+    target_rows = target_h * target_w // 4
+    if source_rows <= 0 or target_rows <= source_rows:
+        return None
+    mixed_rows = prefix_t * target_rows + (temporal - prefix_t) * source_rows
+    return {
+        "temporal": temporal,
+        "prefix_t": prefix_t,
+        "source_h": source_h,
+        "source_w": source_w,
+        "target_h": target_h,
+        "target_w": target_w,
+        "source_rows": source_rows,
+        "target_rows": target_rows,
+        "mixed_rows": mixed_rows,
+        "attention_measure": attention_measure,
+    }
+
+
+def _expected_measure_contract(
+    geometry: dict[str, Any], *, video_start: int, sequence_rows: int
+) -> dict[str, Any] | None:
+    if not geometry["attention_measure"]:
+        return None
+    return {
+        "api": 1,
+        "mode": "prefix_kv_stratified_subsample",
+        "video_start": video_start,
+        "sequence_rows": sequence_rows,
+        "temporal": geometry["temporal"],
+        "prefix_t": geometry["prefix_t"],
+        "source_grid_h": geometry["source_h"] // 2,
+        "source_grid_w": geometry["source_w"] // 2,
+        "prefix_grid_h": geometry["target_h"] // 2,
+        "prefix_grid_w": geometry["target_w"] // 2,
+        "source_rows_per_frame": geometry["source_rows"],
+        "prefix_rows_per_frame": geometry["target_rows"],
+        "expected_kv_rows": video_start
+        + geometry["temporal"] * geometry["source_rows"],
+        "exact_prefix_queries_preserved": True,
+        "suffix_kv_unchanged": True,
+    }
+
+
 def _audited_mixed_wrapper(
     wrapper: Any,
     index: int,
     carrier_layout: Any,
+    model: Any,
 ) -> tuple[Any, tuple[Any, ...], dict[str, Any]] | None:
     base = getattr(wrapper, "__func__", wrapper)
     if getattr(base, "__qualname__", None) != _MIXED_QUALNAME:
@@ -140,19 +250,38 @@ def _audited_mixed_wrapper(
     if loaded is None:
         return None
     module, blob = loaded
-    expected = core_bsa_compat._nested_code(
-        getattr(module, "mixed_diffusion_wrapper", None), "call"
-    )
-    if expected is None or getattr(base, "__code__", None) is not expected:
+    if not _source_matches(
+        base,
+        module,
+        ("mixed_diffusion_wrapper", "wrap", "call"),
+    ):
+        return None
+    if getattr(base, "__defaults__", None) is not None or getattr(base, "__kwdefaults__", None):
         return None
     closure = core_bsa_compat._closure_values(base)
-    if closure is None or closure.get("layer") != index:
+    if closure is None or frozenset(closure) != _MIXED_CLOSURE_SCHEMA:
         return None
-    previous = closure.get("previous")
-    mixed_layout = closure.get("mixed_layout")
-    plan = closure.get("plan")
-    closed_carrier = closure.get("layout")
+    if type(closure["layer"]) is not int or closure["layer"] != index:
+        return None
+    if closure["inner"] is not model:
+        return None
+    native = closure["native"]
+    if (
+        getattr(native, "__name__", None) != "comfy.ldm.minimax.model"
+        or sys.modules.get("comfy.ldm.minimax.model") is not native
+    ):
+        return None
+    cached = closure["cached"]
+    if type(cached) is not dict or cached:
+        return None
+    previous = closure["previous"]
+    mixed_layout = closure["mixed_layout"]
+    plan = closure["plan"]
+    closed_carrier = closure["layout"]
     if type(plan) is not getattr(module, "MixedGridPlan", object):
+        return None
+    geometry = _plan_geometry(plan)
+    if geometry is None:
         return None
     normalized_carrier = core_bsa_compat._normalize_layout(carrier_layout)
     normalized_closed_carrier = core_bsa_compat._normalize_layout(closed_carrier)
@@ -175,10 +304,38 @@ def _audited_mixed_wrapper(
     mixed_video = [item for item in mixed_segments if item[2] == "video"]
     if len(carrier_video) != 1 or len(mixed_video) != 1:
         return None
-    if carrier_video[0][0] != mixed_video[0][0]:
+    va, vb, _kind = carrier_video[0]
+    mixed_va, mixed_vb, _mixed_kind = mixed_video[0]
+    if (
+        va != mixed_va
+        or vb != carrier_seq
+        or mixed_vb != mixed_seq
+        or mixed_seq != va + geometry["mixed_rows"]
+    ):
         return None
     if tuple(item for item in carrier_segments if item[2] != "video") != tuple(
         item for item in mixed_segments if item[2] != "video"
+    ):
+        return None
+    if closure["va"] != va or closure["vb"] != vb:
+        return None
+    if closure["old_prefix"] != geometry["prefix_t"] * geometry["source_rows"]:
+        return None
+    positions = closure["positions"]
+    if not torch.is_tensor(positions) or getattr(mixed_layout, "position_ids", None) is not positions:
+        return None
+    if int(positions.shape[0]) != mixed_seq:
+        return None
+    expected_measure = _expected_measure_contract(
+        geometry,
+        video_start=va,
+        sequence_rows=mixed_seq,
+    )
+    if closure["measure_contract"] != expected_measure:
+        return None
+    metrics = closure["metrics"]
+    if not callable(getattr(metrics, "increment", None)) or not callable(
+        getattr(metrics, "event", None)
     ):
         return None
     plan_generation = core_bsa_compat._lifetime_generation(plan)
@@ -203,6 +360,15 @@ def _audited_mixed_wrapper(
         "mixed_identity": mixed_identity,
         "carrier_seq": carrier_seq,
         "carrier_identity": carrier_identity,
+        "cached": cached,
+        "metrics": metrics,
+        "positions": positions,
+        "native": native,
+        "inner": model,
+        "measure_contract": expected_measure,
+        "old_prefix": closure["old_prefix"],
+        "va": va,
+        "vb": vb,
     }
 
 
@@ -210,6 +376,7 @@ def _unwrap_replacement(
     replacement: Any,
     index: int,
     carrier_layout: Any,
+    model: Any,
 ) -> tuple[Any | None, tuple[Any, ...], dict[str, Any] | None, str | None]:
     current = replacement
     identities: list[Any] = []
@@ -230,7 +397,7 @@ def _unwrap_replacement(
             identities.append(identity)
             continue
 
-        mixed_result = _audited_mixed_wrapper(current, index, carrier_layout)
+        mixed_result = _audited_mixed_wrapper(current, index, carrier_layout, model)
         if mixed_result is not None:
             if mixed is not None:
                 return None, tuple(identities), mixed, "flow_mixed_wrapper_stacked"
@@ -335,7 +502,7 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
                 mixed_specs.append(None)
                 continue
             underlying, identities, mixed, reason = _unwrap_replacement(
-                replacement, index, layout
+                replacement, index, layout, model
             )
             if underlying is None:
                 return None, reason or "flow_wrapper_unreviewed"
@@ -359,6 +526,15 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
                     or item["mixed_layout"] is not mixed["mixed_layout"]
                     or item["source_blob"] != mixed["source_blob"]
                     or item["carrier_identity"] != mixed["carrier_identity"]
+                    or item["cached"] is not mixed["cached"]
+                    or item["metrics"] is not mixed["metrics"]
+                    or item["positions"] is not mixed["positions"]
+                    or item["native"] is not mixed["native"]
+                    or item["inner"] is not mixed["inner"]
+                    or item["measure_contract"] != mixed["measure_contract"]
+                    or item["old_prefix"] != mixed["old_prefix"]
+                    or item["va"] != mixed["va"]
+                    or item["vb"] != mixed["vb"]
                 ):
                     return None, "flow_mixed_wrapper_inconsistent"
 
@@ -419,6 +595,7 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
             and mixed["source_blob"] in _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS
         )
         audit.flow_identity = flow_identity
+        audit.flow_model = model
         return audit, None
     except torch.cuda.OutOfMemoryError:
         raise
@@ -584,6 +761,10 @@ def instrument_actual_options(
     if not isinstance(bsa_replacements, tuple) or len(bsa_replacements) != audit.block_count:
         audit.failure = "flow_bsa_replacement_evidence_missing"
         return prepared
+    flow_model = getattr(audit, "flow_model", None)
+    if flow_model is None:
+        audit.failure = "flow_model_evidence_missing"
+        return prepared
 
     local_patches = dict(patches)
     local_dit = dict(dit)
@@ -601,6 +782,7 @@ def instrument_actual_options(
                 signature=dict(audit.flow_carrier_layout_identity).get("signature"),
                 segments=list(dict(audit.flow_carrier_layout_identity).get("segments", ())),
             ),
+            flow_model,
         )
         if (
             underlying is None
