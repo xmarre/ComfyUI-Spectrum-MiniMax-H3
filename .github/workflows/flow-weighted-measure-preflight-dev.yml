@@ -46,11 +46,10 @@ jobs:
 
           path = Path("tests/test_core_bsa_flow_compat.py")
           text = path.read_text(encoding="utf-8")
-          old = '''    model, _patch, _override, options = _installation(sigma=0.5)\n    monkeypatch.setattr(core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True)\n'''
-          new = '''    model, _patch, _override, options = _installation(sigma=0.5)\n    # Production core BSA registers its measure capability from install_override\n    # during patch/ON_PREPARE_STATE before Spectrum probes the model call.\n    _audited_nodes().install_override(_patch, options)\n    monkeypatch.setattr(core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True)\n'''
-          if text.count(old) != 2:
-              raise SystemExit(f"expected two sparse fixture anchors, found {text.count(old)}")
-          # Only the weighted-measure test requires the measure-capable lifecycle;\n          # preserve the existing unweighted fixture below it.
+          old = '''def test_weighted_mixed_grid_preflight_synthesizes_block_local_contracts_without_mutation(monkeypatch):\n    _attention, mixed_module = _flow_modules()\n    if not hasattr(mixed_module, "MIXED_GRID_MEASURE_PROFILE_WEIGHTED"):\n        pytest.skip("Flow fixture predates the explicit weighted measure profile")\n\n    model, _patch, _override, options = _installation(sigma=0.5)\n'''
+          new = '''def test_weighted_mixed_grid_preflight_synthesizes_block_local_contracts_without_mutation(monkeypatch):\n    _attention, mixed_module = _flow_modules()\n    if not hasattr(mixed_module, "MIXED_GRID_MEASURE_PROFILE_WEIGHTED"):\n        pytest.skip("Flow fixture predates the explicit weighted measure profile")\n\n    model, _patch, _override, options = _installation(sigma=0.5)\n    # Production core BSA registers its measure capability from install_override\n    # during patch/ON_PREPARE_STATE before Spectrum probes the model call.\n    _audited_nodes().install_override(_patch, options)\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"weighted preflight fixture anchor count: {text.count(old)}")
           path.write_text(text.replace(old, new, 1), encoding="utf-8")
           PY
 
