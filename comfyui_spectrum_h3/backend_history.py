@@ -93,7 +93,18 @@ def preflight(options, layout, model):
     return identity, safe
 
 
-def _debug_core_bsa_preflight(runtime, run_id, step_id, identity, safe, audit):
+def _debug_core_bsa_preflight(
+    runtime,
+    run_id,
+    step_id,
+    identity,
+    safe,
+    audit,
+    *,
+    options,
+    layout,
+    model,
+):
     if not runtime.config.debug:
         return
     if audit is not None:
@@ -116,18 +127,41 @@ def _debug_core_bsa_preflight(runtime, run_id, step_id, identity, safe, audit):
         and len(identity) >= 2
         and identity[0] == "core_bsa_unreported"
     ):
+        detail = None
+        if identity[1] == "ownership_unproven":
+            try:
+                from . import core_bsa_diagnostics
+
+                detail = core_bsa_diagnostics.ownership_diagnostic(
+                    options,
+                    layout,
+                    model,
+                )
+            except Exception as exc:  # noqa: BLE001 - debug detail cannot affect sampling
+                detail = f"diagnostic_failed:{type(exc).__name__}:{exc}"
         LOG.warning(
             "Spectrum H3 core-BSA preflight run_id=%s step=%s result=unreported "
-            "safe=False reason=%s",
+            "safe=False reason=%s detail=%s",
             run_id,
             step_id,
             identity[1],
+            detail,
         )
 
 
 def prepare(runtime, run_id, step_id, options, layout, model):
     identity, safe, audit = _preflight(options, layout, model)
-    _debug_core_bsa_preflight(runtime, run_id, step_id, identity, safe, audit)
+    _debug_core_bsa_preflight(
+        runtime,
+        run_id,
+        step_id,
+        identity,
+        safe,
+        audit,
+        options=options,
+        layout=layout,
+        model=model,
+    )
     if identity is None:
         if runtime._backend_history.policy is None:
             return options, None
