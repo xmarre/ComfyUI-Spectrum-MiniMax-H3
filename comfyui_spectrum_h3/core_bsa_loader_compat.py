@@ -61,6 +61,19 @@ def _comfy_extras_dir() -> Path | None:
     return extras
 
 
+def _reviewed_defaults(base: Any, owner: str, local_name: str) -> bool:
+    """Prove defaults that live outside a Python function's code object."""
+    defaults = getattr(base, "__defaults__", None)
+    kwdefaults = getattr(base, "__kwdefaults__", None)
+    if kwdefaults:
+        return False
+    if (owner, local_name) == ("make_attention_override", "override"):
+        return defaults == (None, None, False, False)
+    if (owner, local_name) == ("make_h3_block_patch", "block_patch"):
+        return defaults is None
+    return False
+
+
 def _runtime_module_from_callable(
     function: Any,
     owner: str,
@@ -113,7 +126,7 @@ def _runtime_module_from_callable(
         (owner, local_name),
     ):
         return None
-    if getattr(base, "__defaults__", None) is not None or getattr(base, "__kwdefaults__", None):
+    if not _reviewed_defaults(base, owner, local_name):
         return None
     return module, blob
 
