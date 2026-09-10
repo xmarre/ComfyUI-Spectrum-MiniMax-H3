@@ -77,7 +77,7 @@ jobs:
         with:
           persist-credentials: false
           repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
-          ref: d876590674b27c4410ef415ff605bc7d316dcdd8
+          ref: 860f308cc4f84f920d0c1facd4ece028584a02a0
           path: FlowRegenerate
 
       - name: Set up Python
