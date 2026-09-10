@@ -118,6 +118,7 @@ jobs:
           python -m ruff check \
             comfyui_spectrum_h3/backend_history.py \
             comfyui_spectrum_h3/core_bsa_compat.py \
+            comfyui_spectrum_h3/core_bsa_diagnostics.py \
             comfyui_spectrum_h3/core_bsa_flow_compat.py \
             comfyui_spectrum_h3/core_bsa_preprocess_compat.py \
             comfyui_spectrum_h3/source_code_audit.py \
