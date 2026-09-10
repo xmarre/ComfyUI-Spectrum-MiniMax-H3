@@ -6,6 +6,7 @@ production history carry.
 """
 from __future__ import annotations
 
+import pytest
 import torch
 
 from comfyui_spectrum_h3.config import SpectrumH3Config
@@ -270,7 +271,7 @@ def test_sampler_required_exact_stage_dominates_and_does_not_consume_entitlement
         forecastable_stage_indices=(),
         history_stage_indices=(0,),
     )
-    first, _, first_mode = _complete(runtime, 1.0)
+    _first, _, first_mode = _complete(runtime, 1.0)
     second, _, second_mode = _complete(runtime, 0.5)
     assert first_mode == second_mode == "actual"
     assert second["reason"] == "sampler-required exact stage"
@@ -324,7 +325,7 @@ def test_sa_pece_state_conditioned_topology_does_not_acquire_ordinary_bootstrap(
         max_consecutive_forecasts=1,
         model_aware_can_force_actual=False,
     )
-    first, _, first_mode = _complete(runtime, 1.0)
+    _first, _, first_mode = _complete(runtime, 1.0)
     predicted, _, predicted_mode = _complete(runtime, 0.5)
     corrected, _, corrected_mode = _complete(runtime, 0.5)
     assert first_mode == predicted_mode == corrected_mode == "actual"
@@ -348,10 +349,8 @@ def test_prefix_tail_disabled_degree_and_state_conditioned_restrictions():
     assert [_complete(disabled, s)[2] for s in (1.0, 0.5)] == ["actual", "actual"]
     disabled.end_run(disabled_id)
 
-    degree_two = _runtime(degree=2, tail_actual_steps=0)
-    degree_id = _start(degree_two, 3)
-    assert [_complete(degree_two, s)[2] for s in (1.0, 0.5)] == ["actual", "actual"]
-    degree_two.end_run(degree_id)
+    with pytest.raises(ValueError, match="bootstrap_first_forecast requires degree == 1"):
+        _runtime(degree=2, tail_actual_steps=0)
 
     state = _runtime(tail_actual_steps=0)
     state_id = _start(state, 3, state_conditioned_residual=True, min_actual_prefix_steps=1)
