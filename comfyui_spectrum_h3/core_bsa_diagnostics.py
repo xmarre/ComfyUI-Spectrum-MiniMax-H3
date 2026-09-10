@@ -1,11 +1,13 @@
 """Debug-only ownership diagnostics for the source-gated core BSA adapter.
 
-This module does not participate in acceptance.  It mirrors the strict ownership
+This module does not participate in acceptance. It mirrors the strict ownership
 checks closely enough to report which proof boundary rejected a real runtime
-stack.  All failures remain actual-only in the real adapter.
+stack. All failures remain actual-only in the real adapter.
 """
 from __future__ import annotations
 
+from pathlib import Path
+import sys
 from typing import Any
 
 from . import core_bsa_compat, core_bsa_flow_compat
@@ -18,6 +20,108 @@ def _callable_label(value: Any) -> str:
     module = getattr(base, "__module__", type(base).__module__)
     qualname = getattr(base, "__qualname__", type(base).__qualname__)
     return f"{module}.{qualname}"
+
+
+def _flow_layout_review_diagnostic(wrapper: Any, index: int) -> str:
+    """Mirror every reviewed Flow layout-wrapper gate and report the first miss."""
+    base = getattr(wrapper, "__func__", wrapper)
+    if getattr(base, "__qualname__", None) != core_bsa_flow_compat._LAYOUT_QUALNAME:
+        return f"layout:qualname={getattr(base, '__qualname__', None)!r}"
+
+    module_name = getattr(base, "__module__", None)
+    if not isinstance(module_name, str):
+        return f"layout:module_name_type={type(module_name).__name__}"
+    if (
+        module_name != core_bsa_flow_compat._FLOW_ATTENTION_TOPLEVEL
+        and not module_name.endswith(core_bsa_flow_compat._FLOW_ATTENTION_SUFFIX)
+    ):
+        return f"layout:module_name_unreviewed={module_name!r}"
+
+    module = sys.modules.get(module_name)
+    if module is None:
+        return f"layout:module_not_registered={module_name!r}"
+    source = getattr(module, "__file__", None)
+    code = getattr(base, "__code__", None)
+    if not isinstance(source, str) or code is None:
+        return (
+            "layout:source_or_code_missing "
+            f"source_type={type(source).__name__} code_type={type(code).__name__}"
+        )
+    try:
+        source_path = Path(source).resolve()
+        code_path = Path(code.co_filename).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        return f"layout:path_resolution={type(exc).__name__}:{exc}"
+    if source_path != code_path:
+        return f"layout:path_mismatch source={source_path} code={code_path}"
+    if source_path.name != "attention.py":
+        return f"layout:filename={source_path.name!r}"
+    if source_path.parent.name != "h3_flow_regenerate":
+        return f"layout:parent={source_path.parent.name!r}"
+
+    blob = core_bsa_compat._module_blob_sha(module)
+    if blob not in core_bsa_flow_compat.AUDITED_FLOW_ATTENTION_GIT_BLOBS:
+        return f"layout:source_blob_unreviewed={blob!r} path={source_path}"
+    if not core_bsa_flow_compat._source_matches(
+        base,
+        module,
+        ("make_layout_block_wrapper", "wrapper"),
+    ):
+        return f"layout:source_code_mismatch blob={blob} path={source_path}"
+    if getattr(base, "__defaults__", None) is not None:
+        return f"layout:defaults={getattr(base, '__defaults__', None)!r}"
+    if getattr(base, "__kwdefaults__", None):
+        return f"layout:kwdefaults={getattr(base, '__kwdefaults__', None)!r}"
+
+    closure = core_bsa_compat._closure_values(base)
+    if closure is None:
+        return "layout:closure_unreadable"
+    keys = frozenset(closure)
+    if keys != core_bsa_flow_compat._LAYOUT_CLOSURE_SCHEMA:
+        return f"layout:closure_schema={tuple(sorted(keys))!r}"
+    if type(closure["layer"]) is not int or closure["layer"] != index:
+        return f"layout:layer={closure['layer']!r} expected={index}"
+    if type(closure["record_layout"]) is not bool:
+        return f"layout:record_layout_type={type(closure['record_layout']).__name__}"
+
+    previous = closure["previous"]
+    marker = getattr(wrapper, "_h3_flow_layout_wrapper", None)
+    if marker is not True:
+        return f"layout:marker={marker!r}"
+    marker_previous = getattr(wrapper, "_h3_flow_previous", None)
+    if marker_previous is not previous:
+        return (
+            "layout:previous_marker_mismatch "
+            f"closure={_callable_label(previous)} marker={_callable_label(marker_previous)}"
+        )
+    scope = getattr(wrapper, "_h3_flow_layout_scope", None)
+    if scope not in {"layout", "attention"}:
+        return f"layout:scope={scope!r}"
+    metrics = closure["metrics"]
+    marker_metrics = getattr(wrapper, "_h3_flow_metrics", None)
+    if marker_metrics is not metrics:
+        return (
+            "layout:metrics_marker_mismatch "
+            f"closure_id={id(metrics)} marker_id={id(marker_metrics)}"
+        )
+    if not callable(getattr(metrics, "increment", None)):
+        return f"layout:metrics_increment={type(getattr(metrics, 'increment', None)).__name__}"
+    if not callable(getattr(metrics, "event", None)):
+        return f"layout:metrics_event={type(getattr(metrics, 'event', None)).__name__}"
+    return (
+        "layout:all_review_checks_passed "
+        f"blob={blob} scope={scope!r} module={module_name!r}"
+    )
+
+
+def _flow_wrapper_review_diagnostic(wrapper: Any, index: int) -> str:
+    base = getattr(wrapper, "__func__", wrapper)
+    qualname = getattr(base, "__qualname__", None)
+    if qualname == core_bsa_flow_compat._LAYOUT_QUALNAME:
+        return _flow_layout_review_diagnostic(wrapper, index)
+    if qualname == core_bsa_flow_compat._MIXED_QUALNAME:
+        return "mixed:review_failed_before_detailed_diagnostic"
+    return f"unknown:qualname={qualname!r}"
 
 
 def _effective_override(options: dict[str, Any]) -> tuple[Any, str]:
@@ -74,9 +178,10 @@ def ownership_diagnostic(
                     replacement, index, layout, model
                 )
                 if underlying is None:
+                    review = _flow_wrapper_review_diagnostic(replacement, index)
                     return (
                         f"block[{index}]:flow_unwrap={reason or 'unknown'} "
-                        f"outer={_callable_label(replacement)}"
+                        f"review={review} outer={_callable_label(replacement)}"
                     )
                 flow_wrapped += 1
                 if not identities:
