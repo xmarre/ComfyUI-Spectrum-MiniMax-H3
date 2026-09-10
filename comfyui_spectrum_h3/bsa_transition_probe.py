@@ -29,28 +29,46 @@ ENV = "SPECTRUM_H3_BSA_DIAGNOSTICS"
 
 
 def delta(reference, candidate):
-    """Chunked FP64 reductions; no full FP32 duplicate of the hidden tensor."""
+    """Chunked FP32 vector math with FP64 accumulation of chunk reductions."""
     if reference.shape != candidate.shape:
         raise ValueError("diagnostic tensor shapes differ")
     a, b = reference.detach().reshape(-1), candidate.detach().reshape(-1)
-    sums = torch.zeros(5, dtype=torch.float64, device=a.device)
-    maximum = torch.zeros((), dtype=torch.float64, device=a.device)
-    for start in range(0, a.numel(), 262144):
-        x = a[start:start + 262144].to(dtype=torch.float64)
-        y = b[start:start + 262144].to(device=a.device, dtype=torch.float64)
-        if not bool(torch.isfinite(x).all() & torch.isfinite(y).all()):
-            return {"finite": False, "elements": a.numel()}
-        diff = y - x
-        sums += torch.stack((diff.square().sum(), x.square().sum(),
-                             y.square().sum(), (x * y).sum(), diff.abs().sum()))
-        maximum = torch.maximum(maximum, diff.abs().max())
-    err, ref, cand, dot, abs_sum = sums.tolist()
     n = a.numel()
-    return {"finite": True, "elements": n, "rmse": (err / max(n, 1)) ** 0.5,
+    if n == 0:
+        return {"finite": True, "elements": 0, "rmse": 0.0, "relative_l2": None,
+                "reference_rms": 0.0, "mae": 0.0, "max_abs": 0.0, "cosine": None}
+    sums = torch.zeros(5, dtype=torch.float64, device=a.device)
+    maximum = torch.zeros((), dtype=torch.float32, device=a.device)
+    finite = torch.ones((), dtype=torch.bool, device=a.device)
+    for start in range(0, n, 262144):
+        x = a[start:start + 262144].to(dtype=torch.float32)
+        y = b[start:start + 262144].to(device=a.device, dtype=torch.float32)
+        finite &= torch.isfinite(x).all() & torch.isfinite(y).all()
+        diff = y - x
+        chunk = torch.stack((diff.square().sum(), x.square().sum(),
+                             y.square().sum(), (x * y).sum(), diff.abs().sum()))
+        sums += chunk.to(dtype=torch.float64)
+        maximum = torch.maximum(maximum, diff.abs().max())
+    if not bool(finite.item()):
+        return {"finite": False, "elements": n}
+    err, ref, cand, dot, abs_sum = sums.tolist()
+    return {"finite": True, "elements": n, "rmse": (err / n) ** 0.5,
             "relative_l2": (err / ref) ** 0.5 if ref else None,
-            "reference_rms": (ref / max(n, 1)) ** 0.5,
-            "mae": abs_sum / max(n, 1), "max_abs": maximum.item(),
+            "reference_rms": (ref / n) ** 0.5,
+            "mae": abs_sum / n, "max_abs": maximum.item(),
             "cosine": dot / (ref * cand) ** 0.5 if ref and cand else None}
+
+
+def _tensor_state(tensor):
+    value = tensor.detach().to(dtype=torch.float32)
+    stats = torch.stack((value.min(), value.max(), value.mean(), value.square().mean().sqrt()))
+    minimum, maximum, mean, rms = stats.tolist()
+    return {"shape": list(value.shape), "dtype": str(tensor.dtype),
+            "min": minimum, "max": maximum, "mean": mean, "rms": rms}
+
+
+def _calibration_state(values):
+    return {"kmean": _tensor_state(values[0]), "vscale": _tensor_state(values[1])}
 
 
 class PoolSnapshot:
@@ -90,20 +108,64 @@ class PoolSnapshot:
                     raise RuntimeError("BSA diagnostic failed to restore pool contents")
 
 
+class IsolationStatus:
+    def __init__(self):
+        self.pool_restored = False
+        self.rng_restored = False
+
+
 @contextmanager
 def isolated_pool(patch, device):
-    """Restore after success, Python exceptions and OOM; never swallow failures."""
+    """Restore after success, Python exceptions and OOM without masking the primary failure."""
     saved = PoolSnapshot(patch)
+    status = IsolationStatus()
     python_rng = random.getstate()
-    devices = [device.index if device.index is not None else torch.cuda.current_device()] \
-        if device.type == "cuda" else []
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_device = None
+    cuda_rng = None
+    if device.type == "cuda":
+        cuda_device = device.index if device.index is not None else torch.cuda.current_device()
+        cuda_rng = torch.cuda.get_rng_state(cuda_device).clone()
+    devices = [] if cuda_device is None else [cuda_device]
+    primary = None
     try:
         with torch.random.fork_rng(devices=devices):
-            yield
+            yield status
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        random.setstate(python_rng)
-        saved.restore()
-        saved.verify()
+        restoration_errors = []
+        try:
+            random.setstate(python_rng)
+        except BaseException as exc:  # pragma: no cover - stdlib state restore is deterministic
+            restoration_errors.append(f"Python RNG restore failed: {exc}")
+        try:
+            saved.restore()
+            saved.verify()
+            status.pool_restored = True
+        except BaseException as exc:
+            restoration_errors.append(f"pool restore failed: {exc}")
+        try:
+            cpu_ok = torch.equal(torch.get_rng_state(), cpu_rng)
+            cuda_ok = True if cuda_rng is None else torch.equal(
+                torch.cuda.get_rng_state(cuda_device), cuda_rng
+            )
+            python_ok = random.getstate() == python_rng
+            status.rng_restored = bool(cpu_ok and cuda_ok and python_ok)
+            if not status.rng_restored:
+                restoration_errors.append("RNG state did not restore exactly")
+        except BaseException as exc:
+            restoration_errors.append(f"RNG verification failed: {exc}")
+        if restoration_errors:
+            message = "BSA diagnostic restoration failure: " + "; ".join(restoration_errors)
+            if primary is not None:
+                try:
+                    primary.add_note(message)
+                except AttributeError:  # pragma: no cover - Python 3.11+ has add_note
+                    pass
+            else:
+                raise RuntimeError(message)
 
 
 def _semantic_identity(value):
@@ -135,7 +197,7 @@ class Probe:
         self.started_attention_calls = 0
         self.errors = 0
         self.calls = 0
-        self.write("start", schema_version=1, torch_version=torch.__version__,
+        self.write("start", schema_version=2, torch_version=torch.__version__,
                    scope="matched-input sparse attention; full target-hidden one-point hold",
                    diagnostic_transformer_nfe=0, max_attention_calls_per_run=6,
                    production_policy="unchanged", source_revision=_revision())
@@ -231,34 +293,74 @@ class Actual:
                 self.stale[index] = (entry, old)
                 replacement = None
                 label = "cold_vs_primed"
+                alternative_mode = "cold_current_input_two_pass"
             else:
                 stored = self.probe.pending["stale"].get(index)
                 if stored is None or any(a is not b for a, b in zip(stored[0], entry)):
                     raise RuntimeError("BSA diagnostic pool ownership changed before next actual")
                 replacement = stored[1]
                 label = "skipped_refresh_next_actual"
+                alternative_mode = "primed_with_stale_pre_skipped_step_calibration"
             self.probe.started_attention_calls += 1
             if self.probe.started_attention_calls > 6:
                 raise RuntimeError("BSA diagnostic attention-call budget exceeded")
-            self.probe.write("attention_begin", step=self.step_id, block=index, measurement=label)
-            with isolated_pool(patch, h.device):
+            self.probe.write("attention_begin", step=self.step_id, block=index, measurement=label,
+                             route=self.routes[index])
+            actual_nfe_before = self.runtime.stats.actual_transformer_calls
+            forecast_calls_before = self.runtime.stats.forecast_model_calls
+            with isolated_pool(patch, h.device) as isolation:
                 if replacement is None:
                     del patch.pooled[key]
                 else:
                     for tensor, saved in zip(patch.pooled[key], replacement):
                         tensor.copy_(saved)
                 alternative = function(h, *args, **kwargs)
-                measurement = delta(actual, alternative)
+            if (self.runtime.stats.actual_transformer_calls != actual_nfe_before
+                    or self.runtime.stats.forecast_model_calls != forecast_calls_before):
+                raise RuntimeError("BSA diagnostic attention repeat changed transformer/forecast counters")
+            measurement = delta(actual, alternative)
             self.probe.extra_attention_calls += 1
-            self.measurements.append({"measurement": label, "block": index,
-                                      "scope": "attention_output_projection_at_fixed_actual_block_input",
-                                      "error": measurement, "pool_restored": True,
-                                      "kmean_change": delta(old[0], fresh[0]),
-                                      "vscale_change": delta(old[1], fresh[1]),
-                                      "vscale_range_growth_max": (fresh[1] / old[1].clamp_min(1e-8)).max().item(),
-                                      "alternative_scale_headroom_exceeded_channels": (
-                                          int((fresh[1] / replacement[1].clamp_min(1e-8) > 1.1).sum())
-                                          if replacement is not None else None)})
+            growth = fresh[1] / old[1].clamp_min(1e-8)
+            stale_growth = None if replacement is None else (
+                fresh[1] / replacement[1].clamp_min(1e-8)
+            )
+            headroom_count = None if stale_growth is None else int((stale_growth > 1.1).sum().item())
+            self.measurements.append({
+                "measurement": label,
+                "block": index,
+                "route": self.routes[index],
+                "scope": "attention_output_projection_at_fixed_actual_block_input",
+                "error": measurement,
+                "control_output_source": "unmodified_primary_attention_call",
+                "alternative_output_discarded": True,
+                "alternative_calibration_mode": alternative_mode,
+                "control_pool_entry_identity": id(entry),
+                "control_kmean_tensor_identity": id(entry[0]),
+                "control_vscale_tensor_identity": id(entry[1]),
+                "control_supplied_calibration": _calibration_state(old),
+                "alternative_supplied_calibration": (
+                    None if replacement is None else _calibration_state(replacement)
+                ),
+                "next_calibration": _calibration_state(fresh),
+                "pool_restored": isolation.pool_restored,
+                "rng_restored": isolation.rng_restored,
+                "diagnostic_transformer_nfe_delta": (
+                    self.runtime.stats.actual_transformer_calls - actual_nfe_before
+                ),
+                "diagnostic_forecast_counter_delta": (
+                    self.runtime.stats.forecast_model_calls - forecast_calls_before
+                ),
+                "kmean_change": delta(old[0], fresh[0]),
+                "vscale_change": delta(old[1], fresh[1]),
+                "vscale_range_growth_max": growth.max().item(),
+                "alternative_scale_headroom_exceeded_channels": headroom_count,
+                "alternative_scale_channels": (
+                    None if stale_growth is None else stale_growth.numel()
+                ),
+                "alternative_scale_growth_max": (
+                    None if stale_growth is None else stale_growth.max().item()
+                ),
+            })
             return actual
         return measured
 
@@ -275,7 +377,9 @@ class Actual:
                 receipts_expected=self.audit.block_count,
                 seq_len=self.audit.seq_len, flow_mixed=bool(getattr(self.audit, "flow_mixed", False)),
                 identity=_identity_digest(self.identity), candidate=self.candidate,
-                next_actual=self.next_actual, measurements=self.measurements)
+                next_actual=self.next_actual, core_bsa_source_blob=self.audit.source_blob,
+                patch_generation=self.audit.patch_generation,
+                routes=list(self.routes), measurements=self.measurements)
         if not accepted:
             raise RuntimeError("BSA diagnostic actual audit rejected; report is incomplete")
         if self.candidate:
@@ -296,7 +400,9 @@ class Actual:
                     degree=self.runtime.config.degree,
                     continuum_prefix=run.min_actual_prefix_steps,
                     state_conditioned_residual=bool(run.state_conditioned_residual),
-                    policy_step=self.runtime._step.policy_step_id)
+                    policy_step=self.runtime._step.policy_step_id,
+                    candidate_backend_transition="h3_chunked_sparse_cold->h3_chunked_sparse_primed",
+                    diagnostic_transformer_nfe=0)
             p.pending = {"identity": self.identity, "step": self.step_id, "stale": self.stale}
             p.examined = True
             p.anchor = None
