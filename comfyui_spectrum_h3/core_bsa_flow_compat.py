@@ -25,14 +25,19 @@ AUDITED_FLOW_MIXED_GRID_GIT_BLOBS = frozenset(
     {
         "8fc0f753ff2cd21fae898a4dd3c9ab1025f98443",  # released v0.3.3
         "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",  # PR #26 canonical layout propagation
-        "51b5bb068018f3336d1a036bd0065344788c3e6c",  # PR #30 explicit weighted measure profile
+        "51b5bb068018f3336d1a036bd0065344788c3e6c",  # PR #30 first explicit weighted profile
+        "41586100e74e43e2efbfc3ef30a9540647f1c8f6",  # PR #30 authoritative optional profile semantics
     }
 )
 _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS = frozenset(
     {
         "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",
         "51b5bb068018f3336d1a036bd0065344788c3e6c",
+        "41586100e74e43e2efbfc3ef30a9540647f1c8f6",
     }
+)
+_FLOW_EXPLICIT_PROFILE_AUTHORITATIVE_BLOBS = frozenset(
+    {"41586100e74e43e2efbfc3ef30a9540647f1c8f6"}
 )
 _FLOW_MEASURE_PROFILE_OFF = "off"
 _FLOW_MEASURE_PROFILE_LEGACY = "legacy_representative_v1"
@@ -166,8 +171,31 @@ def _audited_layout_wrapper(
     )
 
 
-def _normalize_measure_profile(attention_measure: bool, raw_profile: Any) -> str | None:
-    if type(attention_measure) is not bool or type(raw_profile) is not str:
+def _normalize_measure_profile(
+    attention_measure: bool, raw_profile: Any, *, source_blob: str
+) -> str | None:
+    if type(attention_measure) is not bool:
+        return None
+    if source_blob not in AUDITED_FLOW_MIXED_GRID_GIT_BLOBS:
+        return None
+    if source_blob in _FLOW_EXPLICIT_PROFILE_AUTHORITATIVE_BLOBS:
+        if raw_profile is None:
+            return (
+                _FLOW_MEASURE_PROFILE_LEGACY
+                if attention_measure
+                else _FLOW_MEASURE_PROFILE_OFF
+            )
+        if type(raw_profile) is not str:
+            return None
+        if raw_profile not in {
+            _FLOW_MEASURE_PROFILE_OFF,
+            _FLOW_MEASURE_PROFILE_LEGACY,
+            _FLOW_MEASURE_PROFILE_WEIGHTED,
+        }:
+            return None
+        return raw_profile
+
+    if type(raw_profile) is not str:
         return None
     if raw_profile == _FLOW_MEASURE_PROFILE_OFF and attention_measure:
         return _FLOW_MEASURE_PROFILE_LEGACY
@@ -182,7 +210,7 @@ def _normalize_measure_profile(attention_measure: bool, raw_profile: Any) -> str
     return raw_profile
 
 
-def _plan_geometry(plan: Any) -> dict[str, Any] | None:
+def _plan_geometry(plan: Any, *, source_blob: str) -> dict[str, Any] | None:
     try:
         prefix = plan.prefix
         prefix_noise = plan.prefix_noise
@@ -190,7 +218,13 @@ def _plan_geometry(plan: Any) -> dict[str, Any] | None:
         source_h = plan.source_h
         source_w = plan.source_w
         attention_measure = plan.attention_measure
-        raw_measure_profile = getattr(plan, "measure_profile", _FLOW_MEASURE_PROFILE_OFF)
+        raw_measure_profile = getattr(
+            plan,
+            "measure_profile",
+            None
+            if source_blob in _FLOW_EXPLICIT_PROFILE_AUTHORITATIVE_BLOBS
+            else _FLOW_MEASURE_PROFILE_OFF,
+        )
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
     if not torch.is_tensor(prefix) or prefix.ndim != 5:
@@ -204,7 +238,9 @@ def _plan_geometry(plan: Any) -> dict[str, Any] | None:
         or type(attention_measure) is not bool
     ):
         return None
-    measure_profile = _normalize_measure_profile(attention_measure, raw_measure_profile)
+    measure_profile = _normalize_measure_profile(
+        attention_measure, raw_measure_profile, source_blob=source_blob
+    )
     if measure_profile is None:
         return None
     prefix_t = int(prefix.shape[2])
@@ -367,7 +403,7 @@ def _audited_mixed_wrapper(
     closed_carrier = closure["layout"]
     if type(plan) is not getattr(module, "MixedGridPlan", object):
         return None
-    geometry = _plan_geometry(plan)
+    geometry = _plan_geometry(plan, source_blob=blob)
     if geometry is None:
         return None
     normalized_carrier = core_bsa_compat._normalize_layout(carrier_layout)

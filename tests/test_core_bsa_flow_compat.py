@@ -595,3 +595,105 @@ def test_untwist_plus_flow_wrapper_reaches_core_bsa_audit():
     assert reason is None and audit is not None and audit.safe
     assert audit.current_override is outer
     assert hasattr(audit, "flow_wrapper_specs")
+
+
+
+def test_measure_profile_semantics_follow_reviewed_flow_source_revision():
+    old_blob = "51b5bb068018f3336d1a036bd0065344788c3e6c"
+    new_blob = "41586100e74e43e2efbfc3ef30a9540647f1c8f6"
+
+    assert core_bsa_flow_compat._normalize_measure_profile(
+        True,
+        core_bsa_flow_compat._FLOW_MEASURE_PROFILE_OFF,
+        source_blob=old_blob,
+    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_LEGACY
+    assert (
+        core_bsa_flow_compat._normalize_measure_profile(
+            False,
+            core_bsa_flow_compat._FLOW_MEASURE_PROFILE_LEGACY,
+            source_blob=old_blob,
+        )
+        is None
+    )
+
+    assert core_bsa_flow_compat._normalize_measure_profile(
+        True, None, source_blob=new_blob
+    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_LEGACY
+    assert core_bsa_flow_compat._normalize_measure_profile(
+        False, None, source_blob=new_blob
+    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_OFF
+    assert core_bsa_flow_compat._normalize_measure_profile(
+        True,
+        core_bsa_flow_compat._FLOW_MEASURE_PROFILE_OFF,
+        source_blob=new_blob,
+    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_OFF
+    assert core_bsa_flow_compat._normalize_measure_profile(
+        False,
+        core_bsa_flow_compat._FLOW_MEASURE_PROFILE_LEGACY,
+        source_blob=new_blob,
+    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_LEGACY
+    assert core_bsa_flow_compat._normalize_measure_profile(
+        False,
+        core_bsa_flow_compat._FLOW_MEASURE_PROFILE_WEIGHTED,
+        source_blob=new_blob,
+    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_WEIGHTED
+
+
+def test_explicit_off_profile_is_authoritative_over_legacy_flag(monkeypatch):
+    _attention, mixed_module = _flow_modules()
+    if (
+        core_bsa_compat._module_blob_sha(mixed_module)
+        not in core_bsa_flow_compat._FLOW_EXPLICIT_PROFILE_AUTHORITATIVE_BLOBS
+    ):
+        pytest.skip("Flow fixture predates authoritative optional profile semantics")
+
+    model, _patch, _override, options = _installation(sigma=0.5)
+    monkeypatch.setattr(
+        core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True
+    )
+    options, carrier, _mixed = _wrap_mixed(
+        options,
+        model,
+        attention_measure=True,
+        measure_profile=mixed_module.MIXED_GRID_MEASURE_PROFILE_OFF,
+    )
+    audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
+    assert reason is None and audit is not None and audit.safe
+    assert audit.measure is None
+    plan = core_bsa_compat._closure_values(
+        options["patches_replace"]["dit"][("double_block", 0)]
+    )["plan"]
+    assert (
+        mixed_module.mixed_attention_measure_profile(plan)
+        == mixed_module.MIXED_GRID_MEASURE_PROFILE_OFF
+    )
+
+
+def test_explicit_legacy_profile_is_authoritative_without_legacy_flag(monkeypatch):
+    _attention, mixed_module = _flow_modules()
+    if (
+        core_bsa_compat._module_blob_sha(mixed_module)
+        not in core_bsa_flow_compat._FLOW_EXPLICIT_PROFILE_AUTHORITATIVE_BLOBS
+    ):
+        pytest.skip("Flow fixture predates authoritative optional profile semantics")
+
+    model, _patch, _override, options = _installation(sigma=0.5)
+    monkeypatch.setattr(
+        core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True
+    )
+    options, carrier, _mixed = _wrap_mixed(
+        options,
+        model,
+        attention_measure=False,
+        measure_profile=mixed_module.MIXED_GRID_MEASURE_PROFILE_LEGACY,
+    )
+    audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
+    assert reason is None and audit is not None and audit.safe
+    assert audit.measure is None
+    plan = core_bsa_compat._closure_values(
+        options["patches_replace"]["dit"][("double_block", 0)]
+    )["plan"]
+    assert (
+        mixed_module.mixed_attention_measure_profile(plan)
+        == mixed_module.MIXED_GRID_MEASURE_PROFILE_LEGACY
+    )
