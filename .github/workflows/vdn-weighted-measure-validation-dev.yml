@@ -57,6 +57,34 @@ jobs:
             "av>=17.0.0" requests simpleeval blake3 kornia spandrel pydantic pydantic-settings \
             PyOpenGL comfy-angle "comfy-kitchen==0.2.33" "comfy-aimdo==0.5.3"
 
+      - name: Apply reviewed VDN audit corrections
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("comfyui_spectrum_h3/vdn_measure_compat.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''def runtime_matches(audit: VDNMeasureAudit, index: int) -> bool:\n    if type(index) is not int or index < 0 or index >= len(audit.attentions):\n        return False\n    try:\n        forward = audit.attentions[index].forward\n    except Exception:  # noqa: BLE001\n        return False\n    if forward is not audit.forwards[index]:\n        return False\n    if not audit.active:\n        return getattr(forward, VDN_FORWARD_MARKER, False) is not True\n'''
+          new = '''def _same_forward_owner(current: Any, expected: Any) -> bool:\n    \"\"\"Compare a callable and its bound owner without relying on bound-method identity.\"\"\"\n    current_func = getattr(current, \"__func__\", None)\n    expected_func = getattr(expected, \"__func__\", None)\n    if current_func is not None or expected_func is not None:\n        return (\n            current_func is expected_func\n            and getattr(current, \"__self__\", None) is getattr(expected, \"__self__\", None)\n        )\n    return current is expected\n\n\ndef runtime_matches(audit: VDNMeasureAudit, index: int) -> bool:\n    if type(index) is not int or index < 0 or index >= len(audit.attentions):\n        return False\n    try:\n        forward = audit.attentions[index].forward\n    except Exception:  # noqa: BLE001\n        return False\n    if not _same_forward_owner(forward, audit.forwards[index]):\n        return False\n    if not audit.active:\n        return getattr(forward, VDN_FORWARD_MARKER, False) is not True\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"runtime identity anchor count: {text.count(old)}")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          path = Path("tests/test_core_bsa_vdn_measure_compat.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''        self.qkv_proj = SimpleNamespace(\n            weight=torch.empty(1, dtype=torch.bfloat16, device=\"cpu\")\n        )\n        self.out_proj = torch.nn.Identity()\n'''
+          new = '''        self.qkv_proj = SimpleNamespace(\n            weight=torch.empty(1, dtype=torch.bfloat16, device=\"cpu\")\n        )\n        norm_weight = torch.ones(128, dtype=torch.bfloat16, device=\"cpu\")\n        self.q_norm = SimpleNamespace(weight=norm_weight, eps=1e-6)\n        self.k_norm = SimpleNamespace(weight=norm_weight.clone(), eps=1e-6)\n        self.out_proj = torch.nn.Identity()\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"VDN attention fixture anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          anchor = '''def test_api2_mixed_geometry_without_vdn_remains_forecast_safe(monkeypatch):\n    model, _state, _patch, options = _install(monkeypatch, with_vdn=False)\n    audit, reason = core_bsa_compat.probe(options, _layout(), model)\n\n    assert reason is None\n    assert audit is not None and audit.safe and audit.measure is not None\n    assert audit.measure.vdn.active is False\n    assert vdn_measure_compat.identity(audit.measure.vdn) == (\"absent\",)\n    assert all(\n        vdn_measure_compat.VDN_EPILOGUE_KEY not in receipt[8]\n        for receipt in audit.expected_receipts\n    )\n\n    prepared = core_bsa_compat.instrument_actual_options(\n        {**options, \"attention_backend_receipts_v1\": []},\n        audit,\n        \"attention_backend_receipts_v1\",\n    )\n    assert vdn_measure_compat.VDN_EPILOGUE_RECEIPTS_KEY not in prepared\n\n\n'''
+          addition = anchor + '''def test_absent_vdn_bound_forward_identity_is_stable_and_owner_sensitive(monkeypatch):\n    model, _state, _patch, options = _install(monkeypatch, count=1, with_vdn=False)\n    audit, reason = core_bsa_compat.probe(options, _layout(), model)\n    assert reason is None and audit is not None and audit.measure is not None\n    vdn = audit.measure.vdn\n\n    # Re-reading a normal Python bound method creates a fresh bound-method object;\n    # that must not look like an attention-owner change.\n    assert vdn_measure_compat.runtime_matches(vdn, 0)\n\n    # Rebinding the same class function to another attention instance is a real\n    # owner change and must still invalidate the preflight.\n    other = _Attention()\n    model.blocks[0].attn.forward = other.forward\n    assert not vdn_measure_compat.runtime_matches(vdn, 0)\n\n\n'''
+          if text.count(anchor) != 1:
+              raise SystemExit(f"absent-VDN regression anchor count: {text.count(anchor)}")
+          path.write_text(text.replace(anchor, addition, 1), encoding="utf-8")
+          PY
+
       - name: Apply deterministic Ruff fixes
         run: |
           python -m ruff check \
@@ -66,7 +94,7 @@ jobs:
             tests/test_core_bsa_vdn_measure_compat.py \
             --fix --ignore N999,I001,C408,UP035
 
-      - name: Checkpoint auto-fixes on isolated CI branch
+      - name: Checkpoint corrections on isolated CI branch
         run: |
           if ! git diff --quiet -- \
             comfyui_spectrum_h3/core_bsa_compat.py \
@@ -80,7 +108,7 @@ jobs:
               comfyui_spectrum_h3/core_bsa_flow_compat.py \
               comfyui_spectrum_h3/vdn_measure_compat.py \
               tests/test_core_bsa_vdn_measure_compat.py
-            git commit -m "Apply weighted measure lint fixes"
+            git commit -m "Fix VDN audit callable identity and fixture"
             git push origin HEAD:ci/vdn-weighted-measure-20260911
           fi
 
