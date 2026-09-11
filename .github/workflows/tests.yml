@@ -41,11 +41,13 @@ jobs:
             comfy_kitchen_version: "0.2.33"
             comfy_aimdo_version: "0.5.3"
             fixture_required: true
-          - comfy_ref: efd54b9a17ce422a2cdbed76d5e7a87671f253c2
+          - comfy_ref: c00cd0acab821cd3f4479f02421c3c11331561f7
             comfy_repository: xmarre/ComfyUI
             python_version: "3.12"
             comfy_kitchen_version: "0.2.33"
             comfy_aimdo_version: "0.5.3"
+            flow_ref: c86d74bcf139563b14257720259e4788e386aa5c
+            vdn_ref: 6e0f1e22058ad0cd1c0ad02e2e34f742d99a0ef3
             measure_fixture_required: true
     runs-on: ubuntu-latest
     steps:
@@ -83,8 +85,17 @@ jobs:
         with:
           persist-credentials: false
           repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
-          ref: 860f308cc4f84f920d0c1facd4ece028584a02a0
+          ref: ${{ matrix.flow_ref || '860f308cc4f84f920d0c1facd4ece028584a02a0' }}
           path: FlowRegenerate
+
+      - name: Check out reviewed VDN measure interop
+        if: ${{ matrix.vdn_ref != '' }}
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/ComfyUI-VDN-H3-Plus
+          ref: ${{ matrix.vdn_ref }}
+          path: VDNH3Plus
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -131,6 +142,7 @@ jobs:
             comfyui_spectrum_h3/core_bsa_flow_compat.py \
             comfyui_spectrum_h3/core_bsa_forecast_recovery.py \
             comfyui_spectrum_h3/core_bsa_preprocess_compat.py \
+            comfyui_spectrum_h3/vdn_measure_compat.py \
             comfyui_spectrum_h3/source_code_audit.py \
             comfyui_spectrum_h3/comfy_compiler_compat.py \
             comfyui_spectrum_h3/config.py \
@@ -167,6 +179,7 @@ jobs:
             tests/test_core_bsa_measure_history.py \
             tests/test_core_bsa_preprocess_compat.py \
             tests/test_core_bsa_source_hardening.py \
+            tests/test_core_bsa_vdn_measure_compat.py \
             tests/test_reviewed_bsa_fixture_gate.py \
             tests/test_scheduler_bootstrap_entitlement.py \
             tests/test_comfy_compiler_compat.py \
@@ -204,7 +217,7 @@ jobs:
       - name: Run focused external compatibility suites
         env:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
-          PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE:${{ github.workspace }}/FlowRegenerate
+          PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE:${{ github.workspace }}/FlowRegenerate:${{ github.workspace }}/VDNH3Plus
         run: |
           python -m pytest -q \
             tests/test_external_patch_compat.py \
@@ -224,7 +237,7 @@ jobs:
       - name: Run tests against native MiniMax H3
         env:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
-          PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE:${{ github.workspace }}/FlowRegenerate
+          PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE:${{ github.workspace }}/FlowRegenerate:${{ github.workspace }}/VDNH3Plus
           SPECTRUM_REQUIRE_REVIEWED_BSA_FIXTURE: ${{ matrix.fixture_required && '1' || '0' }}
           SPECTRUM_REQUIRE_REVIEWED_BSA_MEASURE_FIXTURE: ${{ matrix.measure_fixture_required && '1' || '0' }}
         run: |
