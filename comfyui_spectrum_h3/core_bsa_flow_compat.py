@@ -422,7 +422,7 @@ def _audited_mixed_wrapper(
         return None
     metrics = closure["metrics"]
     if not callable(getattr(metrics, "increment", None)) or not callable(
-        getattr(metrics, "event", None)
+        getattr(metrics, "event", None
     ):
         return None
     plan_generation = core_bsa_compat._lifetime_generation(plan)
@@ -778,6 +778,7 @@ def _make_actual_wrapper(
     )
 
     def audited_replacement(args, replacement_context):
+        vdn_before = core_bsa_compat._vdn_receipt_before(audit)
         try:
             metadata_ok = _current_metadata_matches(audit, index, args)
             before = _pool_entry(audit, index)
@@ -828,15 +829,23 @@ def _make_actual_wrapper(
                 after,
                 sparse_selected=sparse_selected,
             )
+            vdn_ok, vdn_fields = core_bsa_compat._vdn_receipt_after(
+                audit, index, observed, vdn_before
+            )
             expected_route, _expected_sink, _expected_sink_q = audit.route_specs[index]
-            if not metadata_ok or observed != expected_route:
-                audit.failure = "actual_route_mismatch"
+            if not vdn_ok:
+                audit.failure = "actual_vdn_epilogue_receipt_failed"
+            if not metadata_ok or observed != expected_route or not vdn_ok:
+                audit.failure = audit.failure or "actual_route_mismatch"
             receipts.append(
                 core_bsa_compat._receipt(
                     audit,
                     index,
                     observed,
-                    completed=bool(metadata_ok and observed == expected_route),
+                    completed=bool(
+                        metadata_ok and observed == expected_route and vdn_ok
+                    ),
+                    vdn_fields=vdn_fields,
                 )
             )
         except torch.cuda.OutOfMemoryError:
@@ -855,7 +864,9 @@ def instrument_actual_options(
 ) -> dict[str, Any]:
     if not hasattr(audit, "flow_wrapper_specs"):
         return core_bsa_compat.instrument_actual_options(options, audit, receipts_key)
-    prepared = dict(options)
+    prepared = core_bsa_compat._prepare_vdn_receipt_sink(dict(options), audit)
+    if audit.failure is not None:
+        return prepared
     receipts = prepared.get(receipts_key)
     patches = prepared.get("patches_replace")
     if not isinstance(receipts, list) or not isinstance(patches, dict):
