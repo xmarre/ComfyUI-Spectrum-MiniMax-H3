@@ -6,7 +6,7 @@ on:
       - ci/vdn-weighted-measure-20260911
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   targeted-cross-stack:
@@ -15,7 +15,7 @@ jobs:
       - name: Check out Spectrum candidate
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Check out optional-VDN-correct ComfyUI candidate
         uses: actions/checkout@v4
@@ -56,6 +56,33 @@ jobs:
             transformers tokenizers sentencepiece aiohttp yarl alembic SQLAlchemy filelock \
             "av>=17.0.0" requests simpleeval blake3 kornia spandrel pydantic pydantic-settings \
             PyOpenGL comfy-angle "comfy-kitchen==0.2.33" "comfy-aimdo==0.5.3"
+
+      - name: Apply deterministic Ruff fixes
+        run: |
+          python -m ruff check \
+            comfyui_spectrum_h3/core_bsa_compat.py \
+            comfyui_spectrum_h3/core_bsa_flow_compat.py \
+            comfyui_spectrum_h3/vdn_measure_compat.py \
+            tests/test_core_bsa_vdn_measure_compat.py \
+            --fix --ignore N999,I001,C408,UP035
+
+      - name: Checkpoint auto-fixes on isolated CI branch
+        run: |
+          if ! git diff --quiet -- \
+            comfyui_spectrum_h3/core_bsa_compat.py \
+            comfyui_spectrum_h3/core_bsa_flow_compat.py \
+            comfyui_spectrum_h3/vdn_measure_compat.py \
+            tests/test_core_bsa_vdn_measure_compat.py; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add \
+              comfyui_spectrum_h3/core_bsa_compat.py \
+              comfyui_spectrum_h3/core_bsa_flow_compat.py \
+              comfyui_spectrum_h3/vdn_measure_compat.py \
+              tests/test_core_bsa_vdn_measure_compat.py
+            git commit -m "Apply weighted measure lint fixes"
+            git push origin HEAD:ci/vdn-weighted-measure-20260911
+          fi
 
       - name: Static validation
         run: |
