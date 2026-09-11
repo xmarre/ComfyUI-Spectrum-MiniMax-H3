@@ -189,24 +189,30 @@ def _rebind(wrapper, **changes):
     )
 
 
-def _mixed_shared(model, mixed):
+def _mixed_shared(model, mixed, *, attention_measure=False, measure_profile=None):
     _attention, mixed_module = _flow_modules()
     from h3_flow_regenerate.metrics import H3FlowMetrics
     import comfy.ldm.minimax.model as native
 
+    plan_kwargs = {"attention_measure": attention_measure}
+    if measure_profile is not None:
+        plan_kwargs["measure_profile"] = measure_profile
     plan = mixed_module.MixedGridPlan(
         prefix=torch.zeros(1, 24, 1, 8, 8),
         temporal=8,
         source_h=4,
         source_w=4,
         prefix_noise=torch.zeros(1, 24, 1, 8, 8),
-        attention_measure=False,
+        **plan_kwargs,
+    )
+    measure_contract = mixed_module.mixed_attention_measure_contract(
+        plan, video_start=96, sequence_rows=140
     )
     return {
         "cached": {},
         "inner": model,
         "layout": _layout(),
-        "measure_contract": None,
+        "measure_contract": measure_contract,
         "metrics": H3FlowMetrics(),
         "mixed_layout": mixed,
         "native": native,
@@ -234,10 +240,17 @@ def _mixed_wrapper(previous, index, carrier, mixed, model, shared):
     return wrapper
 
 
-def _wrap_mixed(options, model, *, include_all=True):
+def _wrap_mixed(
+    options, model, *, include_all=True, attention_measure=False, measure_profile=None
+):
     carrier = _layout()
     mixed = _mixed_layout()
-    shared = _mixed_shared(model, mixed)
+    shared = _mixed_shared(
+        model,
+        mixed,
+        attention_measure=attention_measure,
+        measure_profile=measure_profile,
+    )
     out = dict(options)
     patches = dict(options["patches_replace"])
     dit = dict(patches["dit"])
@@ -289,6 +302,133 @@ def test_unknown_outer_block_wrapper_stays_fail_closed():
     audit, reason = core_bsa_flow_compat.probe(options, _layout(), model)
     assert audit is None
     assert reason == "flow_wrapper_unreviewed"
+
+
+def test_weighted_mixed_grid_preflight_synthesizes_block_local_contracts_without_mutation(monkeypatch):
+    _attention, mixed_module = _flow_modules()
+    if not hasattr(mixed_module, "MIXED_GRID_MEASURE_PROFILE_WEIGHTED"):
+        pytest.skip("Flow fixture predates the explicit weighted measure profile")
+
+    model, _patch, _override, options = _installation(sigma=0.5)
+    nodes = _audited_nodes()
+    # Match the production lifecycle: patch/ON_PREPARE_STATE registers the
+    # owner-bound measure capability before Spectrum probes the model call.
+    nodes.install_override(_patch, options)
+
+    # This CPU fixture cannot load the candidate GPU kernel. Expose only the
+    # provider ABI that Spectrum audits; the cross-repo workflow separately
+    # source-checks the pinned CUDA/HIP candidate for this key_bias parameter.
+    def key_bias_capable_chunked(*args, key_bias=None, **kwargs):
+        raise AssertionError("CPU compatibility audit must not execute the sparse kernel")
+
+    monkeypatch.setattr(nodes.ck, "sol_attn_chunked", key_bias_capable_chunked)
+    monkeypatch.setattr(core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True)
+    options, carrier, mixed = _wrap_mixed(
+        options,
+        model,
+        measure_profile=mixed_module.MIXED_GRID_MEASURE_PROFILE_WEIGHTED,
+    )
+    assert "attention_measure_v1" not in options
+    assert "vdn_h3_external_sequence_v1" not in options
+
+    audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
+    assert reason is None and audit is not None and audit.safe
+    assert audit.measure is not None
+    assert audit.measure.q_rows == 140
+    assert audit.measure.kv_rows == 140
+    expected_measure = {
+        "api": 1,
+        "operator": "key_log_measure",
+        "normalization": "h3_native_source_carrier_v1",
+        "topology": "mixed_grid_low_suffix",
+        "q_rows": 140,
+        "kv_rows": 140,
+        "video_start": 96,
+        "temporal": 8,
+        "prefix_t": 1,
+        "source_grid": [2, 2],
+        "prefix_grid": [4, 4],
+        "segments": [
+            {"start": 0, "stop": 96, "mass_num": 1, "mass_den": 1},
+            {"start": 96, "stop": 112, "mass_num": 1, "mass_den": 4},
+            {"start": 112, "stop": 140, "mass_num": 1, "mass_den": 1},
+        ],
+        "coordinate_policy": "minimax_h3_native_frame_grid_v1",
+    }
+    assert audit.measure.normalized_request == core_bsa_compat._freeze(expected_measure)
+    expected_external = {
+        "api": 2,
+        "mode": "dense_gate_no_linear",
+        "topology": "mixed_grid_low_suffix",
+        "native_sequence_rows": 128,
+        "sequence_rows": 140,
+        "video_start": 96,
+        "temporal": 8,
+        "prefix_t": 1,
+        "source_rows_per_frame": 4,
+        "prefix_rows_per_frame": 16,
+    }
+    assert dict(audit.measure.external_sequence) == expected_external
+    assert "attention_measure_v1" not in options
+    assert "vdn_h3_external_sequence_v1" not in options
+
+    actual = dict(options)
+    actual["minimax_h3_layout"] = mixed
+    actual["attention_measure_v1"] = expected_measure
+    actual["vdn_h3_external_sequence_v1"] = expected_external
+    assert core_bsa_compat._measure_runtime_matches(
+        audit, 0, actual, sparse_selected=True
+    )
+
+    missing = dict(actual)
+    missing.pop("attention_measure_v1")
+    assert not core_bsa_compat._measure_runtime_matches(
+        audit, 0, missing, sparse_selected=True
+    )
+    tampered = dict(actual)
+    tampered["vdn_h3_external_sequence_v1"] = {**expected_external, "prefix_t": 2}
+    assert not core_bsa_compat._measure_runtime_matches(
+        audit, 0, tampered, sparse_selected=True
+    )
+
+
+def test_legacy_mixed_grid_measure_flag_is_not_reinterpreted_as_weighted(monkeypatch):
+    _attention, mixed_module = _flow_modules()
+    model, _patch, _override, options = _installation(sigma=0.5)
+    monkeypatch.setattr(core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True)
+    options, carrier, _mixed = _wrap_mixed(options, model, attention_measure=True)
+    audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
+    assert reason is None and audit is not None and audit.safe
+    assert audit.measure is None
+    assert audit.flow_mixed is True
+    assert audit.flow_identity is not None
+    assert "attention_measure_v1" not in options
+    assert "vdn_h3_external_sequence_v1" not in options
+    plan = core_bsa_compat._closure_values(
+        options["patches_replace"]["dit"][("double_block", 0)]
+    )["plan"]
+    if hasattr(mixed_module, "mixed_attention_measure_profile"):
+        assert (
+            mixed_module.mixed_attention_measure_profile(plan)
+            == mixed_module.MIXED_GRID_MEASURE_PROFILE_LEGACY
+        )
+
+
+def test_weighted_mixed_grid_rejects_preowned_block_local_contracts(monkeypatch):
+    _attention, mixed_module = _flow_modules()
+    if not hasattr(mixed_module, "MIXED_GRID_MEASURE_PROFILE_WEIGHTED"):
+        pytest.skip("Flow fixture predates the explicit weighted measure profile")
+    model, _patch, _override, options = _installation(sigma=0.5)
+    monkeypatch.setattr(core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True)
+    options, carrier, _mixed = _wrap_mixed(
+        options,
+        model,
+        measure_profile=mixed_module.MIXED_GRID_MEASURE_PROFILE_WEIGHTED,
+    )
+    options["attention_measure_v1"] = {"foreign": True}
+    audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
+    assert audit is None
+    assert reason == "flow_weighted_measure_ownership_conflict"
 
 
 def test_reviewed_mixed_grid_wrapper_uses_propagated_layout_and_exact_kv_sinks(monkeypatch):
