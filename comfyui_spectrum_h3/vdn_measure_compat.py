@@ -48,6 +48,7 @@ class VDNMeasureAudit:
     weight_owner_digests: tuple[str, ...]
     gate_expected: tuple[bool, ...]
     external_digest: str | None
+    external_counts: tuple[tuple[str, int], ...]
     expected_receipts: tuple[tuple[tuple[str, Any], ...], ...]
     hybrid_blob: str | None
     epilogue_blob: str | None
@@ -86,7 +87,32 @@ def _external_digest(epilogue_module, external: Any) -> str | None:
     return digest if isinstance(digest, str) and digest else None
 
 
-def _current_capability_fields(epilogue_module, capability, attention, index: int, external_digest: str):
+def _state_layout_matches_external(
+    state: Any, external_counts: tuple[tuple[str, int], ...]
+) -> bool:
+    counts = dict(external_counts)
+    layout = getattr(state, "layout", None)
+    if layout is None:
+        return False
+    try:
+        return (
+            int(layout.seq_len) == counts["native_sequence_rows"]
+            and int(layout.video_start) == counts["video_start"]
+            and int(layout.num_frames) == counts["temporal"]
+            and int(layout.tokens_per_frame) == counts["source_rows_per_frame"]
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _current_capability_fields(
+    epilogue_module,
+    capability,
+    attention,
+    index: int,
+    external_digest: str,
+    external_counts: tuple[tuple[str, int], ...],
+):
     try:
         if (
             getattr(capability, "api", None) != 1
@@ -131,6 +157,8 @@ def _current_capability_fields(epilogue_module, capability, attention, index: in
             return None
         cfg = state.cfg
         if not isinstance(cfg, Mapping):
+            return None
+        if not _state_layout_matches_external(state, external_counts):
             return None
         gate_expected = bool(branch is not None and cfg.get("enable_softmax_gate", True))
     except torch.cuda.OutOfMemoryError:
@@ -178,6 +206,7 @@ def probe(model: Any, external: Any, block_count: int):
             weight_owner_digests=(),
             gate_expected=(),
             external_digest=None,
+            external_counts=(),
             expected_receipts=(),
             hybrid_blob=None,
             epilogue_blob=None,
@@ -217,6 +246,9 @@ def probe(model: Any, external: Any, block_count: int):
     external_digest = _external_digest(epilogue, external)
     if external_digest is None:
         return None, "vdn_external_digest_unproven"
+    external_counts = tuple(
+        (name, int(external[name])) for name in _EXTERNAL_COUNT_FIELDS
+    )
 
     capabilities = []
     owner_generations = []
@@ -238,8 +270,10 @@ def probe(model: Any, external: Any, block_count: int):
         capability = getattr(forward, VDN_EPILOGUE_KEY, None)
         if type(capability) is not epilogue.ExternalSoftmaxEpilogueCapability:
             return None, "vdn_epilogue_capability_unproven"
+        if not _state_layout_matches_external(capability.state, external_counts):
+            return None, "vdn_execution_context_unproven"
         fields = _current_capability_fields(
-            epilogue, capability, attention, index, external_digest
+            epilogue, capability, attention, index, external_digest, external_counts
         )
         if fields is None:
             return None, "vdn_epilogue_owner_unproven"
@@ -263,6 +297,7 @@ def probe(model: Any, external: Any, block_count: int):
         weight_owner_digests=tuple(weight_owner_digests),
         gate_expected=tuple(gate_expected),
         external_digest=external_digest,
+        external_counts=external_counts,
         expected_receipts=tuple(expected_receipts),
         hybrid_blob=hybrid_blob,
         epilogue_blob=epilogue_blob,
@@ -329,6 +364,7 @@ def runtime_matches(audit: VDNMeasureAudit, index: int) -> bool:
         audit.attentions[index],
         index,
         audit.external_digest,
+        audit.external_counts,
     )
     return fields == audit.expected_receipts[index]
 
