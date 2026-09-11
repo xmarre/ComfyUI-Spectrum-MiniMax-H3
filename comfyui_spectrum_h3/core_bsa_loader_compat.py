@@ -235,6 +235,7 @@ def _runtime_alias_probe(
             patch,
             options,
             layout,
+            model,
             seq_len,
             uuids,
             layout_identity,
