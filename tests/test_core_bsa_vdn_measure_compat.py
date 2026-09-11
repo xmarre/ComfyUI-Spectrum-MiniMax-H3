@@ -31,7 +31,7 @@ def _measure_nodes():
 def _vdn_modules():
     required = os.getenv("SPECTRUM_REQUIRE_REVIEWED_BSA_MEASURE_FIXTURE") == "1"
     try:
-        import vdn_h3.hybrid as hybrid
+        from vdn_h3 import hybrid
         import vdn_h3.mixed_measure_epilogue as epilogue
     except Exception as exc:  # noqa: BLE001
         if required:
@@ -56,6 +56,9 @@ class _Attention:
         self.qkv_proj = SimpleNamespace(
             weight=torch.empty(1, dtype=torch.bfloat16, device="cpu")
         )
+        norm_weight = torch.ones(128, dtype=torch.bfloat16, device="cpu")
+        self.q_norm = SimpleNamespace(weight=norm_weight, eps=1e-6)
+        self.k_norm = SimpleNamespace(weight=norm_weight.clone(), eps=1e-6)
         self.out_proj = torch.nn.Identity()
 
     def forward(self, x, rope_freqs=None, transformer_options=None):
@@ -195,6 +198,23 @@ def test_api2_mixed_geometry_without_vdn_remains_forecast_safe(monkeypatch):
         "attention_backend_receipts_v1",
     )
     assert vdn_measure_compat.VDN_EPILOGUE_RECEIPTS_KEY not in prepared
+
+
+def test_absent_vdn_bound_forward_identity_is_stable_and_owner_sensitive(monkeypatch):
+    model, _state, _patch, options = _install(monkeypatch, count=1, with_vdn=False)
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and audit is not None and audit.measure is not None
+    vdn = audit.measure.vdn
+
+    # Re-reading a normal Python bound method creates a fresh bound-method object;
+    # that must not look like an attention-owner change.
+    assert vdn_measure_compat.runtime_matches(vdn, 0)
+
+    # Rebinding the same class function to another attention instance is a real
+    # owner change and must still invalidate the preflight.
+    other = _Attention()
+    model.blocks[0].attn.forward = other.forward
+    assert not vdn_measure_compat.runtime_matches(vdn, 0)
 
 
 def test_reviewed_vdn_owner_enters_identity_and_sparse_receipt(monkeypatch):
