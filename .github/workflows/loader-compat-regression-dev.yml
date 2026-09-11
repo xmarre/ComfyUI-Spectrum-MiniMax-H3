@@ -1,0 +1,80 @@
+name: Loader alias regression validation
+
+on:
+  push:
+    branches:
+      - ci/vdn-weighted-measure-20260911
+    paths:
+      - .github/workflows/loader-compat-regression-dev.yml
+      - comfyui_spectrum_h3/core_bsa_loader_compat.py
+
+permissions:
+  contents: write
+
+jobs:
+  reviewed-bsa-loader:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/checkout@v4
+        with:
+          repository: comfyanonymous/ComfyUI
+          ref: be92396834f9b6e3e361cfe30e7eed693137a448
+          path: ComfyUI
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
+          ref: 860f308cc4f84f920d0c1facd4ece028584a02a0
+          path: FlowRegenerate
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install pytest numpy scipy torchsde psutil safetensors einops tqdm pyyaml pillow packaging transformers tokenizers sentencepiece aiohttp yarl alembic SQLAlchemy filelock "av>=17.0.0" requests simpleeval blake3 kornia spandrel pydantic pydantic-settings PyOpenGL comfy-angle "comfy-kitchen==0.2.33" "comfy-aimdo==0.5.3"
+
+      - name: Apply narrow signature propagation fix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("comfyui_spectrum_h3/core_bsa_loader_compat.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''        measure_audit, measure_reason = core_bsa_compat._measure_audit(\n            module,\n            source_blob,\n            patch,\n            options,\n            layout,\n            seq_len,\n'''
+          new = '''        measure_audit, measure_reason = core_bsa_compat._measure_audit(\n            module,\n            source_blob,\n            patch,\n            options,\n            layout,\n            model,\n            seq_len,\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"loader measure-audit call anchor count: {text.count(old)}")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+
+      - name: Compile and run failing regressions
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
+          PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/FlowRegenerate:${{ github.workspace }}
+          SPECTRUM_REQUIRE_REVIEWED_BSA_FIXTURE: "1"
+        run: |
+          python -m compileall -q comfyui_spectrum_h3/core_bsa_loader_compat.py
+          python -m pytest -q \
+            tests/test_core_bsa_loader_compat.py::test_runtime_path_loaded_core_bsa_is_recognized \
+            tests/test_core_bsa_loader_compat.py::test_runtime_path_loaded_bsa_under_reviewed_flow_wrapper
+
+      - name: Checkpoint validated fix
+        run: |
+          if ! git diff --quiet -- comfyui_spectrum_h3/core_bsa_loader_compat.py; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add comfyui_spectrum_h3/core_bsa_loader_compat.py
+            git commit -m "Propagate model into loader-alias measure audit"
+            git push origin HEAD:ci/vdn-weighted-measure-20260911
+          fi
