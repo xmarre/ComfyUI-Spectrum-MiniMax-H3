@@ -190,15 +190,23 @@ def _resolve_layout(inner: Any, context: torch.Tensor, video_x: torch.Tensor, au
     signature = (int(context.shape[1]), latent_t, latent_h, latent_w, int(audio_x.shape[-1]))
     layout = payload.get("layout")
     if layout is None or tuple(getattr(layout, "signature", ())) != signature:
+        layout_kwargs = {
+            "keyframes": payload.get("keyframes"),
+            "refs": payload.get("refs"),
+        }
+        try:
+            parameters = inspect.signature(module.PackedLayout).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "frame_count" in parameters:
+            layout_kwargs["frame_count"] = payload.get("frame_count")
         layout = module.PackedLayout(
             signature[0],
             signature[1],
             signature[2],
             signature[3],
             signature[4],
-            keyframes=payload.get("keyframes"),
-            refs=payload.get("refs"),
-            frame_count=payload.get("frame_count"),
+            **layout_kwargs,
         )
     return layout
 

@@ -7,7 +7,7 @@ import torch
 
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.forecast import HistoryWeightForecaster
-from comfyui_spectrum_h3.minimax_h3 import diffusion_model_wrapper
+from comfyui_spectrum_h3.minimax_h3 import _resolve_layout, diffusion_model_wrapper
 from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
 from comfyui_spectrum_h3.sampling import (
     ACTUAL_KEY,
@@ -112,6 +112,16 @@ def _inputs(PackedLayout):
     context = torch.randn(1, 2, 8)
     payload = {"layout": PackedLayout(2, 1, 4, 4, 3), "seed": 5}
     return [video, audio], context, payload
+
+
+def test_layout_fallback_uses_the_loaded_native_constructor_contract():
+    _, _, PackedLayout = _native_imports()
+    model, _ = _tiny_model()
+    x, context, _payload = _inputs(PackedLayout)
+
+    layout = _resolve_layout(model, context, x[0], x[1], {})
+
+    assert tuple(layout.signature) == (2, 1, 4, 4, 3)
 
 
 def _reference_inputs(PackedLayout):
