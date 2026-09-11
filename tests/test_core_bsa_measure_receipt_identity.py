@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from comfyui_spectrum_h3 import backend_history, core_bsa_compat
+from comfyui_spectrum_h3 import backend_history, core_bsa_compat, core_bsa_forecast_recovery
 
 
 def _audit():
@@ -112,7 +112,9 @@ def test_observe_verifies_raw_receipt_but_stores_token_free_identity(monkeypatch
         core_bsa_compat.PRIVATE_AUDIT_KEY: audit,
         backend_history.RECEIPTS: list(raw),
     }
-    backend_history.observe(runtime, 4, 9, options, ("policy", True))
+    original_observe = core_bsa_forecast_recovery._ORIGINAL_OBSERVE
+    assert original_observe is not None
+    original_observe(runtime, 4, 9, options, ("policy", True))
 
     assert accepted == [(audit, raw)]
     assert runtime.observed[:3] == (4, 9, "policy")
