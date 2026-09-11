@@ -1,0 +1,158 @@
+name: VDN deferred execution-context validation
+
+on:
+  push:
+    branches:
+      - ci/vdn-deferred-context-20260911
+    paths:
+      - .github/workflows/vdn-deferred-context-dev.yml
+      - comfyui_spectrum_h3/core_bsa_compat.py
+      - comfyui_spectrum_h3/vdn_measure_compat.py
+      - tests/test_core_bsa_vdn_measure_compat.py
+
+permissions:
+  contents: write
+
+jobs:
+  deferred-vdn-context:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/ComfyUI
+          ref: c00cd0acab821cd3f4479f02421c3c11331561f7
+          path: _deps/ComfyUI
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
+          ref: c86d74bcf139563b14257720259e4788e386aa5c
+          path: _deps/FlowRegenerate
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/ComfyUI-VDN-H3-Plus
+          ref: 6e0f1e22058ad0cd1c0ad02e2e34f742d99a0ef3
+          path: _deps/VDNH3Plus
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install \
+            pytest ruff numpy scipy torchsde psutil safetensors einops tqdm pyyaml pillow packaging \
+            transformers tokenizers sentencepiece aiohttp yarl alembic SQLAlchemy filelock \
+            "av>=17.0.0" requests simpleeval blake3 kornia spandrel pydantic pydantic-settings \
+            PyOpenGL comfy-angle "comfy-kitchen==0.2.33" "comfy-aimdo==0.5.3"
+
+      - name: Apply deferred execution-context proof
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("comfyui_spectrum_h3/vdn_measure_compat.py")
+          text = path.read_text(encoding="utf-8")
+
+          old = '''def _current_capability_fields(\n    epilogue_module,\n    capability,\n    attention,\n    index: int,\n    external_digest: str,\n    external_counts: tuple[tuple[str, int], ...],\n):\n'''
+          new = '''def _current_capability_fields(\n    epilogue_module,\n    capability,\n    attention,\n    index: int,\n    external_digest: str,\n    external_counts: tuple[tuple[str, int], ...],\n    *,\n    require_active_layout: bool = True,\n):\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"capability signature anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''        if not _state_layout_matches_external(state, external_counts):\n            return None\n        gate_expected = bool(branch is not None and cfg.get("enable_softmax_gate", True))\n'''
+          new = '''        if require_active_layout and not _state_layout_matches_external(\n            state, external_counts\n        ):\n            return None\n        gate_expected = bool(branch is not None and cfg.get("enable_softmax_gate", True))\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"active-layout anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          marker = '''    return fields\n\n\ndef probe(model: Any, external: Any, block_count: int):\n'''
+          addition = '''    return fields\n\n\ndef _spectrum_wrapper(function: Any) -> bool:\n    module = sys.modules.get("comfyui_spectrum_h3.minimax_h3")\n    expected = None if module is None else getattr(module, "diffusion_model_wrapper", None)\n    return function is expected and callable(expected)\n\n\ndef _deferred_layout_context_proven(\n    hybrid: Any, state: Any, options: Any\n) -> bool:\n    if not isinstance(options, Mapping):\n        return False\n    wrappers = options.get("wrappers")\n    if not isinstance(wrappers, Mapping):\n        return False\n    groups = wrappers.get("diffusion_model")\n    if not isinstance(groups, Mapping):\n        return False\n\n    expected_code = _core()._nested_code(hybrid.make_layout_wrapper, "wrap")\n    if expected_code is None:\n        return False\n\n    flattened = []\n    try:\n        for key, functions in groups.items():\n            if not isinstance(functions, (tuple, list)):\n                return False\n            for function in functions:\n                flattened.append((key, function))\n    except Exception:  # noqa: BLE001 - malformed wrapper metadata fails closed\n        return False\n\n    spectrum_indices = [\n        index\n        for index, (key, function) in enumerate(flattened)\n        if key == "spectrum_minimax_h3" and _spectrum_wrapper(function)\n    ]\n    vdn_indices = []\n    for index, (key, function) in enumerate(flattened):\n        if key != "vdn_h3":\n            continue\n        base = getattr(function, "__func__", function)\n        if (\n            getattr(base, "__module__", None) != "vdn_h3.hybrid"\n            or getattr(base, "__qualname__", None)\n            != "make_layout_wrapper.<locals>.wrap"\n            or getattr(base, "__code__", None) is not expected_code\n        ):\n            continue\n        closure = _core()._closure_values(base)\n        if closure is None or set(closure) != {"state"} or closure.get("state") is not state:\n            continue\n        vdn_indices.append(index)\n\n    # If VDN has already executed outside Spectrum, state.layout is live and this\n    # helper is not needed.  A missing layout is safe to defer only when the exact\n    # wrapper for this VDN state is still downstream of this Spectrum wrapper.\n    return (\n        len(spectrum_indices) == 1\n        and len(vdn_indices) == 1\n        and spectrum_indices[0] < vdn_indices[0]\n    )\n\n\ndef probe(\n    model: Any, external: Any, block_count: int, options: Any = None\n):\n'''
+          if text.count(marker) != 1:
+              raise SystemExit(f"probe insertion anchor count: {text.count(marker)}")
+          text = text.replace(marker, addition, 1)
+
+          old = '''    required_hybrid = ("make_vdn_forward",)\n'''
+          new = '''    required_hybrid = ("make_vdn_forward", "make_layout_wrapper")\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"required-hybrid anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''        if not _state_layout_matches_external(capability.state, external_counts):\n            return None, "vdn_execution_context_unproven"\n        fields = _current_capability_fields(\n            epilogue, capability, attention, index, external_digest, external_counts\n        )\n'''
+          new = '''        active_layout = _state_layout_matches_external(\n            capability.state, external_counts\n        )\n        if not active_layout and not _deferred_layout_context_proven(\n            hybrid, capability.state, options\n        ):\n            return None, "vdn_execution_context_unproven"\n        fields = _current_capability_fields(\n            epilogue,\n            capability,\n            attention,\n            index,\n            external_digest,\n            external_counts,\n            require_active_layout=active_layout,\n        )\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"probe layout anchor count: {text.count(old)}")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          path = Path("comfyui_spectrum_h3/core_bsa_compat.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''    vdn, vdn_reason = vdn_measure_compat.probe(model, external, block_count)\n'''
+          new = '''    vdn, vdn_reason = vdn_measure_compat.probe(\n        model, external, block_count, options\n    )\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"VDN probe call anchor count: {text.count(old)}")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          path = Path("tests/test_core_bsa_vdn_measure_compat.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''import torch\n\nfrom comfyui_spectrum_h3 import core_bsa_compat, vdn_measure_compat\n'''
+          new = '''import torch\n\nfrom comfyui_spectrum_h3 import core_bsa_compat, vdn_measure_compat\nfrom comfyui_spectrum_h3.minimax_h3 import diffusion_model_wrapper\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"test import anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          anchor = '''def test_vdn_execution_context_must_be_active_at_preflight(monkeypatch):\n    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)\n    state.layout = None\n\n    audit, reason = core_bsa_compat.probe(options, _layout(), model)\n\n    assert audit is None\n    assert reason == "vdn_execution_context_unproven"\n\n\n'''
+          addition = anchor + '''def _deferred_wrapper_options(options, hybrid, state, *, vdn_first=False):\n    spectrum = ("spectrum_minimax_h3", [diffusion_model_wrapper])\n    vdn = ("vdn_h3", [hybrid.make_layout_wrapper(state)])\n    ordered = (vdn, spectrum) if vdn_first else (spectrum, vdn)\n    options["wrappers"] = {"diffusion_model": dict(ordered)}\n\n\ndef test_vdn_context_may_be_proven_by_exact_downstream_layout_wrapper(monkeypatch):\n    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)\n    hybrid, _epilogue = _vdn_modules()\n    state.layout = None\n    _deferred_wrapper_options(options, hybrid, state)\n\n    audit, reason = core_bsa_compat.probe(options, _layout(), model)\n\n    assert reason is None\n    assert audit is not None and audit.safe and audit.measure is not None\n    assert audit.measure.vdn.active\n    # Before the downstream wrapper actually runs, runtime acceptance is still\n    # forbidden. The deferred proof applies only to preflight scheduling.\n    assert not vdn_measure_compat.runtime_matches(audit.measure.vdn, 0)\n\n    state.layout = SimpleNamespace(\n        seq_len=160, video_start=96, num_frames=2, tokens_per_frame=32\n    )\n    assert vdn_measure_compat.runtime_matches(audit.measure.vdn, 0)\n\n\ndef test_missing_vdn_context_rejects_wrapper_that_is_not_downstream(monkeypatch):\n    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)\n    hybrid, _epilogue = _vdn_modules()\n    state.layout = None\n    _deferred_wrapper_options(options, hybrid, state, vdn_first=True)\n\n    audit, reason = core_bsa_compat.probe(options, _layout(), model)\n\n    assert audit is None\n    assert reason == "vdn_execution_context_unproven"\n\n\ndef test_missing_vdn_context_rejects_downstream_wrapper_for_another_state(monkeypatch):\n    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)\n    hybrid, _epilogue = _vdn_modules()\n    state.layout = None\n    other = SimpleNamespace()\n    _deferred_wrapper_options(options, hybrid, other)\n\n    audit, reason = core_bsa_compat.probe(options, _layout(), model)\n\n    assert audit is None\n    assert reason == "vdn_execution_context_unproven"\n\n\n'''
+          if text.count(anchor) != 1:
+              raise SystemExit(f"deferred-context test anchor count: {text.count(anchor)}")
+          path.write_text(text.replace(anchor, addition, 1), encoding="utf-8")
+          PY
+
+      - name: Ruff and compile
+        run: |
+          python -m ruff check \
+            comfyui_spectrum_h3/core_bsa_compat.py \
+            comfyui_spectrum_h3/vdn_measure_compat.py \
+            tests/test_core_bsa_vdn_measure_compat.py \
+            --fix --ignore N999,I001,C408,UP035
+          python -m compileall -q \
+            comfyui_spectrum_h3/core_bsa_compat.py \
+            comfyui_spectrum_h3/vdn_measure_compat.py \
+            tests/test_core_bsa_vdn_measure_compat.py
+
+      - name: Run VDN measure and core BSA regressions
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
+          PYTHONPATH: ${{ github.workspace }}/_deps/ComfyUI:${{ github.workspace }}/_deps/FlowRegenerate:${{ github.workspace }}/_deps/VDNH3Plus:${{ github.workspace }}
+          SPECTRUM_REQUIRE_REVIEWED_BSA_MEASURE_FIXTURE: "1"
+        run: |
+          python -m pytest -q \
+            tests/test_core_bsa_vdn_measure_compat.py \
+            tests/test_core_bsa_compat.py \
+            tests/test_core_bsa_measure_history.py
+
+      - name: Checkpoint validated source changes
+        run: |
+          if ! git diff --quiet -- \
+            comfyui_spectrum_h3/core_bsa_compat.py \
+            comfyui_spectrum_h3/vdn_measure_compat.py \
+            tests/test_core_bsa_vdn_measure_compat.py; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add \
+              comfyui_spectrum_h3/core_bsa_compat.py \
+              comfyui_spectrum_h3/vdn_measure_compat.py \
+              tests/test_core_bsa_vdn_measure_compat.py
+            git commit -m "Prove deferred VDN layout wrapper at Spectrum preflight"
+            git push origin HEAD:ci/vdn-deferred-context-20260911
+          fi
