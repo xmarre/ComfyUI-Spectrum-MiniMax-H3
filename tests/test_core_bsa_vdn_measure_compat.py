@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from comfyui_spectrum_h3 import core_bsa_compat, vdn_measure_compat
+from comfyui_spectrum_h3.minimax_h3 import diffusion_model_wrapper
 
 
 def _measure_nodes():
@@ -285,6 +286,59 @@ def test_vdn_config_change_after_preflight_invalidates_runtime_owner(monkeypatch
 def test_vdn_execution_context_must_be_active_at_preflight(monkeypatch):
     model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)
     state.layout = None
+
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+
+    assert audit is None
+    assert reason == "vdn_execution_context_unproven"
+
+
+def _deferred_wrapper_options(options, hybrid, state, *, vdn_first=False):
+    spectrum = ("spectrum_minimax_h3", [diffusion_model_wrapper])
+    vdn = ("vdn_h3", [hybrid.make_layout_wrapper(state)])
+    ordered = (vdn, spectrum) if vdn_first else (spectrum, vdn)
+    options["wrappers"] = {"diffusion_model": dict(ordered)}
+
+
+def test_vdn_context_may_be_proven_by_exact_downstream_layout_wrapper(monkeypatch):
+    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)
+    hybrid, _epilogue = _vdn_modules()
+    state.layout = None
+    _deferred_wrapper_options(options, hybrid, state)
+
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+
+    assert reason is None
+    assert audit is not None and audit.safe and audit.measure is not None
+    assert audit.measure.vdn.active
+    # Before the downstream wrapper actually runs, runtime acceptance is still
+    # forbidden. The deferred proof applies only to preflight scheduling.
+    assert not vdn_measure_compat.runtime_matches(audit.measure.vdn, 0)
+
+    state.layout = SimpleNamespace(
+        seq_len=160, video_start=96, num_frames=2, tokens_per_frame=32
+    )
+    assert vdn_measure_compat.runtime_matches(audit.measure.vdn, 0)
+
+
+def test_missing_vdn_context_rejects_wrapper_that_is_not_downstream(monkeypatch):
+    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)
+    hybrid, _epilogue = _vdn_modules()
+    state.layout = None
+    _deferred_wrapper_options(options, hybrid, state, vdn_first=True)
+
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+
+    assert audit is None
+    assert reason == "vdn_execution_context_unproven"
+
+
+def test_missing_vdn_context_rejects_downstream_wrapper_for_another_state(monkeypatch):
+    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)
+    hybrid, _epilogue = _vdn_modules()
+    state.layout = None
+    other = SimpleNamespace()
+    _deferred_wrapper_options(options, hybrid, other)
 
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
 

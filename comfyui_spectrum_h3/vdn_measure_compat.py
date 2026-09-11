@@ -112,6 +112,8 @@ def _current_capability_fields(
     index: int,
     external_digest: str,
     external_counts: tuple[tuple[str, int], ...],
+    *,
+    require_active_layout: bool = True,
 ):
     try:
         if (
@@ -158,7 +160,9 @@ def _current_capability_fields(
         cfg = state.cfg
         if not isinstance(cfg, Mapping):
             return None
-        if not _state_layout_matches_external(state, external_counts):
+        if require_active_layout and not _state_layout_matches_external(
+            state, external_counts
+        ):
             return None
         gate_expected = bool(branch is not None and cfg.get("enable_softmax_gate", True))
     except torch.cuda.OutOfMemoryError:
@@ -179,7 +183,73 @@ def _current_capability_fields(
     return fields
 
 
-def probe(model: Any, external: Any, block_count: int):
+def _spectrum_wrapper(function: Any) -> bool:
+    module = sys.modules.get("comfyui_spectrum_h3.minimax_h3")
+    expected = None if module is None else getattr(module, "diffusion_model_wrapper", None)
+    return function is expected and callable(expected)
+
+
+def _deferred_layout_context_proven(
+    hybrid: Any, state: Any, options: Any
+) -> bool:
+    if not isinstance(options, Mapping):
+        return False
+    wrappers = options.get("wrappers")
+    if not isinstance(wrappers, Mapping):
+        return False
+    groups = wrappers.get("diffusion_model")
+    if not isinstance(groups, Mapping):
+        return False
+
+    expected_code = _core()._nested_code(hybrid.make_layout_wrapper, "wrap")
+    if expected_code is None:
+        return False
+
+    flattened = []
+    try:
+        for key, functions in groups.items():
+            if not isinstance(functions, (tuple, list)):
+                return False
+            for function in functions:
+                flattened.append((key, function))
+    except Exception:  # noqa: BLE001 - malformed wrapper metadata fails closed
+        return False
+
+    spectrum_indices = [
+        index
+        for index, (key, function) in enumerate(flattened)
+        if key == "spectrum_minimax_h3" and _spectrum_wrapper(function)
+    ]
+    vdn_indices = []
+    for index, (key, function) in enumerate(flattened):
+        if key != "vdn_h3":
+            continue
+        base = getattr(function, "__func__", function)
+        if (
+            getattr(base, "__module__", None) != "vdn_h3.hybrid"
+            or getattr(base, "__qualname__", None)
+            != "make_layout_wrapper.<locals>.wrap"
+            or getattr(base, "__code__", None) is not expected_code
+        ):
+            continue
+        closure = _core()._closure_values(base)
+        if closure is None or set(closure) != {"state"} or closure.get("state") is not state:
+            continue
+        vdn_indices.append(index)
+
+    # If VDN has already executed outside Spectrum, state.layout is live and this
+    # helper is not needed.  A missing layout is safe to defer only when the exact
+    # wrapper for this VDN state is still downstream of this Spectrum wrapper.
+    return (
+        len(spectrum_indices) == 1
+        and len(vdn_indices) == 1
+        and spectrum_indices[0] < vdn_indices[0]
+    )
+
+
+def probe(
+    model: Any, external: Any, block_count: int, options: Any = None
+):
     """Return reviewed per-block VDN epilogue ownership, or a fail-closed reason."""
     try:
         blocks = getattr(model, "blocks", None)
@@ -228,7 +298,7 @@ def probe(model: Any, external: Any, block_count: int):
     )
     if hybrid is None or epilogue is None:
         return None, "vdn_source_unreviewed"
-    required_hybrid = ("make_vdn_forward",)
+    required_hybrid = ("make_vdn_forward", "make_layout_wrapper")
     required_epilogue = (
         "ExternalSoftmaxEpilogueCapability",
         "_config_identity",
@@ -270,10 +340,21 @@ def probe(model: Any, external: Any, block_count: int):
         capability = getattr(forward, VDN_EPILOGUE_KEY, None)
         if type(capability) is not epilogue.ExternalSoftmaxEpilogueCapability:
             return None, "vdn_epilogue_capability_unproven"
-        if not _state_layout_matches_external(capability.state, external_counts):
+        active_layout = _state_layout_matches_external(
+            capability.state, external_counts
+        )
+        if not active_layout and not _deferred_layout_context_proven(
+            hybrid, capability.state, options
+        ):
             return None, "vdn_execution_context_unproven"
         fields = _current_capability_fields(
-            epilogue, capability, attention, index, external_digest, external_counts
+            epilogue,
+            capability,
+            attention,
+            index,
+            external_digest,
+            external_counts,
+            require_active_layout=active_layout,
         )
         if fields is None:
             return None, "vdn_epilogue_owner_unproven"
