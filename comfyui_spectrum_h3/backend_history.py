@@ -44,6 +44,41 @@ def _provider_accepts(provider, receipts):
         return False
 
 
+def _core_bsa_numerical_receipts(audit, receipts):
+    """Drop only dispatch-local call tokens from accepted weighted BSA receipts.
+
+    Raw receipts remain the authority for ``accepts_actual``.  The per-preflight
+    call token proves that the current actual block consumed the capability bound
+    for that invocation, but it deliberately changes on every preflight and is
+    therefore not part of numerical history identity.  Every numerical field,
+    including cold/primed route, owner generation, measure digest, profile/route,
+    exact K range, preprocessing identity and VDN completion evidence, remains.
+    """
+    if getattr(audit, "measure", None) is None:
+        return receipts
+    normalized = []
+    for receipt in receipts:
+        # Accepted weighted core-BSA receipts have the measure evidence as field
+        # 8. Keep this fail closed even though callers invoke us only after the
+        # source-gated exact receipt comparison has succeeded.
+        if (
+            not isinstance(receipt, tuple)
+            or len(receipt) != 9
+            or not isinstance(receipt[8], tuple)
+            or len(receipt[8]) < 3
+            or receipt[8][0] != audit.measure.core.ATTENTION_MEASURE_KEY
+        ):
+            raise ValueError("accepted weighted core-BSA receipt has an invalid shape")
+        measure_receipt = receipt[8]
+        normalized.append(
+            (
+                *receipt[:8],
+                (measure_receipt[0], *measure_receipt[2:]),
+            )
+        )
+    return tuple(normalized)
+
+
 def _runtime_has_backend_evidence(runtime) -> bool:
     history = runtime._backend_history
     if history.policy is not None or history.receipt is not None:
@@ -189,6 +224,7 @@ def observe(runtime, run_id, step_id, options, policy):
         return
     identity, safe = policy
     receipts = tuple(options.get(RECEIPTS, ()))
+    numerical_receipts = receipts
 
     from . import core_bsa_compat
 
@@ -196,6 +232,12 @@ def observe(runtime, run_id, step_id, options, policy):
     if audit is not None:
         accepted = core_bsa_compat.accepts_actual(audit, receipts)
         safe = safe and accepted
+        if accepted:
+            try:
+                numerical_receipts = _core_bsa_numerical_receipts(audit, receipts)
+            except Exception:  # noqa: BLE001 - receipt normalization fails closed
+                safe = False
+                numerical_receipts = receipts
         if runtime.config.debug:
             routes = ",".join(
                 str(item[4]) if isinstance(item, tuple) and len(item) > 4 else "malformed"
@@ -235,4 +277,4 @@ def observe(runtime, run_id, step_id, options, policy):
                 identity[1],
                 len(receipts),
             )
-    runtime.observe_backend_history(run_id, step_id, identity, receipts, safe)
+    runtime.observe_backend_history(run_id, step_id, identity, numerical_receipts, safe)

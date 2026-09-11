@@ -229,6 +229,21 @@ def _runtime_alias_probe(
         except (AttributeError, TypeError, ValueError, RuntimeError):
             return None, "pool_shape_unproven"
 
+        measure_audit, measure_reason = core_bsa_compat._measure_audit(
+            module,
+            source_blob,
+            patch,
+            options,
+            layout,
+            model,
+            seq_len,
+            uuids,
+            layout_identity,
+            len(model.blocks),
+        )
+        if measure_reason is not None:
+            return None, measure_reason
+
         sparse_runtime_ok = core_bsa_compat._sparse_runtime_eligible(model, module)
         routed = core_bsa_compat._route_specs(
             patch,
@@ -239,6 +254,7 @@ def _runtime_alias_probe(
             options,
             sparse_runtime_ok,
             pool_specs,
+            measure_audit,
         )
         if routed is None:
             return None, "route_unproven"
@@ -249,21 +265,14 @@ def _runtime_alias_probe(
             seq_len,
             uuids,
             pool_specs,
-        )
-        expected_receipts = tuple(
-            (
-                core_bsa_compat.ADAPTER_KEY,
-                core_bsa_compat.ADAPTER_VERSION,
-                patch_generation,
-                index,
-                route,
-                seq_len,
-                sink,
-                sink_q,
-            )
-            for index, (route, sink, sink_q) in enumerate(route_specs)
+            measure_audit,
         )
         mode = "sol-attn" if settings_identity[2] == 0.0 else "sla"
+        measure_identity = (
+            ()
+            if measure_audit is None
+            else (("attention_measure", core_bsa_compat._measure_identity(measure_audit)),)
+        )
         identity = (
             core_bsa_compat.ADAPTER_KEY,
             core_bsa_compat.ADAPTER_VERSION,
@@ -275,10 +284,11 @@ def _runtime_alias_probe(
             ("uuids", core_bsa_compat._freeze(uuids)),
             ("routes", route_specs),
             ("pool_ownership", pool_ownership),
+            *measure_identity,
             ("ownership", ownership_identity),
             ("execution", execution_identity),
         )
-        return core_bsa_compat.CoreBSAAudit(
+        audit = core_bsa_compat.CoreBSAAudit(
             identity=identity,
             safe=bool(safe),
             patch=patch,
@@ -290,10 +300,13 @@ def _runtime_alias_probe(
             settings_identity=settings_identity,
             route_specs=route_specs,
             pool_specs=pool_specs,
-            expected_receipts=expected_receipts,
+            expected_receipts=(),
             source_blob=source_blob,
             current_override=options.get("optimized_attention_override"),
-        ), None
+            measure=measure_audit,
+        )
+        audit.expected_receipts = core_bsa_compat._expected_receipts(audit)
+        return audit, None
     except torch.cuda.OutOfMemoryError:
         raise
     except Exception:  # noqa: BLE001 - source/ownership introspection stays fail closed
