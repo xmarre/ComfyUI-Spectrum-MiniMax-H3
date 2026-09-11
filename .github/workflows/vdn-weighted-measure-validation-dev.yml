@@ -1,0 +1,92 @@
+name: VDN weighted measure validation
+
+on:
+  push:
+    branches:
+      - ci/vdn-weighted-measure-20260911
+
+permissions:
+  contents: read
+
+jobs:
+  targeted-cross-stack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Spectrum candidate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out optional-VDN-correct ComfyUI candidate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/ComfyUI
+          ref: c00cd0acab821cd3f4479f02421c3c11331561f7
+          path: _deps/ComfyUI
+
+      - name: Check out weighted Flow candidate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
+          ref: c86d74bcf139563b14257720259e4788e386aa5c
+          path: _deps/FlowRegenerate
+
+      - name: Check out reviewed VDN epilogue candidate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/ComfyUI-VDN-H3-Plus
+          ref: 6e0f1e22058ad0cd1c0ad02e2e34f742d99a0ef3
+          path: _deps/VDNH3Plus
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install validation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install \
+            pytest ruff numpy scipy torchsde psutil safetensors einops tqdm pyyaml pillow packaging \
+            transformers tokenizers sentencepiece aiohttp yarl alembic SQLAlchemy filelock \
+            "av>=17.0.0" requests simpleeval blake3 kornia spandrel pydantic pydantic-settings \
+            PyOpenGL comfy-angle "comfy-kitchen==0.2.33" "comfy-aimdo==0.5.3"
+
+      - name: Static validation
+        run: |
+          python -m ruff check \
+            comfyui_spectrum_h3/core_bsa_compat.py \
+            comfyui_spectrum_h3/core_bsa_flow_compat.py \
+            comfyui_spectrum_h3/vdn_measure_compat.py \
+            tests/test_core_bsa_vdn_measure_compat.py \
+            --ignore N999,I001,C408,UP035
+          python -m compileall -q \
+            comfyui_spectrum_h3/core_bsa_compat.py \
+            comfyui_spectrum_h3/core_bsa_flow_compat.py \
+            comfyui_spectrum_h3/vdn_measure_compat.py \
+            tests/test_core_bsa_vdn_measure_compat.py
+
+      - name: Run targeted BSA and cross-stack regressions
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
+          PYTHONPATH: ${{ github.workspace }}/_deps/ComfyUI:${{ github.workspace }}/_deps/FlowRegenerate:${{ github.workspace }}/_deps/VDNH3Plus:${{ github.workspace }}
+          SPECTRUM_REQUIRE_REVIEWED_BSA_MEASURE_FIXTURE: "1"
+        run: |
+          python -m pytest -q \
+            tests/test_core_bsa_compat.py \
+            tests/test_core_bsa_flow_compat.py \
+            tests/test_core_bsa_flow_identity.py \
+            tests/test_core_bsa_forecast_recovery.py \
+            tests/test_core_bsa_measure_history.py \
+            tests/test_core_bsa_preprocess_compat.py \
+            tests/test_core_bsa_source_hardening.py \
+            tests/test_core_bsa_vdn_measure_compat.py \
+            tests/test_backend_history.py \
+            tests/test_bsa_transition_probe.py \
+            tests/test_bsa_transition_probe_activation.py \
+            tests/test_bsa_transition_probe_kitchen_compat.py
