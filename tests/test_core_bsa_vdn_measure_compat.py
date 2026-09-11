@@ -31,7 +31,7 @@ def _measure_nodes():
 def _vdn_modules():
     required = os.getenv("SPECTRUM_REQUIRE_REVIEWED_BSA_MEASURE_FIXTURE") == "1"
     try:
-        import vdn_h3.hybrid as hybrid
+        from vdn_h3 import hybrid
         import vdn_h3.mixed_measure_epilogue as epilogue
     except Exception as exc:  # noqa: BLE001
         if required:

@@ -92,8 +92,8 @@ def _current_capability_fields(epilogue_module, capability, attention, index: in
             getattr(capability, "api", None) != 1
             or getattr(capability, "block_index", None) != index
             or getattr(capability, "out_proj", None) is not attention.out_proj
-            or int(getattr(capability, "heads")) != int(attention.heads)
-            or int(getattr(capability, "head_dim")) != int(attention.head_dim)
+            or int(capability.heads) != int(attention.heads)
+            or int(capability.head_dim) != int(attention.head_dim)
         ):
             return None
         state = capability.state
