@@ -684,7 +684,9 @@ def _measure_audit(
     except Exception:  # noqa: BLE001 - malformed/stale measure must be actual-only
         return None, "measure_contract_unproven"
 
-    vdn, vdn_reason = vdn_measure_compat.probe(model, external, block_count)
+    vdn, vdn_reason = vdn_measure_compat.probe(
+        model, external, block_count, options
+    )
     if vdn is None:
         return None, vdn_reason or "vdn_owner_unproven"
     if vdn.active and vdn_measure_compat.VDN_EPILOGUE_RECEIPTS_KEY in options:
