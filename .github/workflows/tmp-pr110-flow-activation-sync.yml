@@ -1,0 +1,156 @@
+name: tmp-pr110-flow-activation-sync
+
+on:
+  push:
+    branches:
+      - mirror/pr110-flow73863-activation-sync-20260911
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message == 'Temporary PR110 Flow activation synchronization harness'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mirror/pr110-flow73863-activation-sync-20260911
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Synchronize audited Flow profile semantics
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement, found {count}: {old[:120]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          path = "comfyui_spectrum_h3/core_bsa_flow_compat.py"
+          replace_once(
+              path,
+              '''AUDITED_FLOW_MIXED_GRID_GIT_BLOBS = frozenset(
+    {
+        "8fc0f753ff2cd21fae898a4dd3c9ab1025f98443",  # released v0.3.3
+        "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",  # PR #26 canonical layout propagation
+        "51b5bb068018f3336d1a036bd0065344788c3e6c",  # PR #30 explicit weighted measure profile
+    }
+)
+_FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS = frozenset(
+    {
+        "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",
+        "51b5bb068018f3336d1a036bd0065344788c3e6c",
+    }
+)
+''',
+              '''AUDITED_FLOW_MIXED_GRID_GIT_BLOBS = frozenset(
+    {
+        "8fc0f753ff2cd21fae898a4dd3c9ab1025f98443",  # released v0.3.3
+        "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",  # PR #26 canonical layout propagation
+        "3554fdeb02d3f662275bd54f99f197429e714138",  # PR #30 weighted runtime activation
+    }
+)
+_FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS = frozenset(
+    {
+        "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",
+        "3554fdeb02d3f662275bd54f99f197429e714138",
+    }
+)
+''',
+          )
+          replace_once(
+              path,
+              '''def _normalize_measure_profile(attention_measure: bool, raw_profile: Any) -> str | None:
+    if type(attention_measure) is not bool or type(raw_profile) is not str:
+        return None
+    if raw_profile == _FLOW_MEASURE_PROFILE_OFF and attention_measure:
+        return _FLOW_MEASURE_PROFILE_LEGACY
+    if raw_profile == _FLOW_MEASURE_PROFILE_LEGACY and not attention_measure:
+        return None
+    if raw_profile not in {
+        _FLOW_MEASURE_PROFILE_OFF,
+        _FLOW_MEASURE_PROFILE_LEGACY,
+        _FLOW_MEASURE_PROFILE_WEIGHTED,
+    }:
+        return None
+    return raw_profile
+''',
+              '''def _normalize_measure_profile(attention_measure: bool, raw_profile: Any) -> str | None:
+    if type(attention_measure) is not bool:
+        return None
+    if raw_profile is None:
+        # Released/pre-profile Flow sources expose only the historical boolean.
+        # Its true value is the frozen representative-K/V comparator and must
+        # never be reinterpreted as the all-row weighted operator.
+        return (
+            _FLOW_MEASURE_PROFILE_LEGACY
+            if attention_measure
+            else _FLOW_MEASURE_PROFILE_OFF
+        )
+    if type(raw_profile) is not str or raw_profile not in {
+        _FLOW_MEASURE_PROFILE_OFF,
+        _FLOW_MEASURE_PROFILE_LEGACY,
+        _FLOW_MEASURE_PROFILE_WEIGHTED,
+    }:
+        return None
+    # Once the explicit field exists it is authoritative and deliberately
+    # independent of Flow's separate representation/seam control boolean.
+    return raw_profile
+''',
+          )
+          replace_once(
+              path,
+              '        raw_measure_profile = getattr(plan, "measure_profile", _FLOW_MEASURE_PROFILE_OFF)\n',
+              '        raw_measure_profile = getattr(plan, "measure_profile", None)\n',
+          )
+
+          test_path = Path("tests/test_core_bsa_flow_compat.py")
+          text = test_path.read_text()
+          anchor = '''def test_reviewed_flow_layout_wrapper_is_unwrapped_to_bsa():
+'''
+          addition = '''def test_measure_profile_normalization_preserves_legacy_absence_and_explicit_modes():
+    normalize = core_bsa_flow_compat._normalize_measure_profile
+    assert normalize(True, None) == "legacy_representative_v1"
+    assert normalize(False, None) == "off"
+    assert normalize(True, "off") == "off"
+    assert normalize(False, "legacy_representative_v1") == "legacy_representative_v1"
+    assert normalize(False, "weighted_measure_v1") == "weighted_measure_v1"
+    assert normalize(True, "unknown") is None
+    assert normalize(True, False) is None
+
+
+'''
+          if text.count(anchor) != 1:
+              raise SystemExit("could not find test insertion anchor")
+          test_path.write_text(text.replace(anchor, addition + anchor, 1))
+
+          replace_once(
+              ".github/workflows/tests.yml",
+              '          ref: 860f308cc4f84f920d0c1facd4ece028584a02a0\n          path: FlowRegenerate\n',
+              '          ref: 73863e16e0742523679ca9cd566020a4570a5be4\n          path: FlowRegenerate\n',
+          )
+
+          import py_compile
+          for source in [
+              "comfyui_spectrum_h3/core_bsa_flow_compat.py",
+              "tests/test_core_bsa_flow_compat.py",
+          ]:
+              py_compile.compile(source, doraise=True)
+          PY
+      - name: Commit synchronized tree and remove temporary harness
+        shell: bash
+        run: |
+          rm .github/workflows/tmp-pr110-flow-activation-sync.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Synchronize weighted Flow runtime activation audit"
+          git push origin HEAD:mirror/pr110-flow73863-activation-sync-20260911
