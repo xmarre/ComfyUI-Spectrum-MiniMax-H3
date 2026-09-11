@@ -1,0 +1,154 @@
+name: VDN execution-context lifetime validation
+
+on:
+  push:
+    branches:
+      - ci/vdn-weighted-measure-20260911
+    paths:
+      - .github/workflows/vdn-layout-context-regression-dev.yml
+      - comfyui_spectrum_h3/vdn_measure_compat.py
+      - tests/test_core_bsa_vdn_measure_compat.py
+
+permissions:
+  contents: write
+
+jobs:
+  vdn-context-lifetime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/ComfyUI
+          ref: c00cd0acab821cd3f4479f02421c3c11331561f7
+          path: _deps/ComfyUI
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
+          ref: c86d74bcf139563b14257720259e4788e386aa5c
+          path: _deps/FlowRegenerate
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/ComfyUI-VDN-H3-Plus
+          ref: 6e0f1e22058ad0cd1c0ad02e2e34f742d99a0ef3
+          path: _deps/VDNH3Plus
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install \
+            pytest ruff numpy scipy torchsde psutil safetensors einops tqdm pyyaml pillow packaging \
+            transformers tokenizers sentencepiece aiohttp yarl alembic SQLAlchemy filelock \
+            "av>=17.0.0" requests simpleeval blake3 kornia spandrel pydantic pydantic-settings \
+            PyOpenGL comfy-angle "comfy-kitchen==0.2.33" "comfy-aimdo==0.5.3"
+
+      - name: Apply execution-context proof
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("comfyui_spectrum_h3/vdn_measure_compat.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''    gate_expected: tuple[bool, ...]\n    external_digest: str | None\n    expected_receipts: tuple[tuple[tuple[str, Any], ...], ...]\n'''
+          new = '''    gate_expected: tuple[bool, ...]\n    external_digest: str | None\n    external_counts: tuple[tuple[str, int], ...]\n    expected_receipts: tuple[tuple[tuple[str, Any], ...], ...]\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"audit dataclass anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''def _current_capability_fields(epilogue_module, capability, attention, index: int, external_digest: str):\n    try:\n'''
+          new = '''def _state_layout_matches_external(\n    state: Any, external_counts: tuple[tuple[str, int], ...]\n) -> bool:\n    counts = dict(external_counts)\n    layout = getattr(state, "layout", None)\n    if layout is None:\n        return False\n    try:\n        return (\n            int(layout.seq_len) == counts["native_sequence_rows"]\n            and int(layout.video_start) == counts["video_start"]\n            and int(layout.num_frames) == counts["temporal"]\n            and int(layout.tokens_per_frame) == counts["source_rows_per_frame"]\n        )\n    except (AttributeError, KeyError, TypeError, ValueError):\n        return False\n\n\ndef _current_capability_fields(\n    epilogue_module,\n    capability,\n    attention,\n    index: int,\n    external_digest: str,\n    external_counts: tuple[tuple[str, int], ...],\n):\n    try:\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"capability helper anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''        cfg = state.cfg\n        if not isinstance(cfg, Mapping):\n            return None\n        gate_expected = bool(branch is not None and cfg.get("enable_softmax_gate", True))\n'''
+          new = '''        cfg = state.cfg\n        if not isinstance(cfg, Mapping):\n            return None\n        if not _state_layout_matches_external(state, external_counts):\n            return None\n        gate_expected = bool(branch is not None and cfg.get("enable_softmax_gate", True))\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"layout runtime proof anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''            gate_expected=(),\n            external_digest=None,\n            expected_receipts=(),\n'''
+          new = '''            gate_expected=(),\n            external_digest=None,\n            external_counts=(),\n            expected_receipts=(),\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"inactive audit anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''    external_digest = _external_digest(epilogue, external)\n    if external_digest is None:\n        return None, "vdn_external_digest_unproven"\n\n    capabilities = []\n'''
+          new = '''    external_digest = _external_digest(epilogue, external)\n    if external_digest is None:\n        return None, "vdn_external_digest_unproven"\n    external_counts = tuple(\n        (name, int(external[name])) for name in _EXTERNAL_COUNT_FIELDS\n    )\n\n    capabilities = []\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"external counts anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''        fields = _current_capability_fields(\n            epilogue, capability, attention, index, external_digest\n        )\n        if fields is None:\n            return None, "vdn_epilogue_owner_unproven"\n'''
+          new = '''        if not _state_layout_matches_external(capability.state, external_counts):\n            return None, "vdn_execution_context_unproven"\n        fields = _current_capability_fields(\n            epilogue, capability, attention, index, external_digest, external_counts\n        )\n        if fields is None:\n            return None, "vdn_epilogue_owner_unproven"\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"probe capability anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''        gate_expected=tuple(gate_expected),\n        external_digest=external_digest,\n        expected_receipts=tuple(expected_receipts),\n'''
+          new = '''        gate_expected=tuple(gate_expected),\n        external_digest=external_digest,\n        external_counts=external_counts,\n        expected_receipts=tuple(expected_receipts),\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"active audit anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          old = '''        audit.attentions[index],\n        index,\n        audit.external_digest,\n    )\n'''
+          new = '''        audit.attentions[index],\n        index,\n        audit.external_digest,\n        audit.external_counts,\n    )\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"runtime fields anchor count: {text.count(old)}")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          path = Path("tests/test_core_bsa_vdn_measure_compat.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''        state = SimpleNamespace(\n            name="spectrum-vdn-fixture",\n            cfg={"enable_softmax_gate": True},\n            branches=branches,\n            managed_weights=None,\n            layout=None,\n        )\n'''
+          new = '''        state = SimpleNamespace(\n            name="spectrum-vdn-fixture",\n            cfg={"enable_softmax_gate": True},\n            branches=branches,\n            managed_weights=None,\n            layout=SimpleNamespace(\n                seq_len=160,\n                video_start=96,\n                num_frames=2,\n                tokens_per_frame=32,\n            ),\n        )\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f"VDN state fixture anchor count: {text.count(old)}")
+          text = text.replace(old, new, 1)
+
+          anchor = '''def test_vdn_config_change_after_preflight_invalidates_runtime_owner(monkeypatch):\n    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)\n    audit, reason = core_bsa_compat.probe(options, _layout(), model)\n    assert reason is None and audit is not None and audit.measure is not None\n\n    state.cfg["enable_softmax_gate"] = False\n    assert not vdn_measure_compat.runtime_matches(audit.measure.vdn, 0)\n    assert not core_bsa_compat._measure_runtime_matches(\n        audit, 0, options, sparse_selected=True\n    )\n\n\n'''
+          addition = anchor + '''def test_vdn_execution_context_must_be_active_at_preflight(monkeypatch):\n    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)\n    state.layout = None\n\n    audit, reason = core_bsa_compat.probe(options, _layout(), model)\n\n    assert audit is None\n    assert reason == "vdn_execution_context_unproven"\n\n\ndef test_vdn_execution_context_loss_after_preflight_invalidates_runtime(monkeypatch):\n    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)\n    audit, reason = core_bsa_compat.probe(options, _layout(), model)\n    assert reason is None and audit is not None and audit.measure is not None\n\n    state.layout = None\n    assert not vdn_measure_compat.runtime_matches(audit.measure.vdn, 0)\n    assert not core_bsa_compat._measure_runtime_matches(\n        audit, 0, options, sparse_selected=True\n    )\n\n\ndef test_vdn_execution_context_geometry_change_invalidates_runtime(monkeypatch):\n    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)\n    audit, reason = core_bsa_compat.probe(options, _layout(), model)\n    assert reason is None and audit is not None and audit.measure is not None\n\n    state.layout.tokens_per_frame = 31\n    assert not vdn_measure_compat.runtime_matches(audit.measure.vdn, 0)\n\n\n'''
+          if text.count(anchor) != 1:
+              raise SystemExit(f"VDN config-test anchor count: {text.count(anchor)}")
+          path.write_text(text.replace(anchor, addition, 1), encoding="utf-8")
+          PY
+
+      - name: Ruff and compile
+        run: |
+          python -m ruff check \
+            comfyui_spectrum_h3/vdn_measure_compat.py \
+            tests/test_core_bsa_vdn_measure_compat.py \
+            --fix --ignore N999,I001,C408,UP035
+          python -m compileall -q \
+            comfyui_spectrum_h3/vdn_measure_compat.py \
+            tests/test_core_bsa_vdn_measure_compat.py
+
+      - name: Run VDN measure regressions
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
+          PYTHONPATH: ${{ github.workspace }}/_deps/ComfyUI:${{ github.workspace }}/_deps/FlowRegenerate:${{ github.workspace }}/_deps/VDNH3Plus:${{ github.workspace }}
+          SPECTRUM_REQUIRE_REVIEWED_BSA_MEASURE_FIXTURE: "1"
+        run: python -m pytest -q tests/test_core_bsa_vdn_measure_compat.py
+
+      - name: Checkpoint validated source changes
+        run: |
+          if ! git diff --quiet -- comfyui_spectrum_h3/vdn_measure_compat.py tests/test_core_bsa_vdn_measure_compat.py; then
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add comfyui_spectrum_h3/vdn_measure_compat.py tests/test_core_bsa_vdn_measure_compat.py
+            git commit -m "Bind VDN measure audit to active layout context"
+            git push origin HEAD:ci/vdn-weighted-measure-20260911
+          fi
