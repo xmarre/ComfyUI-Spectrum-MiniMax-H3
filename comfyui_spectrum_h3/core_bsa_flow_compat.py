@@ -422,7 +422,7 @@ def _audited_mixed_wrapper(
         return None
     metrics = closure["metrics"]
     if not callable(getattr(metrics, "increment", None)) or not callable(
-        getattr(metrics, "event", None
+        getattr(metrics, "event", None)
     ):
         return None
     plan_generation = core_bsa_compat._lifetime_generation(plan)
