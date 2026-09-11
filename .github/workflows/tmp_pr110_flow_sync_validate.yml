@@ -1,0 +1,126 @@
+name: temporary PR110 Flow synchronization validation
+
+on:
+  push:
+    branches:
+      - mirror/pr110-flow8dfb-sync-20260911
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Spectrum mirror
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Apply synchronization candidate in workspace
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('comfyui_spectrum_h3/core_bsa_flow_compat.py')
+          text = path.read_text()
+
+          old = '''        "51b5bb068018f3336d1a036bd0065344788c3e6c",  # PR #30 explicit weighted measure profile\n    }\n)\n_FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS = frozenset(\n    {\n        "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",\n        "51b5bb068018f3336d1a036bd0065344788c3e6c",\n    }\n)\n'''
+          new = '''        "51b5bb068018f3336d1a036bd0065344788c3e6c",  # PR #30 first explicit weighted profile\n        "41586100e74e43e2efbfc3ef30a9540647f1c8f6",  # PR #30 authoritative optional profile semantics\n    }\n)\n_FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS = frozenset(\n    {\n        "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",\n        "51b5bb068018f3336d1a036bd0065344788c3e6c",\n        "41586100e74e43e2efbfc3ef30a9540647f1c8f6",\n    }\n)\n_FLOW_EXPLICIT_PROFILE_AUTHORITATIVE_BLOBS = frozenset(\n    {"41586100e74e43e2efbfc3ef30a9540647f1c8f6"}\n)\n'''
+          if old not in text:
+              raise SystemExit('audited Flow blob block no longer matches expected source')
+          text = text.replace(old, new, 1)
+
+          old = '''def _normalize_measure_profile(attention_measure: bool, raw_profile: Any) -> str | None:\n    if type(attention_measure) is not bool or type(raw_profile) is not str:\n        return None\n    if raw_profile == _FLOW_MEASURE_PROFILE_OFF and attention_measure:\n        return _FLOW_MEASURE_PROFILE_LEGACY\n    if raw_profile == _FLOW_MEASURE_PROFILE_LEGACY and not attention_measure:\n        return None\n    if raw_profile not in {\n        _FLOW_MEASURE_PROFILE_OFF,\n        _FLOW_MEASURE_PROFILE_LEGACY,\n        _FLOW_MEASURE_PROFILE_WEIGHTED,\n    }:\n        return None\n    return raw_profile\n'''
+          new = '''def _normalize_measure_profile(\n    attention_measure: bool, raw_profile: Any, *, source_blob: str\n) -> str | None:\n    if type(attention_measure) is not bool:\n        return None\n    if source_blob not in AUDITED_FLOW_MIXED_GRID_GIT_BLOBS:\n        return None\n    if source_blob in _FLOW_EXPLICIT_PROFILE_AUTHORITATIVE_BLOBS:\n        if raw_profile is None:\n            return (\n                _FLOW_MEASURE_PROFILE_LEGACY\n                if attention_measure\n                else _FLOW_MEASURE_PROFILE_OFF\n            )\n        if type(raw_profile) is not str:\n            return None\n        if raw_profile not in {\n            _FLOW_MEASURE_PROFILE_OFF,\n            _FLOW_MEASURE_PROFILE_LEGACY,\n            _FLOW_MEASURE_PROFILE_WEIGHTED,\n        }:\n            return None\n        return raw_profile\n\n    if type(raw_profile) is not str:\n        return None\n    if raw_profile == _FLOW_MEASURE_PROFILE_OFF and attention_measure:\n        return _FLOW_MEASURE_PROFILE_LEGACY\n    if raw_profile == _FLOW_MEASURE_PROFILE_LEGACY and not attention_measure:\n        return None\n    if raw_profile not in {\n        _FLOW_MEASURE_PROFILE_OFF,\n        _FLOW_MEASURE_PROFILE_LEGACY,\n        _FLOW_MEASURE_PROFILE_WEIGHTED,\n    }:\n        return None\n    return raw_profile\n'''
+          if old not in text:
+              raise SystemExit('measure profile normalizer no longer matches expected source')
+          text = text.replace(old, new, 1)
+
+          old = 'def _plan_geometry(plan: Any) -> dict[str, Any] | None:\n'
+          new = 'def _plan_geometry(plan: Any, *, source_blob: str) -> dict[str, Any] | None:\n'
+          if old not in text:
+              raise SystemExit('plan geometry signature no longer matches expected source')
+          text = text.replace(old, new, 1)
+
+          old = '        raw_measure_profile = getattr(plan, "measure_profile", _FLOW_MEASURE_PROFILE_OFF)\n'
+          new = '''        raw_measure_profile = getattr(\n            plan,\n            "measure_profile",\n            None\n            if source_blob in _FLOW_EXPLICIT_PROFILE_AUTHORITATIVE_BLOBS\n            else _FLOW_MEASURE_PROFILE_OFF,\n        )\n'''
+          if old not in text:
+              raise SystemExit('profile getter no longer matches expected source')
+          text = text.replace(old, new, 1)
+
+          old = '    measure_profile = _normalize_measure_profile(attention_measure, raw_measure_profile)\n'
+          new = '''    measure_profile = _normalize_measure_profile(\n        attention_measure, raw_measure_profile, source_blob=source_blob\n    )\n'''
+          if old not in text:
+              raise SystemExit('profile normalization call no longer matches expected source')
+          text = text.replace(old, new, 1)
+
+          old = '    geometry = _plan_geometry(plan)\n'
+          new = '    geometry = _plan_geometry(plan, source_blob=blob)\n'
+          if old not in text:
+              raise SystemExit('plan geometry call no longer matches expected source')
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+
+          tests = Path('tests/test_core_bsa_flow_compat.py')
+          test_text = tests.read_text()
+          sentinel = 'def test_measure_profile_semantics_follow_reviewed_flow_source_revision():'
+          if sentinel in test_text:
+              raise SystemExit('synchronization tests unexpectedly already present')
+          test_text += '''\n\n\ndef test_measure_profile_semantics_follow_reviewed_flow_source_revision():\n    old_blob = "51b5bb068018f3336d1a036bd0065344788c3e6c"\n    new_blob = "41586100e74e43e2efbfc3ef30a9540647f1c8f6"\n\n    assert core_bsa_flow_compat._normalize_measure_profile(\n        True,\n        core_bsa_flow_compat._FLOW_MEASURE_PROFILE_OFF,\n        source_blob=old_blob,\n    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_LEGACY\n    assert (\n        core_bsa_flow_compat._normalize_measure_profile(\n            False,\n            core_bsa_flow_compat._FLOW_MEASURE_PROFILE_LEGACY,\n            source_blob=old_blob,\n        )\n        is None\n    )\n\n    assert core_bsa_flow_compat._normalize_measure_profile(\n        True, None, source_blob=new_blob\n    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_LEGACY\n    assert core_bsa_flow_compat._normalize_measure_profile(\n        False, None, source_blob=new_blob\n    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_OFF\n    assert core_bsa_flow_compat._normalize_measure_profile(\n        True,\n        core_bsa_flow_compat._FLOW_MEASURE_PROFILE_OFF,\n        source_blob=new_blob,\n    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_OFF\n    assert core_bsa_flow_compat._normalize_measure_profile(\n        False,\n        core_bsa_flow_compat._FLOW_MEASURE_PROFILE_LEGACY,\n        source_blob=new_blob,\n    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_LEGACY\n    assert core_bsa_flow_compat._normalize_measure_profile(\n        False,\n        core_bsa_flow_compat._FLOW_MEASURE_PROFILE_WEIGHTED,\n        source_blob=new_blob,\n    ) == core_bsa_flow_compat._FLOW_MEASURE_PROFILE_WEIGHTED\n\n\ndef test_explicit_off_profile_is_authoritative_over_legacy_flag(monkeypatch):\n    _attention, mixed_module = _flow_modules()\n    if (\n        core_bsa_compat._module_blob_sha(mixed_module)\n        not in core_bsa_flow_compat._FLOW_EXPLICIT_PROFILE_AUTHORITATIVE_BLOBS\n    ):\n        pytest.skip("Flow fixture predates authoritative optional profile semantics")\n\n    model, _patch, _override, options = _installation(sigma=0.5)\n    monkeypatch.setattr(\n        core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True\n    )\n    options, carrier, _mixed = _wrap_mixed(\n        options,\n        model,\n        attention_measure=True,\n        measure_profile=mixed_module.MIXED_GRID_MEASURE_PROFILE_OFF,\n    )\n    audit, reason = core_bsa_flow_compat.probe(options, carrier, model)\n    assert reason is None and audit is not None and audit.safe\n    assert audit.measure is None\n    plan = core_bsa_compat._closure_values(\n        options["patches_replace"]["dit"][("double_block", 0)]\n    )["plan"]\n    assert (\n        mixed_module.mixed_attention_measure_profile(plan)\n        == mixed_module.MIXED_GRID_MEASURE_PROFILE_OFF\n    )\n\n\ndef test_explicit_legacy_profile_is_authoritative_without_legacy_flag(monkeypatch):\n    _attention, mixed_module = _flow_modules()\n    if (\n        core_bsa_compat._module_blob_sha(mixed_module)\n        not in core_bsa_flow_compat._FLOW_EXPLICIT_PROFILE_AUTHORITATIVE_BLOBS\n    ):\n        pytest.skip("Flow fixture predates authoritative optional profile semantics")\n\n    model, _patch, _override, options = _installation(sigma=0.5)\n    monkeypatch.setattr(\n        core_bsa_compat, "_sparse_runtime_eligible", lambda _model, _module: True\n    )\n    options, carrier, _mixed = _wrap_mixed(\n        options,\n        model,\n        attention_measure=False,\n        measure_profile=mixed_module.MIXED_GRID_MEASURE_PROFILE_LEGACY,\n    )\n    audit, reason = core_bsa_flow_compat.probe(options, carrier, model)\n    assert reason is None and audit is not None and audit.safe\n    assert audit.measure is None\n    plan = core_bsa_compat._closure_values(\n        options["patches_replace"]["dit"][("double_block", 0)]\n    )["plan"]\n    assert (\n        mixed_module.mixed_attention_measure_profile(plan)\n        == mixed_module.MIXED_GRID_MEASURE_PROFILE_LEGACY\n    )\n'''
+          tests.write_text(test_text)
+          PY
+
+          git diff --check
+
+      - name: Check out reviewed ComfyUI Core companion
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/ComfyUI
+          ref: 8406da920f9df19cbc14b76aef1bcd3dc4cf1119
+          path: _deps/ComfyUI
+
+      - name: Check out synchronized Flow PR 30 head
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
+          ref: 8dfb7a2e570458b5078734755b897c7e89ddac8c
+          path: _deps/Flow
+
+      - name: Check out reviewed VDN companion
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/ComfyUI-VDN-H3-Plus
+          ref: d5f158a1c1750d79b37cb6ef22b0f14e6a8cbad6
+          path: _deps/VDN
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install targeted environment
+        run: |
+          python -m pip install torch==2.10.0+cpu torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r _deps/ComfyUI/requirements.txt
+          python -m pip install pytest ruff
+
+      - name: Validate source gate and weighted history companions
+        env:
+          COMFYUI_PATH: "${{ github.workspace }}/_deps/ComfyUI"
+          PYTHONPATH: "${{ github.workspace }}:${{ github.workspace }}/_deps/ComfyUI:${{ github.workspace }}/_deps/Flow:${{ github.workspace }}/_deps/VDN"
+        run: |
+          python -m ruff check comfyui_spectrum_h3/core_bsa_flow_compat.py tests/test_core_bsa_flow_compat.py --ignore I001
+          python -m pytest -q tests/test_core_bsa_flow_compat.py tests/test_core_bsa_measure_history.py tests/test_core_bsa_measure_receipt_identity.py tests/test_core_bsa_vdn_measure_compat.py
+
+      - name: Upload validated synchronization candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr110-flow8dfb-sync
+          path: |
+            comfyui_spectrum_h3/core_bsa_flow_compat.py
+            tests/test_core_bsa_flow_compat.py
+          if-no-files-found: error
