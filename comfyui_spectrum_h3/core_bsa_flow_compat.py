@@ -8,6 +8,7 @@ chain without depending on inference-tensor version counters.
 """
 from __future__ import annotations
 
+from math import gcd
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -24,11 +25,20 @@ AUDITED_FLOW_MIXED_GRID_GIT_BLOBS = frozenset(
     {
         "8fc0f753ff2cd21fae898a4dd3c9ab1025f98443",  # released v0.3.3
         "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",  # PR #26 canonical layout propagation
+        "51b5bb068018f3336d1a036bd0065344788c3e6c",  # PR #30 explicit weighted measure profile
     }
 )
 _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS = frozenset(
-    {"66c59f26ad41154fcce7e1ce5250fa233a96dc3b"}
+    {
+        "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",
+        "51b5bb068018f3336d1a036bd0065344788c3e6c",
+    }
 )
+_FLOW_MEASURE_PROFILE_OFF = "off"
+_FLOW_MEASURE_PROFILE_LEGACY = "legacy_representative_v1"
+_FLOW_MEASURE_PROFILE_WEIGHTED = "weighted_measure_v1"
+_ATTENTION_MEASURE_KEY = "attention_measure_v1"
+_VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
 _FLOW_ATTENTION_TOPLEVEL = "h3_flow_regenerate.attention"
 _FLOW_ATTENTION_SUFFIX = ".h3_flow_regenerate.attention"
 _FLOW_MIXED_TOPLEVEL = "h3_flow_regenerate.mixed_grid"
@@ -156,6 +166,22 @@ def _audited_layout_wrapper(
     )
 
 
+def _normalize_measure_profile(attention_measure: bool, raw_profile: Any) -> str | None:
+    if type(attention_measure) is not bool or type(raw_profile) is not str:
+        return None
+    if raw_profile == _FLOW_MEASURE_PROFILE_OFF and attention_measure:
+        return _FLOW_MEASURE_PROFILE_LEGACY
+    if raw_profile == _FLOW_MEASURE_PROFILE_LEGACY and not attention_measure:
+        return None
+    if raw_profile not in {
+        _FLOW_MEASURE_PROFILE_OFF,
+        _FLOW_MEASURE_PROFILE_LEGACY,
+        _FLOW_MEASURE_PROFILE_WEIGHTED,
+    }:
+        return None
+    return raw_profile
+
+
 def _plan_geometry(plan: Any) -> dict[str, Any] | None:
     try:
         prefix = plan.prefix
@@ -164,6 +190,7 @@ def _plan_geometry(plan: Any) -> dict[str, Any] | None:
         source_h = plan.source_h
         source_w = plan.source_w
         attention_measure = plan.attention_measure
+        raw_measure_profile = getattr(plan, "measure_profile", _FLOW_MEASURE_PROFILE_OFF)
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
     if not torch.is_tensor(prefix) or prefix.ndim != 5:
@@ -176,6 +203,9 @@ def _plan_geometry(plan: Any) -> dict[str, Any] | None:
         or type(source_w) is not int
         or type(attention_measure) is not bool
     ):
+        return None
+    measure_profile = _normalize_measure_profile(attention_measure, raw_measure_profile)
+    if measure_profile is None:
         return None
     prefix_t = int(prefix.shape[2])
     target_h, target_w = map(int, prefix.shape[-2:])
@@ -202,14 +232,54 @@ def _plan_geometry(plan: Any) -> dict[str, Any] | None:
         "target_rows": target_rows,
         "mixed_rows": mixed_rows,
         "attention_measure": attention_measure,
+        "measure_profile": measure_profile,
     }
 
 
 def _expected_measure_contract(
     geometry: dict[str, Any], *, video_start: int, sequence_rows: int
 ) -> dict[str, Any] | None:
-    if not geometry["attention_measure"]:
+    profile = geometry["measure_profile"]
+    if profile == _FLOW_MEASURE_PROFILE_OFF:
         return None
+    if profile == _FLOW_MEASURE_PROFILE_WEIGHTED:
+        source_rows = geometry["source_rows"]
+        target_rows = geometry["target_rows"]
+        common = gcd(source_rows, target_rows)
+        prefix_stop = video_start + geometry["prefix_t"] * target_rows
+        segments = [
+            {"start": 0, "stop": video_start, "mass_num": 1, "mass_den": 1},
+            {
+                "start": video_start,
+                "stop": prefix_stop,
+                "mass_num": source_rows // common,
+                "mass_den": target_rows // common,
+            },
+        ]
+        if prefix_stop < sequence_rows:
+            segments.append(
+                {
+                    "start": prefix_stop,
+                    "stop": sequence_rows,
+                    "mass_num": 1,
+                    "mass_den": 1,
+                }
+            )
+        return {
+            "api": 1,
+            "operator": "key_log_measure",
+            "normalization": "h3_native_source_carrier_v1",
+            "topology": "mixed_grid_low_suffix",
+            "q_rows": sequence_rows,
+            "kv_rows": sequence_rows,
+            "video_start": video_start,
+            "temporal": geometry["temporal"],
+            "prefix_t": geometry["prefix_t"],
+            "source_grid": [geometry["source_h"] // 2, geometry["source_w"] // 2],
+            "prefix_grid": [geometry["target_h"] // 2, geometry["target_w"] // 2],
+            "segments": segments,
+            "coordinate_policy": "minimax_h3_native_frame_grid_v1",
+        }
     return {
         "api": 1,
         "mode": "prefix_kv_stratified_subsample",
@@ -227,6 +297,23 @@ def _expected_measure_contract(
         + geometry["temporal"] * geometry["source_rows"],
         "exact_prefix_queries_preserved": True,
         "suffix_kv_unchanged": True,
+    }
+
+
+def _expected_external_sequence(
+    geometry: dict[str, Any], *, video_start: int, native_sequence_rows: int, sequence_rows: int
+) -> dict[str, Any]:
+    return {
+        "api": 2,
+        "mode": "dense_gate_no_linear",
+        "topology": "mixed_grid_low_suffix",
+        "native_sequence_rows": native_sequence_rows,
+        "sequence_rows": sequence_rows,
+        "video_start": video_start,
+        "temporal": geometry["temporal"],
+        "prefix_t": geometry["prefix_t"],
+        "source_rows_per_frame": geometry["source_rows"],
+        "prefix_rows_per_frame": geometry["target_rows"],
     }
 
 
@@ -366,6 +453,8 @@ def _audited_mixed_wrapper(
         "native": native,
         "inner": model,
         "measure_contract": expected_measure,
+        "measure_profile": geometry["measure_profile"],
+        "geometry": geometry,
         "old_prefix": closure["old_prefix"],
         "va": va,
         "vb": vb,
@@ -532,6 +621,8 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
                     or item["native"] is not mixed["native"]
                     or item["inner"] is not mixed["inner"]
                     or item["measure_contract"] != mixed["measure_contract"]
+                    or item["measure_profile"] != mixed["measure_profile"]
+                    or item["geometry"] != mixed["geometry"]
                     or item["old_prefix"] != mixed["old_prefix"]
                     or item["va"] != mixed["va"]
                     or item["vb"] != mixed["vb"]
@@ -543,6 +634,16 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
         normalized_patches["dit"] = normalized_dit
         normalized["patches_replace"] = normalized_patches
         audit_layout = _effective_mixed_layout(mixed, layout) if mixed is not None else layout
+        if mixed is not None and mixed["measure_profile"] == _FLOW_MEASURE_PROFILE_WEIGHTED:
+            if _ATTENTION_MEASURE_KEY in options or _VDN_EXTERNAL_SEQUENCE_KEY in options:
+                return None, "flow_weighted_measure_ownership_conflict"
+            normalized[_ATTENTION_MEASURE_KEY] = mixed["measure_contract"]
+            normalized[_VDN_EXTERNAL_SEQUENCE_KEY] = _expected_external_sequence(
+                mixed["geometry"],
+                video_start=mixed["va"],
+                native_sequence_rows=mixed["carrier_seq"],
+                sequence_rows=mixed["mixed_seq"],
+            )
         audit, reason = core_bsa_compat.probe(normalized, audit_layout, model)
         if audit is None:
             return None, reason
@@ -608,7 +709,7 @@ def _pool_entry(
 ) -> tuple[Any, ...]:
     return core_bsa_compat._pool_entry(
         audit.patch,
-        (index, audit.seq_len, audit.uuids),
+        core_bsa_compat._pool_key(audit, index),
         audit.pool_specs[index],
     )
 
@@ -677,6 +778,7 @@ def _make_actual_wrapper(
     )
 
     def audited_replacement(args, replacement_context):
+        vdn_before = core_bsa_compat._vdn_receipt_before(audit)
         try:
             metadata_ok = _current_metadata_matches(audit, index, args)
             before = _pool_entry(audit, index)
@@ -698,9 +800,17 @@ def _make_actual_wrapper(
             output = replacement(args, replacement_context)
         else:
             def audited_original_block(call_args):
-                nonlocal sparse_selected, original_block_calls
+                nonlocal sparse_selected, original_block_calls, metadata_ok
                 original_block_calls += 1
                 sparse_selected = call_args.get("attention") is expected_attention
+                if not core_bsa_compat._measure_runtime_matches(
+                    audit,
+                    index,
+                    call_args.get("transformer_options"),
+                    sparse_selected=sparse_selected,
+                ):
+                    metadata_ok = False
+                    audit.failure = "actual_measure_metadata_failed"
                 if sparse_selected:
                     from .bsa_transition_probe import attention
                     call_args = {**call_args, "attention": attention(expected_attention, audit, index)}
@@ -719,19 +829,23 @@ def _make_actual_wrapper(
                 after,
                 sparse_selected=sparse_selected,
             )
-            expected_route, expected_sink, expected_sink_q = audit.route_specs[index]
-            if not metadata_ok or observed != expected_route:
-                audit.failure = "actual_route_mismatch"
+            vdn_ok, vdn_fields = core_bsa_compat._vdn_receipt_after(
+                audit, index, observed, vdn_before
+            )
+            expected_route, _expected_sink, _expected_sink_q = audit.route_specs[index]
+            if not vdn_ok:
+                audit.failure = "actual_vdn_epilogue_receipt_failed"
+            if not metadata_ok or observed != expected_route or not vdn_ok:
+                audit.failure = audit.failure or "actual_route_mismatch"
             receipts.append(
-                (
-                    core_bsa_compat.ADAPTER_KEY,
-                    core_bsa_compat.ADAPTER_VERSION,
-                    audit.patch_generation,
+                core_bsa_compat._receipt(
+                    audit,
                     index,
                     observed,
-                    audit.seq_len,
-                    expected_sink,
-                    expected_sink_q,
+                    completed=bool(
+                        metadata_ok and observed == expected_route and vdn_ok
+                    ),
+                    vdn_fields=vdn_fields,
                 )
             )
         except torch.cuda.OutOfMemoryError:
@@ -750,7 +864,9 @@ def instrument_actual_options(
 ) -> dict[str, Any]:
     if not hasattr(audit, "flow_wrapper_specs"):
         return core_bsa_compat.instrument_actual_options(options, audit, receipts_key)
-    prepared = dict(options)
+    prepared = core_bsa_compat._prepare_vdn_receipt_sink(dict(options), audit)
+    if audit.failure is not None:
+        return prepared
     receipts = prepared.get(receipts_key)
     patches = prepared.get("patches_replace")
     if not isinstance(receipts, list) or not isinstance(patches, dict):

@@ -91,7 +91,7 @@ def _capture_transition_proof(runtime, run_id: int, step_id: int, audit, receipt
     for index in sparse:
         entry = core_bsa_compat._pool_entry(
             audit.patch,
-            (index, audit.seq_len, audit.uuids),
+            core_bsa_compat._pool_key(audit, index),
             audit.pool_specs[index],
         )
         if entry[0] != "present":
@@ -154,7 +154,7 @@ def _prove_forecast_carry(runtime, run_id: int, step_id: int, audit, identity, s
     for index, owners in zip(sparse, proof.owners):
         entry = core_bsa_compat._pool_entry(
             audit.patch,
-            (index, audit.seq_len, audit.uuids),
+            core_bsa_compat._pool_key(audit, index),
             audit.pool_specs[index],
         )
         if (

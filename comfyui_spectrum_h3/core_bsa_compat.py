@@ -21,20 +21,49 @@ import weakref
 
 import torch
 
+from . import vdn_measure_compat
+
 ADAPTER_KEY = "spectrum_core_bsa_v1"
 ADAPTER_VERSION = 1
 PRIVATE_AUDIT_KEY = "_spectrum_core_bsa_audit_v1"
 
-# Comfy-Org/ComfyUI comfy_extras/nodes_sparse_attention.py as reviewed at
-# be92396834f9b6e3e361cfe30e7eed693137a448 (unchanged from its parent).
-# Any source change is actual-only until the new implementation is audited.
+# Comfy-Org/ComfyUI comfy_extras/nodes_sparse_attention.py sources reviewed
+# for Spectrum numerical-history compatibility. The second blob is the generic
+# attention-measure implementation from ComfyUI PR #16239; unreviewed sources
+# remain actual-only.
 AUDITED_BSA_GIT_BLOBS = frozenset(
-    {"006d1eb352f946a7c85595edf75d3cda9ac79194"}
+    {
+        "006d1eb352f946a7c85595edf75d3cda9ac79194",
+        "a2b0d601529d776265b7b37cfe49b804158ae4a2",
+    }
 )
+MEASURE_CAPABLE_BSA_GIT_BLOBS = frozenset(
+    {"a2b0d601529d776265b7b37cfe49b804158ae4a2"}
+)
+# Only the optional-VDN-correct adapter is forecast-audited. The earlier
+# attention-measure adapter conflated Flow's API-2 geometry contract with VDN
+# ownership and can therefore fail a valid weighted Flow+BSA execution without
+# VDN; it remains actual-only rather than inheriting this proof.
+AUDITED_BSA_MEASURE_GIT_BLOBS = frozenset(
+    {"50a8c5a8901b1a43342d5eef0c2fdc256a1b1cbe"}
+)
+AUDITED_ATTENTION_MEASURE_GIT_BLOBS = frozenset(
+    {"439f2798f8514d38ea56f12c330068b78e8fa539"}
+)
+ATTENTION_MEASURE_KEY = "attention_measure_v1"
+ATTENTION_MEASURE_CAPABILITIES_KEY = "attention_measure_capabilities_v1"
+CORE_BSA_MEASURE_PROVIDER = "comfy.core.block_sparse_attention"
+SPARSE_MEASURE_PROFILE = "weighted_exact_blocks_v1"
+SPARSE_MEASURE_ROUTE = "core_bsa_h3_chunked"
+SPARSE_MEASURE_PREPROCESS = "core_h3_chunked_rms_rope_split_half_v1"
+DENSE_MEASURE_PROFILE = "dense_exact_v1"
+DENSE_MEASURE_ROUTE = "core_dense_sdpa"
+DENSE_MEASURE_PREPROCESS = "caller_attention_domain_v1"
 
 _MISSING = object()
 _IDENTITY_LOCK = threading.RLock()
 _IDENTITY_COUNTER = itertools.count(1)
+_MEASURE_CALL_COUNTER = itertools.count(1)
 _IDENTITY_REGISTRY: dict[int, tuple[weakref.ReferenceType[Any] | None, int, Any | None]] = {}
 
 
@@ -80,6 +109,29 @@ def _lifetime_generation(value: Any) -> int:
         return generation
 
 
+@dataclass(frozen=True)
+class CoreBSAMeasureAudit:
+    bsa_module: Any
+    adapter: Any
+    core: Any
+    capability: Any
+    semantic_digest: str
+    normalized_request: Any
+    external_sequence: Any
+    owner_generation: str
+    provider_identity: str
+    q_rows: int
+    kv_rows: int
+    exact_k_block_range: tuple[int, int]
+    exact_range_digest: str
+    pool_keys: tuple[tuple[Any, ...], ...]
+    call_tokens: tuple[tuple[int, int], ...]
+    core_blob: str
+    adapter_blob: str
+    chunked_key_bias: bool
+    vdn: vdn_measure_compat.VDNMeasureAudit
+
+
 @dataclass
 class CoreBSAAudit:
     identity: tuple[Any, ...]
@@ -96,7 +148,9 @@ class CoreBSAAudit:
     expected_receipts: tuple[tuple[Any, ...], ...]
     source_blob: str
     current_override: Any
+    measure: CoreBSAMeasureAudit | None = None
     failure: str | None = None
+    vdn_receipts: list[Any] | None = None
 
 
 def has_core_bsa_callback(options: dict[str, Any]) -> bool:
@@ -527,6 +581,329 @@ def _replacement_ownership(
     )
 
 
+def _measure_audit(
+    module: Any,
+    source_blob: str,
+    patch: Any,
+    options: dict[str, Any],
+    layout: Any,
+    model: Any,
+    seq_len: int,
+    uuids: tuple[Any, ...],
+    layout_identity: tuple[Any, ...],
+    block_count: int,
+) -> tuple[CoreBSAMeasureAudit | None, str | None]:
+    request = options.get(ATTENTION_MEASURE_KEY, _MISSING)
+    if request is _MISSING:
+        return None, None
+    if source_blob not in MEASURE_CAPABLE_BSA_GIT_BLOBS:
+        return None, "measure_bsa_source_unreviewed"
+
+    adapter = getattr(module, "measure", None)
+    if adapter is None:
+        return None, "measure_adapter_missing"
+    try:
+        core = importlib.import_module("comfy.attention_measure")
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception:  # noqa: BLE001 - source-gated optional contract
+        return None, "measure_core_missing"
+
+    adapter_blob = _module_blob_sha(adapter)
+    core_blob = _module_blob_sha(core)
+    if adapter_blob not in AUDITED_BSA_MEASURE_GIT_BLOBS:
+        return None, "measure_adapter_source_unreviewed"
+    if core_blob not in AUDITED_ATTENTION_MEASURE_GIT_BLOBS:
+        return None, "measure_core_source_unreviewed"
+
+    required_adapter = (
+        "ATTENTION_MEASURE_KEY",
+        "PROVIDER_IDENTITY",
+        "Capability",
+        "VDN_EXTERNAL_SEQUENCE_KEY",
+        "VDN_FORWARD_MARKER",
+        "VDN_EXTERNAL_SEQUENCE_API_ATTR",
+        "supports_key_bias",
+    )
+    required_core = (
+        "ATTENTION_MEASURE_CAPABILITIES_KEY",
+        "normalize",
+        "semantic_digest",
+        "validate_h3",
+        "merge_exact_k_blocks",
+    )
+    if any(not hasattr(adapter, name) for name in required_adapter) or any(
+        not hasattr(core, name) for name in required_core
+    ):
+        return None, "measure_source_shape_changed"
+    if (
+        adapter.ATTENTION_MEASURE_KEY != ATTENTION_MEASURE_KEY
+        or core.ATTENTION_MEASURE_CAPABILITIES_KEY
+        != ATTENTION_MEASURE_CAPABILITIES_KEY
+        or adapter.PROVIDER_IDENTITY != CORE_BSA_MEASURE_PROVIDER
+        or adapter.VDN_FORWARD_MARKER != vdn_measure_compat.VDN_FORWARD_MARKER
+        or adapter.VDN_EXTERNAL_SEQUENCE_API_ATTR
+        != vdn_measure_compat.VDN_EXTERNAL_SEQUENCE_API_ATTR
+    ):
+        return None, "measure_contract_identity_changed"
+
+    registry = options.get(ATTENTION_MEASURE_CAPABILITIES_KEY)
+    capability = registry.get(CORE_BSA_MEASURE_PROVIDER) if isinstance(registry, dict) else None
+    owner_generation = getattr(patch, "measure_owner_generation", None)
+    if (
+        capability is None
+        or capability is not getattr(patch, "measure_capability", None)
+        or type(capability) is not adapter.Capability
+        or getattr(capability, "patch", None) is not patch
+        or not isinstance(owner_generation, str)
+        or not owner_generation
+        or not isinstance(getattr(patch, "measure_plans", None), dict)
+    ):
+        return None, "measure_capability_unproven"
+
+    external = options.get(adapter.VDN_EXTERNAL_SEQUENCE_KEY)
+    try:
+        normalized = core.validate_h3(
+            request,
+            layout=layout,
+            q_rows=seq_len,
+            kv_rows=seq_len,
+            external_sequence=external,
+        )
+        digest = core.semantic_digest(normalized)
+        sinks = _conditioning_sinks(patch, layout_identity, seq_len)
+        if sinks is None:
+            return None, "measure_sink_unproven"
+        exact_range = core.merge_exact_k_blocks(normalized, 64, sinks[0])
+        exact_range_digest = hashlib.sha256(
+            f"{exact_range[0]}:{exact_range[1]}".encode("ascii")
+        ).hexdigest()
+        chunked_key_bias = bool(adapter.supports_key_bias(module.ck.sol_attn_chunked))
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception:  # noqa: BLE001 - malformed/stale measure must be actual-only
+        return None, "measure_contract_unproven"
+
+    vdn, vdn_reason = vdn_measure_compat.probe(
+        model, external, block_count, options
+    )
+    if vdn is None:
+        return None, vdn_reason or "vdn_owner_unproven"
+    if vdn.active and vdn_measure_compat.VDN_EPILOGUE_RECEIPTS_KEY in options:
+        return None, "vdn_receipt_ownership_conflict"
+
+    plan_identity = (
+        ATTENTION_MEASURE_KEY,
+        digest,
+        CORE_BSA_MEASURE_PROVIDER,
+        owner_generation,
+        SPARSE_MEASURE_ROUTE,
+        SPARSE_MEASURE_PREPROCESS,
+        SPARSE_MEASURE_PROFILE,
+    )
+    pool_keys = tuple(
+        (index, seq_len, uuids, plan_identity) for index in range(block_count)
+    )
+    with _IDENTITY_LOCK:
+        call_generation = next(_MEASURE_CALL_COUNTER)
+    call_tokens = tuple((call_generation, index) for index in range(block_count))
+    return CoreBSAMeasureAudit(
+        bsa_module=module,
+        adapter=adapter,
+        core=core,
+        capability=capability,
+        semantic_digest=digest,
+        normalized_request=_freeze(normalized),
+        external_sequence=_freeze(external),
+        owner_generation=owner_generation,
+        provider_identity=CORE_BSA_MEASURE_PROVIDER,
+        q_rows=seq_len,
+        kv_rows=seq_len,
+        exact_k_block_range=tuple(exact_range),
+        exact_range_digest=exact_range_digest,
+        pool_keys=pool_keys,
+        call_tokens=call_tokens,
+        core_blob=core_blob,
+        adapter_blob=adapter_blob,
+        chunked_key_bias=chunked_key_bias,
+        vdn=vdn,
+    ), None
+
+
+def _measure_identity(measure: CoreBSAMeasureAudit) -> tuple[Any, ...]:
+    return (
+        ATTENTION_MEASURE_KEY,
+        measure.semantic_digest,
+        ("provider", measure.provider_identity, measure.owner_generation),
+        ("sources", measure.core_blob, measure.adapter_blob),
+        ("rows", measure.q_rows, measure.kv_rows),
+        ("exact_range", measure.exact_k_block_range, measure.exact_range_digest),
+        ("mask", "none"),
+        ("sparse_profile", SPARSE_MEASURE_PROFILE, SPARSE_MEASURE_ROUTE, SPARSE_MEASURE_PREPROCESS),
+        ("dense_profile", DENSE_MEASURE_PROFILE, DENSE_MEASURE_ROUTE, DENSE_MEASURE_PREPROCESS),
+        ("external_sequence", measure.external_sequence),
+        ("vdn_epilogue", vdn_measure_compat.identity(measure.vdn)),
+        ("chunked_key_bias", measure.chunked_key_bias),
+        ("calibration_key_policy", "measure_bound_v1"),
+    )
+
+
+def _pool_key(audit: CoreBSAAudit, index: int) -> tuple[Any, ...]:
+    measure = getattr(audit, "measure", None)
+    if measure is not None:
+        return measure.pool_keys[index]
+    return index, audit.seq_len, audit.uuids
+
+
+def _measure_runtime_matches(
+    audit: CoreBSAAudit,
+    index: int,
+    call_options: Any,
+    *,
+    sparse_selected: bool,
+) -> bool:
+    measure = getattr(audit, "measure", None)
+    if not isinstance(call_options, dict):
+        return measure is None
+    request = call_options.get(ATTENTION_MEASURE_KEY, _MISSING)
+    if measure is None:
+        return request is _MISSING
+    if request is _MISSING:
+        return False
+    try:
+        registry = call_options.get(ATTENTION_MEASURE_CAPABILITIES_KEY)
+        capability = (
+            registry.get(measure.provider_identity) if isinstance(registry, dict) else None
+        )
+        if (
+            capability is not measure.capability
+            or capability is not getattr(audit.patch, "measure_capability", None)
+            or getattr(capability, "patch", None) is not audit.patch
+            or getattr(audit.patch, "measure_owner_generation", None)
+            != measure.owner_generation
+        ):
+            return False
+        layout = call_options.get("minimax_h3_layout")
+        external = call_options.get(measure.adapter.VDN_EXTERNAL_SEQUENCE_KEY)
+        normalized = measure.core.validate_h3(
+            request,
+            layout=layout,
+            q_rows=audit.seq_len,
+            kv_rows=audit.seq_len,
+            external_sequence=external,
+        )
+        if (
+            measure.core.semantic_digest(normalized) != measure.semantic_digest
+            or _freeze(normalized) != measure.normalized_request
+            or _freeze(external) != measure.external_sequence
+            or not vdn_measure_compat.runtime_matches(measure.vdn, index)
+        ):
+            return False
+        if sparse_selected and not measure.adapter.supports_key_bias(
+            measure.bsa_module.ck.sol_attn_chunked
+        ):
+            return False
+        return type(index) is int and 0 <= index < audit.block_count
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception:  # noqa: BLE001 - execution metadata mismatch is fail closed
+        return False
+
+
+def _measure_receipt_fields(
+    measure: CoreBSAMeasureAudit,
+    index: int,
+    route: str,
+    *,
+    completed: bool,
+    vdn_fields: tuple[tuple[str, Any], ...] | None = None,
+) -> tuple[Any, ...]:
+    if route == "h3_dense":
+        profile = DENSE_MEASURE_PROFILE
+        numerical_route = DENSE_MEASURE_ROUTE
+        preprocess = DENSE_MEASURE_PREPROCESS
+    else:
+        profile = SPARSE_MEASURE_PROFILE
+        numerical_route = SPARSE_MEASURE_ROUTE
+        preprocess = SPARSE_MEASURE_PREPROCESS
+    fields: tuple[Any, ...] = (
+        measure.call_tokens[index],
+        index,
+        measure.owner_generation,
+        measure.semantic_digest,
+        profile,
+        numerical_route,
+        measure.q_rows,
+        measure.kv_rows,
+        measure.exact_range_digest,
+        preprocess,
+    )
+    expected_vdn = vdn_measure_compat.expected_receipt(measure.vdn, index, route)
+    if expected_vdn is not None:
+        actual_vdn = (
+            (("vdn_receipt_missing", True),)
+            if vdn_fields is None
+            else vdn_fields
+        )
+        fields = (*fields, (vdn_measure_compat.VDN_EPILOGUE_KEY, *actual_vdn))
+    return (*fields, bool(completed))
+
+
+def _receipt(
+    audit: CoreBSAAudit,
+    index: int,
+    route: str,
+    *,
+    completed: bool,
+    vdn_fields: tuple[tuple[str, Any], ...] | None = None,
+) -> tuple[Any, ...]:
+    _expected_route, sink, sink_q = audit.route_specs[index]
+    receipt = (
+        ADAPTER_KEY,
+        ADAPTER_VERSION,
+        audit.patch_generation,
+        index,
+        route,
+        audit.seq_len,
+        sink,
+        sink_q,
+    )
+    measure = getattr(audit, "measure", None)
+    if measure is None:
+        return receipt
+    return (
+        *receipt,
+        (
+            ATTENTION_MEASURE_KEY,
+            *_measure_receipt_fields(
+                measure,
+                index,
+                route,
+                completed=completed,
+                vdn_fields=vdn_fields,
+            ),
+        ),
+    )
+
+
+def _expected_receipts(audit: CoreBSAAudit) -> tuple[tuple[Any, ...], ...]:
+    measure = getattr(audit, "measure", None)
+    return tuple(
+        _receipt(
+            audit,
+            index,
+            route,
+            completed=True,
+            vdn_fields=(
+                None
+                if measure is None
+                else vdn_measure_compat.expected_receipt(measure.vdn, index, route)
+            ),
+        )
+        for index, (route, _sink, _sink_q) in enumerate(audit.route_specs)
+    )
+
+
 def _pool_entry(
     patch: Any,
     key: tuple[Any, ...],
@@ -563,10 +940,12 @@ def _pool_ownership_identity(
     seq_len: int,
     uuids: tuple[Any, ...],
     pool_specs: tuple[tuple[int, int, str | None], ...],
+    measure: CoreBSAMeasureAudit | None = None,
 ) -> tuple[Any, ...]:
     ownership = []
     for index in range(block_count):
-        state = _pool_entry(patch, (index, seq_len, uuids), pool_specs[index])
+        key = measure.pool_keys[index] if measure is not None else (index, seq_len, uuids)
+        state = _pool_entry(patch, key, pool_specs[index])
         if state[0] == "present":
             ownership.append(
                 (
@@ -610,6 +989,7 @@ def _route_specs(
     options: dict[str, Any],
     sparse_runtime_ok: bool,
     pool_specs: tuple[tuple[int, int, str | None], ...],
+    measure: CoreBSAMeasureAudit | None = None,
 ) -> tuple[tuple[tuple[str, tuple[int, int], tuple[int, int]], ...], bool] | None:
     sigma = _sigma_value(options)
     if sigma is None:
@@ -626,6 +1006,8 @@ def _route_specs(
     if sinks is None:
         return None
     sink, sink_q = sinks
+    if measure is not None:
+        sink = measure.exact_k_block_range
     dense_set = set(dense_blocks)
     specs = []
     safe = True
@@ -633,11 +1015,12 @@ def _route_specs(
         if not inside_window or seq_len < min_tokens or index in dense_set:
             specs.append(("h3_dense", (0, 0), (0, 0)))
             continue
-        if not sparse_runtime_ok:
+        if not sparse_runtime_ok or (measure is not None and not measure.chunked_key_bias):
             safe = False
             specs.append(("h3_sparse_unproven", sink, sink_q))
             continue
-        state = _pool_entry(patch, (index, seq_len, uuids), pool_specs[index])
+        key = measure.pool_keys[index] if measure is not None else (index, seq_len, uuids)
+        state = _pool_entry(patch, key, pool_specs[index])
         if state[0] == "missing":
             route = "h3_chunked_sparse_cold"
         elif state[0] == "present":
@@ -694,6 +1077,21 @@ def probe(
         except (AttributeError, TypeError, ValueError, RuntimeError):
             return None, "pool_shape_unproven"
 
+        measure_audit, measure_reason = _measure_audit(
+            module,
+            source_blob,
+            patch,
+            options,
+            layout,
+            model,
+            seq_len,
+            uuids,
+            layout_identity,
+            len(model.blocks),
+        )
+        if measure_reason is not None:
+            return None, measure_reason
+
         sparse_runtime_ok = _sparse_runtime_eligible(model, module)
         routed = _route_specs(
             patch,
@@ -704,27 +1102,25 @@ def probe(
             options,
             sparse_runtime_ok,
             pool_specs,
+            measure_audit,
         )
         if routed is None:
             return None, "route_unproven"
         route_specs, safe = routed
         pool_ownership = _pool_ownership_identity(
-            patch, len(model.blocks), seq_len, uuids, pool_specs
-        )
-        expected_receipts = tuple(
-            (
-                ADAPTER_KEY,
-                ADAPTER_VERSION,
-                patch_generation,
-                index,
-                route,
-                seq_len,
-                sink,
-                sink_q,
-            )
-            for index, (route, sink, sink_q) in enumerate(route_specs)
+            patch,
+            len(model.blocks),
+            seq_len,
+            uuids,
+            pool_specs,
+            measure_audit,
         )
         mode = "sol-attn" if settings_identity[2] == 0.0 else "sla"
+        measure_identity = (
+            ()
+            if measure_audit is None
+            else (("attention_measure", _measure_identity(measure_audit)),)
+        )
         identity = (
             ADAPTER_KEY,
             ADAPTER_VERSION,
@@ -736,10 +1132,11 @@ def probe(
             ("uuids", _freeze(uuids)),
             ("routes", route_specs),
             ("pool_ownership", pool_ownership),
+            *measure_identity,
             ("ownership", ownership_identity),
             ("execution", execution_identity),
         )
-        return CoreBSAAudit(
+        audit = CoreBSAAudit(
             identity=identity,
             safe=bool(safe),
             patch=patch,
@@ -751,10 +1148,13 @@ def probe(
             settings_identity=settings_identity,
             route_specs=route_specs,
             pool_specs=pool_specs,
-            expected_receipts=expected_receipts,
+            expected_receipts=(),
             source_blob=source_blob,
             current_override=options.get("optimized_attention_override"),
-        ), None
+            measure=measure_audit,
+        )
+        audit.expected_receipts = _expected_receipts(audit)
+        return audit, None
     except torch.cuda.OutOfMemoryError:
         raise
     except Exception:  # noqa: BLE001 - all adapter introspection is fail closed
@@ -812,13 +1212,60 @@ def _current_route_matches(
     return not dense
 
 
+def _prepare_vdn_receipt_sink(
+    options: dict[str, Any], audit: CoreBSAAudit
+) -> dict[str, Any]:
+    measure = getattr(audit, "measure", None)
+    if measure is None or not measure.vdn.active:
+        return options
+    prepared = dict(options)
+    key = vdn_measure_compat.VDN_EPILOGUE_RECEIPTS_KEY
+    existing = prepared.get(key, _MISSING)
+    if existing is not _MISSING:
+        if existing is audit.vdn_receipts and isinstance(existing, list):
+            return prepared
+        audit.failure = "vdn_receipt_ownership_conflict"
+        return prepared
+    sink: list[Any] = []
+    prepared[key] = sink
+    audit.vdn_receipts = sink
+    return prepared
+
+
+def _vdn_receipt_before(audit: CoreBSAAudit) -> int | None:
+    measure = getattr(audit, "measure", None)
+    if measure is None or not measure.vdn.active:
+        return None
+    if not isinstance(audit.vdn_receipts, list):
+        return -1
+    return len(audit.vdn_receipts)
+
+
+def _vdn_receipt_after(
+    audit: CoreBSAAudit,
+    index: int,
+    route: str,
+    before: int | None,
+):
+    measure = getattr(audit, "measure", None)
+    if measure is None or not measure.vdn.active:
+        return True, None
+    return vdn_measure_compat.validate_receipt_delta(
+        measure.vdn,
+        index,
+        route,
+        audit.vdn_receipts,
+        before,
+    )
+
+
 def _make_actual_wrapper(
     audit: CoreBSAAudit,
     index: int,
     replacement: Any,
     receipts: list[Any],
 ):
-    key = (index, audit.seq_len, audit.uuids)
+    key = _pool_key(audit, index)
     replacement_closure = _closure_values(replacement)
     expected_attention = (
         replacement_closure.get("attention")
@@ -827,6 +1274,7 @@ def _make_actual_wrapper(
     )
 
     def audited_replacement(args, replacement_context):
+        vdn_before = _vdn_receipt_before(audit)
         try:
             metadata_ok = _current_route_matches(audit, index, args)
         except torch.cuda.OutOfMemoryError:
@@ -850,9 +1298,17 @@ def _make_actual_wrapper(
             output = replacement(args, replacement_context)
         else:
             def audited_original_block(call_args):
-                nonlocal sparse_selected, original_block_calls
+                nonlocal sparse_selected, original_block_calls, metadata_ok
                 original_block_calls += 1
                 sparse_selected = call_args.get("attention") is expected_attention
+                if not _measure_runtime_matches(
+                    audit,
+                    index,
+                    call_args.get("transformer_options"),
+                    sparse_selected=sparse_selected,
+                ):
+                    metadata_ok = False
+                    audit.failure = "actual_measure_metadata_failed"
                 if sparse_selected:
                     from .bsa_transition_probe import attention
                     call_args = {**call_args, "attention": attention(expected_attention, audit, index)}
@@ -871,18 +1327,22 @@ def _make_actual_wrapper(
                 after,
                 sparse_selected=sparse_selected,
             )
-            expected_route, expected_sink, expected_sink_q = audit.route_specs[index]
-            if not metadata_ok or observed != expected_route:
-                audit.failure = "actual_route_mismatch"
-            receipt = (
-                ADAPTER_KEY,
-                ADAPTER_VERSION,
-                audit.patch_generation,
+            vdn_ok, vdn_fields = _vdn_receipt_after(
+                audit, index, observed, vdn_before
+            )
+            expected_route, _expected_sink, _expected_sink_q = audit.route_specs[index]
+            if not vdn_ok:
+                audit.failure = "actual_vdn_epilogue_receipt_failed"
+            if not metadata_ok or observed != expected_route or not vdn_ok:
+                audit.failure = audit.failure or "actual_route_mismatch"
+            receipt = _receipt(
+                audit,
                 index,
                 observed,
-                audit.seq_len,
-                expected_sink,
-                expected_sink_q,
+                completed=bool(
+                    metadata_ok and observed == expected_route and vdn_ok
+                ),
+                vdn_fields=vdn_fields,
             )
             receipts.append(receipt)
         except torch.cuda.OutOfMemoryError:
@@ -898,7 +1358,9 @@ def instrument_actual_options(
     options: dict[str, Any], audit: CoreBSAAudit, receipts_key: str
 ) -> dict[str, Any]:
     """Wrap copied main-H3 replacements so an actual call proves its route."""
-    prepared = dict(options)
+    prepared = _prepare_vdn_receipt_sink(dict(options), audit)
+    if audit.failure is not None:
+        return prepared
     receipts = prepared.get(receipts_key)
     if not isinstance(receipts, list):
         audit.failure = "receipt_buffer_missing"
@@ -934,7 +1396,7 @@ def accepts_actual(audit: CoreBSAAudit, receipts: tuple[Any, ...]) -> bool:
         return False
     seen = set()
     for receipt in receipts:
-        if not isinstance(receipt, tuple) or len(receipt) != 8:
+        if not isinstance(receipt, tuple) or len(receipt) < 8:
             return False
         if receipt[0] != ADAPTER_KEY or receipt[1] != ADAPTER_VERSION:
             return False
@@ -946,4 +1408,11 @@ def accepts_actual(audit: CoreBSAAudit, receipts: tuple[Any, ...]) -> bool:
         seen.add(block)
         if receipt != audit.expected_receipts[block]:
             return False
+    measure = getattr(audit, "measure", None)
+    if measure is not None and not vdn_measure_compat.validate_final_receipts(
+        measure.vdn,
+        audit.route_specs,
+        audit.vdn_receipts,
+    ):
+        return False
     return seen == set(range(audit.block_count))
