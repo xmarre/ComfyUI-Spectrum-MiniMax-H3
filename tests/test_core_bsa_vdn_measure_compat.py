@@ -137,7 +137,12 @@ def _install(monkeypatch, *, count=2, with_vdn=False):
             cfg={"enable_softmax_gate": True},
             branches=branches,
             managed_weights=None,
-            layout=None,
+            layout=SimpleNamespace(
+                seq_len=160,
+                video_start=96,
+                num_frames=2,
+                tokens_per_frame=32,
+            ),
         )
         for index, block in enumerate(model.blocks):
             block.attn.forward = hybrid.make_vdn_forward(block.attn, state, index)
@@ -275,6 +280,37 @@ def test_vdn_config_change_after_preflight_invalidates_runtime_owner(monkeypatch
     assert not core_bsa_compat._measure_runtime_matches(
         audit, 0, options, sparse_selected=True
     )
+
+
+def test_vdn_execution_context_must_be_active_at_preflight(monkeypatch):
+    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)
+    state.layout = None
+
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+
+    assert audit is None
+    assert reason == "vdn_execution_context_unproven"
+
+
+def test_vdn_execution_context_loss_after_preflight_invalidates_runtime(monkeypatch):
+    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and audit is not None and audit.measure is not None
+
+    state.layout = None
+    assert not vdn_measure_compat.runtime_matches(audit.measure.vdn, 0)
+    assert not core_bsa_compat._measure_runtime_matches(
+        audit, 0, options, sparse_selected=True
+    )
+
+
+def test_vdn_execution_context_geometry_change_invalidates_runtime(monkeypatch):
+    model, state, _patch, options = _install(monkeypatch, count=1, with_vdn=True)
+    audit, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and audit is not None and audit.measure is not None
+
+    state.layout.tokens_per_frame = 31
+    assert not vdn_measure_compat.runtime_matches(audit.measure.vdn, 0)
 
 
 def test_partial_vdn_owner_is_fail_closed(monkeypatch):
