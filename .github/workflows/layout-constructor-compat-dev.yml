@@ -1,0 +1,89 @@
+name: Layout constructor compatibility development
+
+on:
+  push:
+    branches: [dev/layout-constructor-compat-20260911]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/ComfyUI
+          ref: c00cd0acab821cd3f4479f02421c3c11331561f7
+          path: _deps/CorePinned
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: xmarre/ComfyUI
+          ref: df5b4f71a153b44e49e7e42777e0f71989b61546
+          path: _deps/CoreFrameCount
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install \
+            pytest ruff numpy scipy torchsde psutil safetensors einops tqdm pyyaml pillow packaging \
+            transformers tokenizers sentencepiece aiohttp yarl alembic SQLAlchemy filelock \
+            'av>=17.0.0' requests simpleeval blake3 kornia spandrel pydantic pydantic-settings \
+            PyOpenGL comfy-angle 'comfy-kitchen==0.2.33' 'comfy-aimdo==0.5.3'
+      - name: Apply compatibility patch and regression
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('comfyui_spectrum_h3/minimax_h3.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''        layout = module.PackedLayout(\n            signature[0],\n            signature[1],\n            signature[2],\n            signature[3],\n            signature[4],\n            keyframes=payload.get("keyframes"),\n            refs=payload.get("refs"),\n            frame_count=payload.get("frame_count"),\n        )\n'''
+          new = '''        layout_kwargs = {\n            "keyframes": payload.get("keyframes"),\n            "refs": payload.get("refs"),\n        }\n        try:\n            parameters = inspect.signature(module.PackedLayout).parameters\n        except (TypeError, ValueError):\n            parameters = {}\n        if "frame_count" in parameters:\n            layout_kwargs["frame_count"] = payload.get("frame_count")\n        layout = module.PackedLayout(\n            signature[0],\n            signature[1],\n            signature[2],\n            signature[3],\n            signature[4],\n            **layout_kwargs,\n        )\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'layout constructor anchor count: {text.count(old)}')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          path = Path('tests/test_native_equivalence.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'from comfyui_spectrum_h3.minimax_h3 import diffusion_model_wrapper\n'
+          new = 'from comfyui_spectrum_h3.minimax_h3 import _resolve_layout, diffusion_model_wrapper\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'import anchor count: {text.count(old)}')
+          text = text.replace(old, new, 1)
+          anchor = '''def _reference_inputs(PackedLayout):\n'''
+          addition = '''def test_layout_fallback_uses_the_loaded_native_constructor_contract():\n    _, _, PackedLayout = _native_imports()\n    model, _ = _tiny_model()\n    x, context, _payload = _inputs(PackedLayout)\n\n    layout = _resolve_layout(model, context, x[0], x[1], {})\n\n    assert tuple(layout.signature) == (2, 1, 4, 4, 3)\n\n\n'''
+          if text.count(anchor) != 1:
+              raise SystemExit(f'test insertion anchor count: {text.count(anchor)}')
+          path.write_text(text.replace(anchor, addition + anchor, 1), encoding='utf-8')
+          PY
+      - name: Ruff and compile
+        run: |
+          python -m ruff check comfyui_spectrum_h3/minimax_h3.py tests/test_native_equivalence.py --ignore N999,I001,C408,UP035
+          python -m compileall -q comfyui_spectrum_h3/minimax_h3.py tests/test_native_equivalence.py
+      - name: Test current reviewed Core contract
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/_deps/CorePinned
+          PYTHONPATH: ${{ github.workspace }}/_deps/CorePinned:${{ github.workspace }}
+        run: python -m pytest -q tests/test_native_equivalence.py tests/test_h3_wrapper.py
+      - name: Test frame-count Core contract
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/_deps/CoreFrameCount
+          PYTHONPATH: ${{ github.workspace }}/_deps/CoreFrameCount:${{ github.workspace }}
+        run: python -m pytest -q tests/test_native_equivalence.py tests/test_h3_wrapper.py
+      - name: Commit validated patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add comfyui_spectrum_h3/minimax_h3.py tests/test_native_equivalence.py
+          git commit -m 'Adapt H3 layout fallback to native constructor contract'
+          git push origin HEAD:dev/layout-constructor-compat-20260911
