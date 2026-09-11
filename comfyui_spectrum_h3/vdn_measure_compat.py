@@ -293,6 +293,18 @@ def identity(audit: VDNMeasureAudit):
     )
 
 
+def _same_forward_owner(current: Any, expected: Any) -> bool:
+    """Compare a callable and its bound owner without relying on bound-method identity."""
+    current_func = getattr(current, "__func__", None)
+    expected_func = getattr(expected, "__func__", None)
+    if current_func is not None or expected_func is not None:
+        return (
+            current_func is expected_func
+            and getattr(current, "__self__", None) is getattr(expected, "__self__", None)
+        )
+    return current is expected
+
+
 def runtime_matches(audit: VDNMeasureAudit, index: int) -> bool:
     if type(index) is not int or index < 0 or index >= len(audit.attentions):
         return False
@@ -300,7 +312,7 @@ def runtime_matches(audit: VDNMeasureAudit, index: int) -> bool:
         forward = audit.attentions[index].forward
     except Exception:  # noqa: BLE001
         return False
-    if forward is not audit.forwards[index]:
+    if not _same_forward_owner(forward, audit.forwards[index]):
         return False
     if not audit.active:
         return getattr(forward, VDN_FORWARD_MARKER, False) is not True
