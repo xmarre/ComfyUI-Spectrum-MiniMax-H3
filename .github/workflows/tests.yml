@@ -2,7 +2,7 @@ name: tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci/spectrum-vdn-full-matrix-20260911]
   pull_request:
 
 permissions:
