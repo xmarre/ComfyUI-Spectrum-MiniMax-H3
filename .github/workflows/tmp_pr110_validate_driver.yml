@@ -1,0 +1,77 @@
+name: temporary PR110 synchronization driver
+
+on:
+  push:
+    branches:
+      - mirror/pr110-flow8dfb-sync-20260911
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Apply candidate from the reviewed temporary harness
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          lines = Path('.github/workflows/tmp_pr110_flow_sync_validate.yml').read_text().splitlines()
+          start_marker = '      - name: Apply synchronization candidate in workspace'
+          stop_marker = '      - name: Check out reviewed ComfyUI Core companion'
+          start = lines.index(start_marker)
+          run = next(i for i in range(start + 1, len(lines)) if lines[i] == '        run: |')
+          stop = lines.index(stop_marker, run + 1)
+          script = textwrap.dedent('\n'.join(lines[run + 1:stop])) + '\n'
+          Path('/tmp/apply_candidate.sh').write_text(script)
+          PY
+          bash /tmp/apply_candidate.sh
+          git diff --check
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/ComfyUI
+          ref: 8406da920f9df19cbc14b76aef1bcd3dc4cf1119
+          path: _deps/ComfyUI
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/MiniMax-H3-Flow-Aligned-Regenerate
+          ref: 8dfb7a2e570458b5078734755b897c7e89ddac8c
+          path: _deps/Flow
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/ComfyUI-VDN-H3-Plus
+          ref: d5f158a1c1750d79b37cb6ef22b0f14e6a8cbad6
+          path: _deps/VDN
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install targeted environment
+        run: |
+          python -m pip install torch==2.10.0+cpu torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r _deps/ComfyUI/requirements.txt
+          python -m pip install pytest ruff
+      - name: Validate synchronized contracts
+        env:
+          COMFYUI_PATH: ${{ github.workspace }}/_deps/ComfyUI
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/_deps/ComfyUI:${{ github.workspace }}/_deps/Flow:${{ github.workspace }}/_deps/VDN
+        run: |
+          python -m ruff check comfyui_spectrum_h3/core_bsa_flow_compat.py tests/test_core_bsa_flow_compat.py --ignore I001,C408
+          python -m pytest -q tests/test_core_bsa_flow_compat.py tests/test_core_bsa_measure_history.py tests/test_core_bsa_measure_receipt_identity.py tests/test_core_bsa_vdn_measure_compat.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr110-flow8dfb-sync-driver
+          path: |
+            comfyui_spectrum_h3/core_bsa_flow_compat.py
+            tests/test_core_bsa_flow_compat.py
+          if-no-files-found: error
