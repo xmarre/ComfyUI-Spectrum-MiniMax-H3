@@ -1,0 +1,41 @@
+name: temporary PR110 promote validated synchronization
+
+on:
+  push:
+    branches:
+      - mirror/pr110-flow8dfb-sync-20260911
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+      - name: Reproduce the already validated candidate on a clean PR tree
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          lines = Path('.github/workflows/tmp_pr110_flow_sync_validate.yml').read_text().splitlines()
+          start = lines.index('      - name: Apply synchronization candidate in workspace')
+          run = next(i for i in range(start + 1, len(lines)) if lines[i] == '        run: |')
+          stop = lines.index('      - name: Check out reviewed ComfyUI Core companion', run + 1)
+          Path('/tmp/apply_candidate.sh').write_text(textwrap.dedent('\n'.join(lines[run + 1:stop])) + '\n')
+          PY
+          git reset --hard 7f7b9b2d13476ea8b631de946ad48ce0fd33a8a5
+          bash /tmp/apply_candidate.sh
+          git diff --check
+          git status --short
+          test "$(git status --short | wc -l)" -eq 2
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add comfyui_spectrum_h3/core_bsa_flow_compat.py tests/test_core_bsa_flow_compat.py
+          git commit -m "Synchronize Spectrum audit with authoritative Flow measure profiles"
+          git push origin HEAD:refs/heads/mirror/pr110-flow8dfb-clean-20260911 --force
