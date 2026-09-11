@@ -45,7 +45,7 @@ MEASURE_CAPABLE_BSA_GIT_BLOBS = frozenset(
 # ownership and can therefore fail a valid weighted Flow+BSA execution without
 # VDN; it remains actual-only rather than inheriting this proof.
 AUDITED_BSA_MEASURE_GIT_BLOBS = frozenset(
-    {"50a8c5a8901b1a43342d5eef0c2fdc256a1b1cbe"}
+    {"8c2b181dc663f43dbb09ca8035126a2a99fabfe5"}
 )
 AUDITED_ATTENTION_MEASURE_GIT_BLOBS = frozenset(
     {"439f2798f8514d38ea56f12c330068b78e8fa539"}
