@@ -1,3 +1,69 @@
+# Spectrum MiniMax H3 v0.2.27
+
+v0.2.27 combines the unreleased Core BlockSparseAttention forecast-recovery work from PR #106 with PR #107's forecast streaming and CUDA target-lifetime fix. The release restores the reviewed Mixed-Grid production schedule while substantially reducing Spectrum's forecast-head VRAM pressure.
+
+## Streamed H3 forecast projection and retained-target VRAM fix
+
+PR #107, contributed by @Pizzawookiee, removes two independent sources of excessive CUDA memory use.
+
+Spectrum can now keep a predicted H3 hidden state in system RAM and stream it through the audited MiniMax H3 FinalLayer using bounded reusable CUDA workspaces instead of materializing the complete forecast hidden representation on the GPU.
+
+- The default forecast-head workspace budget is 16 MiB.
+- Audio and video rows are projected independently while preserving the native packed layout and timestep selectors.
+- State-conditioned residual reconstruction uses the same bounded strategy instead of reintroducing a full hidden-sized CUDA allocation.
+- Native FinalLayer streaming is accepted only when the current bound method matches the reviewed MiniMax H3 implementation.
+- H3-Optimizations is accepted only through its reviewed source/marker contract, including cube-order selector/state remapping and output restoration.
+- Unknown or foreign FinalLayer patches keep the historical one-shot monolithic projection path instead of being slab-called under an unproven contract.
+
+A separate actual-step lifetime bug is also fixed. The final hidden target view is now retained on CUDA only while an active residual probe actually needs it, and the reference is cleared after comparison and on executor failure. Ordinary actual steps therefore no longer pin successive full final-hidden storages through the callback closure.
+
+### Measured memory and timing
+
+The contributor supplied matched 0.1 MP / 15 s / 20-step CUDA comparisons for both stock/native token order and H3-Optimizations sparse/cube order.
+
+| Path | Incremental forecast-head CUDA peak | Whole-run wall time |
+| --- | ---: | ---: |
+| Stock/native | 253.78 -> 84.44 MiB (**-66.7%**) | 435.28 -> 448.14 s (**+3.0%**) |
+| H3-Optimizations cube order | 253.68 -> 84.43 MiB (**-66.7%**) | 315.85 -> 309.37 s (**-2.1%**) |
+
+The streamed FinalLayer itself is materially slower in that small benchmark (roughly 6-7x forecast-head latency), so this release does **not** claim a forecast-head speedup. The observed benefit is lower CUDA memory pressure; whole-workflow timing in the supplied matched runs remained approximately flat.
+
+Both post-change runs completed the expected 20/20 logical calls as **11 actual / 9 forecast / 0 fallbacks**. Decoded-output comparisons were also supplied (stock PSNR 21.38 dB / SSIM 0.709; cube-order PSNR 20.48 dB / SSIM 0.733). These are real-media quality checks, not strict numerical or bitwise parity claims.
+
+## Core BlockSparseAttention forecast recovery
+
+PR #106 adds a fail-closed Spectrum contract for reviewed ComfyUI core `BlockSparseAttention`, including Flow Mixed-Grid execution, and recovers forecasts that were previously lost at the audited `h3_chunked_sparse_cold -> h3_chunked_sparse_primed` transition.
+
+The carry is intentionally narrow. Spectrum retains history across that transition only when the predecessor/current calls are adjacent in the same run and the reviewed BSA owner, source, patch generation, sequence layout, UUIDs, numerical identity and exact calibration tensor ownership all remain proven. Dense-to-sparse, reverse transitions, changed owners/layout/settings/source and every unproven route still reset to an actual H3 evaluation.
+
+The scheduler also gains a transactional deferred one-point bootstrap entitlement for ordinary degree-1 runs when `bootstrap_first_forecast` is enabled. The entitlement can survive exact-prefix/backend-veto steps but is consumed only by a successfully finalized forecast; state-conditioned residual, separate-stage history and offline replay remain excluded.
+
+Real production validation on the RTX PRO 6000 Blackwell stack with VDN, DiffAid, Untwist, core BSA, Spectrum, Continuum and Progressive Mixed-Grid Flow reached:
+
+```text
+sampler_logical_calls       18
+transformer_actual_nfe      14
+spectrum_forecast_calls      4
+
+low:    8 actual / 2 forecast
+high:   4 actual / 2 forecast
+probe:  2 actual / 0 forecast
+```
+
+Compared with the safe 17-actual / 1-forecast control, the later Mixed-Grid sampler measured **179.745 s -> 132.611 s (-26.2%)**, and the Mixed-Grid high stage measured **82.362 s -> 51.141 s (-37.9%)**. Controlled visual inspection found no apparent quality degradation and no clear winner between the safe control and recovered 14A/4F output.
+
+## Compatibility and validation
+
+- PR #106's final implementation was validated across the full 10-job matrix and by real SM120 production execution.
+- PR #107's final head passed the full CI matrix after review, and the squash-merged `main` commit `27d178d3e9b22cdabd3b48fec4d9f13f617cc62e` subsequently passed push run #672 across the repository test workflow.
+- The #107 rebase preserves the existing #106 BSA/backend-history ordering and actual-execution receipt completion contract.
+- Regression coverage now includes streamed-vs-monolithic row/selector behavior, H3-Optimizations cube-order restoration, state-conditioned reconstruction/fallback, bounded sanitization, source gating, unknown-wrapper one-shot behavior, core-BSA ownership/history proofs and cold-to-primed recovery.
+- CUDA out-of-memory remains a hard resource failure; unsupported or unproven external contracts continue to fail closed to actual execution rather than silently weakening the safety boundary.
+
+Existing sampler equations, PECE/SEEDS/SA-Solver ownership, Continuum prefix semantics, external-patch exactness rules, generic correction, offline replay policy and the v0.2.26 numerical-backend history contract remain unchanged outside the specific BSA-recovery and H3 forecast-memory paths above.
+
+---
+
 # Spectrum MiniMax H3 v0.2.26
 
 v0.2.26 adds a provider-generic numerical-attention history contract so Spectrum can keep forecasts only across backend routes whose next-call identity and actual execution receipts are provably compatible. The contract was then validated in the released ComfyUI-Sol-H3 v0.1.0 production stack.
