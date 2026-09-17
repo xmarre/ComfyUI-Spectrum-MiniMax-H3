@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
+import torch
+
 from . import minimax_h3
 from .keyless_compat import (
     KEYLESS_CONTRACT_KEY,
@@ -19,6 +21,14 @@ _NATIVE_HELPERS = (
     "patchify_video",
     "pack_audio",
 )
+_KEYLESS_PROVIDER = "minimax_h3_keyless_provider_v1"
+_KEYLESS_PREPROCESSORS = "minimax_h3_keyless_routing_preprocessors_v1"
+_KEYLESS_VALUE_DOMAIN = "minimax_h3_keyless_value_domain_v1"
+_KEYLESS_ROUTING_POSITION_DOMAIN = "minimax_h3_keyless_routing_position_domain_v1"
+_KEYLESS_QUERY_DOMAIN = "minimax_h3_keyless_query_domain_v1"
+_KEYLESS_MASK = "minimax_h3_keyless_mask_v1"
+_KEYLESS_LOG_MEASURE = "minimax_h3_keyless_log_measure_v1"
+_KEYLESS_EXACT_BLOCKS = "minimax_h3_keyless_exact_blocks_v1"
 
 _ORIGINAL_IS_NATIVE_MINIMAX_H3 = minimax_h3.is_native_minimax_h3
 _ORIGINAL_NATIVE_MODULE = minimax_h3._native_module
@@ -62,6 +72,133 @@ def _runtime_native_module(inner: Any):
     return module
 
 
+def _freeze_option(value: Any) -> Any:
+    """Build a bounded hashable identity for Keyless numerical routing options.
+
+    Tensor contents are deliberately not copied or synchronized. Object identity plus
+    PyTorch's mutation version is enough to invalidate Spectrum history when the same
+    tensor is edited in-place; replacing a tensor changes its object identity.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if torch.is_tensor(value):
+        try:
+            version = int(value._version)
+        except (AttributeError, RuntimeError):
+            version = None
+        return (
+            "tensor",
+            tuple(int(v) for v in value.shape),
+            str(value.dtype),
+            str(value.device),
+            id(value),
+            version,
+        )
+    if isinstance(value, slice):
+        return ("slice", value.start, value.stop, value.step)
+    if isinstance(value, dict):
+        return tuple(
+            sorted((str(key), _freeze_option(item)) for key, item in value.items())
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_option(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_freeze_option(item) for item in value), key=repr))
+
+    # Keyless RowDomain is deliberately duck-typed so Spectrum does not import
+    # the Keyless package. Preserve both physical coordinates and semantic label.
+    if all(hasattr(value, name) for name in ("start", "stop", "indices", "identity")):
+        return (
+            "row_domain",
+            getattr(value, "start"),
+            getattr(value, "stop"),
+            _freeze_option(getattr(value, "indices")),
+            _freeze_option(getattr(value, "identity")),
+        )
+    return (
+        "object",
+        type(value).__module__,
+        type(value).__qualname__,
+        id(value),
+    )
+
+
+def _callable_identity(value: Any) -> tuple[Any, ...]:
+    base = getattr(value, "__func__", value)
+    owner = getattr(value, "__self__", None)
+    return (
+        str(getattr(base, "__module__", type(base).__module__)),
+        str(getattr(base, "__qualname__", type(base).__qualname__)),
+        id(base),
+        None if owner is None else id(owner),
+    )
+
+
+def _preprocessor_identity(value: Any) -> tuple[Any, ...]:
+    declared = getattr(value, "identity", None)
+    fn = getattr(value, "fn", None)
+    if callable(fn):
+        implementation = _callable_identity(fn)
+    elif callable(value):
+        implementation = _callable_identity(value)
+    else:
+        implementation = (
+            "non_callable",
+            type(value).__module__,
+            type(value).__qualname__,
+            id(value),
+        )
+    return (_freeze_option(declared), implementation)
+
+
+def _keyless_runtime_identity(transformer_options: dict[str, Any]) -> tuple[Any, ...]:
+    """Identity the numerical Keyless route independently of packed H3 geometry.
+
+    Spectrum history is a prediction of final H3 hidden states. A QV provider,
+    routing-only preprocessor, physical row domain, mask, or row measure can change
+    those states without changing video/audio tensor shapes. Bind those semantics to
+    the topology so an old QKV/Keyless or old-Keyless anchor cannot silently prime a
+    numerically different call.
+    """
+    provider = transformer_options.get(_KEYLESS_PROVIDER)
+    provider_identity = (
+        ("none",)
+        if provider is None
+        else (
+            "provider",
+            getattr(provider, "api", None),
+            _callable_identity(provider),
+            _freeze_option(getattr(provider, "identity", None)),
+        )
+    )
+    preprocessors = transformer_options.get(_KEYLESS_PREPROCESSORS, ())
+    try:
+        preprocessor_identity = tuple(_preprocessor_identity(item) for item in preprocessors)
+    except TypeError:
+        preprocessor_identity = (
+            (
+                "invalid_container",
+                type(preprocessors).__module__,
+                type(preprocessors).__qualname__,
+                id(preprocessors),
+            ),
+        )
+
+    return (
+        ("provider", provider_identity),
+        ("preprocessors", preprocessor_identity),
+        ("value_domain", _freeze_option(transformer_options.get(_KEYLESS_VALUE_DOMAIN))),
+        (
+            "routing_position_domain",
+            _freeze_option(transformer_options.get(_KEYLESS_ROUTING_POSITION_DOMAIN)),
+        ),
+        ("query_domain", _freeze_option(transformer_options.get(_KEYLESS_QUERY_DOMAIN))),
+        ("mask", _freeze_option(transformer_options.get(_KEYLESS_MASK))),
+        ("log_measure", _freeze_option(transformer_options.get(_KEYLESS_LOG_MEASURE))),
+        ("exact_blocks", _freeze_option(transformer_options.get(_KEYLESS_EXACT_BLOCKS))),
+    )
+
+
 def _topology_signature(
     inner: Any,
     video_x,
@@ -83,7 +220,11 @@ def _topology_signature(
     identity = keyless_semantic_identity(inner)
     if identity is None:
         return base
-    return (*base, ("keyless_semantic_identity", identity))
+    return (
+        *base,
+        ("keyless_semantic_identity", identity),
+        ("keyless_runtime_identity", _keyless_runtime_identity(transformer_options)),
+    )
 
 
 def install_keyless_runtime_compat() -> None:
