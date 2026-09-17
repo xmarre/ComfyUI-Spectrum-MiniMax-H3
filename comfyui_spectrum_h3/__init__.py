@@ -35,9 +35,8 @@ from .trust_probe import install_forecast_trust_probe
 install_keyless_runtime_compat()
 install_keyless_model_aware_compat()
 # Loader compatibility teaches the source audit about ComfyUI's path-loaded BSA
-# module alias before the Keyless fallback relies on that ownership proof.
+# module alias before either BSA recovery or Keyless fallback relies on ownership.
 install_core_bsa_loader_compat()
-install_keyless_core_bsa_fallback()
 install_bsa_transition_probe_compat()
 install_bsa_transition_probe_manual_only()
 install_generic_residual_correction()
@@ -58,9 +57,11 @@ install_external_patch_compat()
 install_visual_reference_patch_compat()
 install_external_patch_hardening()
 install_er_sde_offline_replay_safety()
-# The BSA recovery wrapper must see the final scheduler/rollback decision made by
-# the compatibility layers above. Compiler compatibility remains outermost.
+# The native-QKV BSA recovery wrapper must see the final scheduler/rollback
+# decision. The Keyless dense-reference fallback then wraps that final history
+# stack so it cannot be bypassed by recovery's custom prepare/observe functions.
 install_core_bsa_forecast_recovery()
+install_keyless_core_bsa_fallback()
 # Compiler compatibility must be outermost: it owns the thread-local lifetime
 # from Spectrum step entry through every already-installed finalize/end wrapper.
 install_comfy_compiler_compat()
