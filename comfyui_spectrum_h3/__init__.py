@@ -11,6 +11,7 @@ from .external_patch_hardening import install_external_patch_hardening
 from .external_patch_visual_reference import install_visual_reference_patch_compat
 from .forecast import HistoryWeightForecaster
 from .generic_correction import install_generic_residual_correction
+from .keyless_core_bsa_fallback import install_keyless_core_bsa_fallback
 from .keyless_model_aware_compat import install_keyless_model_aware_compat
 from .keyless_runtime_compat import install_keyless_runtime_compat
 from .minimax_h3 import locate_minimax_h3_inner, require_native_minimax_h3
@@ -33,7 +34,10 @@ from .trust_probe import install_forecast_trust_probe
 # compatibility layer captures native-H3 helper identities.
 install_keyless_runtime_compat()
 install_keyless_model_aware_compat()
+# Loader compatibility teaches the source audit about ComfyUI's path-loaded BSA
+# module alias before the Keyless fallback relies on that ownership proof.
 install_core_bsa_loader_compat()
+install_keyless_core_bsa_fallback()
 install_bsa_transition_probe_compat()
 install_bsa_transition_probe_manual_only()
 install_generic_residual_correction()
