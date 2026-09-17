@@ -83,10 +83,7 @@ def _proof():
 
 
 def _direct_bsa_options():
-    dit = {
-        ("double_block", index): object()
-        for index in range(50)
-    }
+    dit = {( "double_block", index): object() for index in range(50)}
     dit[("foreign", 3)] = "keep-me"
     return {
         "patches_replace": {"dit": dit, "other": {"x": "keep"}},
@@ -195,7 +192,8 @@ def test_direct_core_bsa_is_removed_only_from_local_keyless_options(monkeypatch)
     assert prepared["unrelated"] == "keep"
     assert prepared[keyless_core_bsa_fallback.BYPASS_KEY] == identity
     assert identity[0] == keyless_core_bsa_fallback.BYPASS_KEY
-    assert identity[-1] == "dense_materialized_route"
+    assert identity[-2] == "dense_materialized_route"
+    assert identity[-1][0] == "keyless_runtime_identity"
 
 
 def test_reviewed_core_bsa_ownership_proof_never_requires_fake_keyless_qkv():
@@ -208,7 +206,8 @@ def test_reviewed_core_bsa_ownership_proof_never_requires_fake_keyless_qkv():
     assert proof.source_blob in keyless_core_bsa_fallback.core_bsa_compat.AUDITED_BSA_GIT_BLOBS
 
     prepared, identity = keyless_core_bsa_fallback.prepare_reference_options(options, model)
-    assert identity == proof.identity(model)
+    assert identity[:-1] == proof.identity(model)
+    assert identity[-1][0] == "keyless_runtime_identity"
     assert "optimized_attention_override" not in prepared
     assert prepared["patches_replace"]["dit"] == {}
     assert all(not hasattr(block.attn, "qkv_proj") for block in model.blocks)
@@ -227,8 +226,8 @@ def test_reviewed_outer_untwist_is_rebuilt_without_bsa_and_keeps_raw_v():
     transform, previous = restored.attention_preprocess_v1
     assert previous is None
     assert core_bsa_preprocess_compat._audited_untwist_preprocess(transform) is not None
-    assert identity[-2][0] == "outer_preprocess"
-    assert identity[-2][1] is not None
+    assert identity[-3][0] == "outer_preprocess"
+    assert identity[-3][1] is not None
 
     q = torch.ones(1, 2, 4, 128)
     route = torch.ones_like(q)
@@ -262,8 +261,8 @@ def test_reviewed_untwist_below_bsa_is_restored_directly():
     prepared, identity = keyless_core_bsa_fallback.prepare_reference_options(options, model)
     assert prepared["optimized_attention_override"] is untwist
     assert prepared["patches_replace"]["dit"] == {}
-    assert identity[-2][0] == "outer_preprocess"
-    assert identity[-2][1] is not None
+    assert identity[-3][0] == "outer_preprocess"
+    assert identity[-3][1] is not None
 
 
 def test_unknown_inherited_override_is_not_silently_discarded():
@@ -310,8 +309,20 @@ def test_native_qkv_options_are_not_touched(monkeypatch):
     assert identity is None
 
 
+def _safe_bypass_fixture():
+    model = _keyless_model()
+    options = {}
+    identity = keyless_core_bsa_fallback._route_bound_bypass_identity(
+        _proof(),
+        model,
+        options,
+    )
+    options[keyless_core_bsa_fallback.BYPASS_KEY] = identity
+    return options, identity
+
+
 def test_bypass_marker_is_forecast_safe_without_core_bsa_receipts(monkeypatch):
-    identity = (keyless_core_bsa_fallback.BYPASS_KEY, 1, "semantic")
+    options, identity = _safe_bypass_fixture()
     original_called = False
 
     def original(*args, **kwargs):
@@ -320,26 +331,45 @@ def test_bypass_marker_is_forecast_safe_without_core_bsa_receipts(monkeypatch):
         return None
 
     monkeypatch.setattr(keyless_core_bsa_fallback, "_ORIGINAL_PREFLIGHT", original)
-    result = keyless_core_bsa_fallback._preflight(
-        {keyless_core_bsa_fallback.BYPASS_KEY: identity}, None, None
-    )
+    result = keyless_core_bsa_fallback._preflight(options, None, None)
     assert result == (identity, True, None)
     assert original_called is False
 
     observed = []
-    runtime = SimpleNamespace(
-        observe_backend_history=lambda *args: observed.append(args)
-    )
+    runtime = SimpleNamespace(observe_backend_history=lambda *args: observed.append(args))
     monkeypatch.setattr(keyless_core_bsa_fallback, "_ORIGINAL_OBSERVE", original)
     keyless_core_bsa_fallback._observe(
         runtime,
         4,
         9,
-        {keyless_core_bsa_fallback.BYPASS_KEY: identity},
+        options,
         (identity, True),
     )
     assert observed == [(4, 9, identity, (), True)]
     assert original_called is False
+
+
+def test_bypass_marker_rejects_runtime_route_change():
+    options, identity = _safe_bypass_fixture()
+    options["minimax_h3_keyless_mask_v1"] = object()
+    result_identity, safe, audit = keyless_core_bsa_fallback._preflight(options, None, None)
+    assert result_identity[0] == keyless_core_bsa_fallback.BYPASS_KEY
+    assert result_identity[1] == "invalid_or_opaque_bypass"
+    assert safe is False
+    assert audit is None
+    assert identity != result_identity
+
+
+def test_bypass_does_not_promote_opaque_keyless_provider_to_forecast_safe():
+    model = _keyless_model()
+    options = {"minimax_h3_keyless_provider_v1": object()}
+    identity = keyless_core_bsa_fallback._route_bound_bypass_identity(
+        _proof(), model, options
+    )
+    options[keyless_core_bsa_fallback.BYPASS_KEY] = identity
+    _identity, safe, audit = keyless_core_bsa_fallback._preflight(options, None, model)
+    assert safe is False
+    assert audit is None
 
 
 def test_prepare_strips_bsa_before_delegating_to_history_stack(monkeypatch):
