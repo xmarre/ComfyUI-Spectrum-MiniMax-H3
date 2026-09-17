@@ -11,6 +11,7 @@ from .external_patch_hardening import install_external_patch_hardening
 from .external_patch_visual_reference import install_visual_reference_patch_compat
 from .forecast import HistoryWeightForecaster
 from .generic_correction import install_generic_residual_correction
+from .keyless_backend_history import install_keyless_backend_history
 from .keyless_core_bsa_fallback import install_keyless_core_bsa_fallback
 from .keyless_model_aware_compat import install_keyless_model_aware_compat
 from .keyless_runtime_compat import install_keyless_runtime_compat
@@ -34,6 +35,9 @@ from .trust_probe import install_forecast_trust_probe
 # compatibility layer captures native-H3 helper identities.
 install_keyless_runtime_compat()
 install_keyless_model_aware_compat()
+# Numerical Keyless identity must be under the later Core-BSA recovery/fallback
+# wrappers so their source-gated special cases can compose without hiding it.
+install_keyless_backend_history()
 # Loader compatibility teaches the source audit about ComfyUI's path-loaded BSA
 # module alias before either BSA recovery or Keyless fallback relies on ownership.
 install_core_bsa_loader_compat()
