@@ -328,7 +328,6 @@ def test_bypass_marker_is_forecast_safe_without_core_bsa_receipts(monkeypatch):
     def original(*args, **kwargs):
         nonlocal original_called
         original_called = True
-        return None
 
     monkeypatch.setattr(keyless_core_bsa_fallback, "_ORIGINAL_PREFLIGHT", original)
     result = keyless_core_bsa_fallback._preflight(options, None, None)
