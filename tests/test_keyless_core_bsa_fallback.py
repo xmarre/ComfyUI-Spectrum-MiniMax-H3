@@ -3,9 +3,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from comfyui_spectrum_h3 import (
     core_bsa_forecast_recovery,
+    core_bsa_preprocess_compat,
     keyless_compat,
     keyless_core_bsa_fallback,
 )
@@ -120,11 +122,52 @@ def _reviewed_bsa_options(model):
         ("double_block", index): nodes.make_h3_block_patch(block, index, patch)
         for index, block in enumerate(model.blocks)
     }
-    return {
+    return nodes, patch, {
         "patches_replace": {"dit": dit},
         "optimized_attention_override": override,
         "callbacks": {"prepare": {"block_sparse_attention": object()}},
     }
+
+
+def _reviewed_untwist_factory():
+    try:
+        from flux_untwist import patches
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"reviewed Untwist fixture is unavailable: {exc}")
+    blob = keyless_core_bsa_fallback.core_bsa_compat._module_blob_sha(patches)
+    if blob not in core_bsa_preprocess_compat.AUDITED_UNTWIST_GIT_BLOBS:
+        pytest.skip("this Untwist fixture is not the reviewed v0.2.4 source")
+    return patches.make_minimax_h3_attention_override
+
+
+def _with_reviewed_untwist(options, inherited, *, instance_id="untwist-keyless-1"):
+    outer = _reviewed_untwist_factory()(inherited)
+    out = dict(options)
+    out["optimized_attention_override"] = outer
+    out["minimax_h3_untwist_rope"] = {
+        "enabled": True,
+        "progress": 0.5,
+        "start_percent": 0.0,
+        "end_percent": 1.0,
+        "high_scale_start": 0.5,
+        "high_scale_end": 0.5,
+        "low_scale_start": 1.0,
+        "low_scale_end": 1.0,
+        "beta": 2.0,
+        "rope_axis_count": 3,
+        "rope_freqs_per_axis": 1,
+        "reference_ranges": [(0, 2)],
+    }
+    out["spectrum_h3_visual_reference_patch_runtime"] = (
+        {
+            "schema_version": 2,
+            "provider": "comfyui-flux2-untwisting-rope",
+            "instance_id": instance_id,
+            "schedule_progress": 0.5,
+            "active": True,
+        },
+    )
+    return out, outer
 
 
 def test_direct_core_bsa_is_removed_only_from_local_keyless_options(monkeypatch):
@@ -157,7 +200,7 @@ def test_direct_core_bsa_is_removed_only_from_local_keyless_options(monkeypatch)
 
 def test_reviewed_core_bsa_ownership_proof_never_requires_fake_keyless_qkv():
     model = _keyless_model()
-    options = _reviewed_bsa_options(model)
+    _nodes, _patch, options = _reviewed_bsa_options(model)
     assert all(not hasattr(block.attn, "qkv_proj") for block in model.blocks)
 
     proof = keyless_core_bsa_fallback._resolve_direct_core_bsa(options, model)
@@ -169,6 +212,72 @@ def test_reviewed_core_bsa_ownership_proof_never_requires_fake_keyless_qkv():
     assert "optimized_attention_override" not in prepared
     assert prepared["patches_replace"]["dit"] == {}
     assert all(not hasattr(block.attn, "qkv_proj") for block in model.blocks)
+
+
+def test_reviewed_outer_untwist_is_rebuilt_without_bsa_and_keeps_raw_v():
+    model = _keyless_model()
+    _nodes, _patch, options = _reviewed_bsa_options(model)
+    bsa_override = options["optimized_attention_override"]
+    options, outer = _with_reviewed_untwist(options, bsa_override)
+
+    prepared, identity = keyless_core_bsa_fallback.prepare_reference_options(options, model)
+    restored = prepared["optimized_attention_override"]
+    assert restored is not outer
+    assert restored is not bsa_override
+    transform, previous = restored.attention_preprocess_v1
+    assert previous is None
+    assert core_bsa_preprocess_compat._audited_untwist_preprocess(transform) is not None
+    assert identity[-2][0] == "outer_preprocess"
+    assert identity[-2][1] is not None
+
+    q = torch.ones(1, 2, 4, 128)
+    route = torch.ones_like(q)
+    raw_v = torch.arange(q.numel(), dtype=q.dtype).reshape_as(q)
+
+    def original(q_in, route_in, v_in, _heads, **_kwargs):
+        return q_in, route_in, v_in
+
+    q_out, route_out, v_out = restored(
+        original,
+        q,
+        route,
+        raw_v,
+        2,
+        transformer_options=prepared,
+    )
+    assert torch.equal(q_out, q)
+    assert not torch.equal(route_out[:, :, :2, :], route[:, :, :2, :])
+    assert torch.equal(route_out[:, :, 2:, :], route[:, :, 2:, :])
+    assert torch.equal(v_out, raw_v)
+
+
+def test_reviewed_untwist_below_bsa_is_restored_directly():
+    model = _keyless_model()
+    nodes, patch, options = _reviewed_bsa_options(model)
+    options, untwist = _with_reviewed_untwist(options, None, instance_id="untwist-below")
+    bsa_override = nodes.make_attention_override(patch, untwist)
+    patch.installed.add(bsa_override)
+    options["optimized_attention_override"] = bsa_override
+
+    prepared, identity = keyless_core_bsa_fallback.prepare_reference_options(options, model)
+    assert prepared["optimized_attention_override"] is untwist
+    assert prepared["patches_replace"]["dit"] == {}
+    assert identity[-2][0] == "outer_preprocess"
+    assert identity[-2][1] is not None
+
+
+def test_unknown_inherited_override_is_not_silently_discarded():
+    model = _keyless_model()
+    nodes, patch, options = _reviewed_bsa_options(model)
+
+    def opaque(*args, **kwargs):
+        return None
+
+    bsa_override = nodes.make_attention_override(patch, opaque)
+    patch.installed.add(bsa_override)
+    options["optimized_attention_override"] = bsa_override
+    with pytest.raises(RuntimeError, match="silently discard an opaque"):
+        keyless_core_bsa_fallback.prepare_reference_options(options, model)
 
 
 def test_opaque_keyless_core_bsa_fails_before_qkv_execution(monkeypatch):
@@ -184,7 +293,7 @@ def test_opaque_keyless_core_bsa_fails_before_qkv_execution(monkeypatch):
         "_resolve_direct_core_bsa",
         lambda value, inner: None,
     )
-    with pytest.raises(RuntimeError, match="Refusing to execute an opaque QKV block replacement"):
+    with pytest.raises(RuntimeError, match="Refusing to execute or silently discard"):
         keyless_core_bsa_fallback.prepare_reference_options(options, model)
 
 
