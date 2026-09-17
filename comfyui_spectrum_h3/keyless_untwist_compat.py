@@ -135,20 +135,20 @@ def _snapshot_semantics(
     if any(not hasattr(snapshot, name) for name in required):
         return None
 
-    instance_id = getattr(snapshot, "instance_id")
-    scope = getattr(snapshot, "reference_scope")
+    instance_id = snapshot.instance_id
+    scope = snapshot.reference_scope
     if not isinstance(instance_id, str) or not instance_id or scope not in _REFERENCE_SCOPES:
         return None
     try:
-        expected_rows = int(getattr(snapshot, "expected_rows"))
-        axis_count = int(getattr(snapshot, "rope_axis_count"))
-        freq_count = int(getattr(snapshot, "rope_freqs_per_axis"))
+        expected_rows = int(snapshot.expected_rows)
+        axis_count = int(snapshot.rope_axis_count)
+        freq_count = int(snapshot.rope_freqs_per_axis)
     except (TypeError, ValueError):
         return None
     if expected_rows <= 0 or axis_count <= 0 or freq_count <= 0:
         return None
 
-    raw_ranges = getattr(snapshot, "reference_ranges")
+    raw_ranges = snapshot.reference_ranges
     if not isinstance(raw_ranges, tuple) or not raw_ranges:
         return None
     ranges: list[tuple[int, int]] = []
@@ -186,7 +186,7 @@ def _snapshot_semantics(
         and 0.0 <= numeric["progress"] <= 1.0
     ):
         return None
-    temporal = getattr(snapshot, "scale_temporal_axis")
+    temporal = snapshot.scale_temporal_axis
     if not isinstance(temporal, bool):
         return None
 
