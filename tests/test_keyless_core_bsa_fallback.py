@@ -83,7 +83,7 @@ def _proof():
 
 
 def _direct_bsa_options():
-    dit = {( "double_block", index): object() for index in range(50)}
+    dit = {("double_block", index): object() for index in range(50)}
     dit[("foreign", 3)] = "keep-me"
     return {
         "patches_replace": {"dit": dit, "other": {"x": "keep"}},
