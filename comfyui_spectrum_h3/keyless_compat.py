@@ -90,9 +90,9 @@ def validate_keyless_contract(inner: Any) -> Any | None:
             "Keyless H3 model is missing inherited MiniMax H3 fields: "
             + ", ".join(missing_common)
         )
-    if int(getattr(inner, "hidden_size")) != KEYLESS_HIDDEN_SIZE:
+    if int(inner.hidden_size) != KEYLESS_HIDDEN_SIZE:
         raise KeylessCompatibilityError("Keyless H3 hidden_size disagrees with its semantic contract")
-    if not isinstance(getattr(inner, "use_adaln_curves"), bool):
+    if not isinstance(inner.use_adaln_curves, bool):
         raise KeylessCompatibilityError("Keyless H3 use_adaln_curves must be boolean")
     timestep_attribute = "adaln_t_table" if inner.use_adaln_curves else "time_embedder"
     if not hasattr(inner, timestep_attribute):
@@ -100,7 +100,7 @@ def validate_keyless_contract(inner: Any) -> Any | None:
             f"Keyless H3 model is missing inherited timestep field {timestep_attribute!r}"
         )
 
-    blocks = getattr(inner, "blocks")
+    blocks = inner.blocks
     try:
         block_count = len(blocks)
     except TypeError as exc:
@@ -109,7 +109,7 @@ def validate_keyless_contract(inner: Any) -> Any | None:
         raise KeylessCompatibilityError(
             f"Keyless H3 has {block_count} core blocks; expected {KEYLESS_CORE_BLOCKS}"
         )
-    refiner_blocks = getattr(getattr(inner, "token_refiner"), "blocks", None)
+    refiner_blocks = getattr(inner.token_refiner, "blocks", None)
     if refiner_blocks is None or len(refiner_blocks) != KEYLESS_TOKEN_REFINER_BLOCKS:
         raise KeylessCompatibilityError(
             "Keyless H3 must preserve exactly two native-QKV token-refiner blocks"

@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from . import core_bsa_compat, minimax_h3
+from . import core_bsa_compat, keyless_untwist_compat, minimax_h3
 from .keyless_compat import (
     KEYLESS_CONTRACT_KEY,
     keyless_semantic_identity,
@@ -116,10 +116,10 @@ def _freeze_option(value: Any) -> Any:
     if all(hasattr(value, name) for name in ("start", "stop", "indices", "identity")):
         return (
             "row_domain",
-            getattr(value, "start"),
-            getattr(value, "stop"),
-            _freeze_option(getattr(value, "indices")),
-            _freeze_option(getattr(value, "identity")),
+            value.start,
+            value.stop,
+            _freeze_option(value.indices),
+            _freeze_option(value.identity),
         )
     return (
         "object",
@@ -147,7 +147,22 @@ def _declared_identity(value: Any) -> Any:
     return _freeze_option(value)
 
 
-def _preprocessor_identity(value: Any) -> tuple[Any, ...]:
+def _preprocessor_identity(
+    value: Any,
+    transformer_options: dict[str, Any] | None = None,
+) -> tuple[Any, ...]:
+    options = {} if transformer_options is None else transformer_options
+    reviewed_untwist = keyless_untwist_compat.reviewed_keyless_untwist_identity(
+        value,
+        options,
+    )
+    if reviewed_untwist is not None:
+        # The reviewed adapter deliberately omits only denoising progress: the
+        # visual-reference external-patch transaction already tracks that exact
+        # coordinate and hard schedule transitions. Static route semantics remain
+        # identity-bearing here.
+        return ("reviewed_external_route", reviewed_untwist)
+
     declared = getattr(value, "identity", None)
     fn = getattr(value, "fn", None)
     if callable(fn):
@@ -186,7 +201,10 @@ def _keyless_runtime_identity(transformer_options: dict[str, Any]) -> tuple[Any,
     )
     preprocessors = transformer_options.get(_KEYLESS_PREPROCESSORS, ())
     try:
-        preprocessor_identity = tuple(_preprocessor_identity(item) for item in preprocessors)
+        preprocessor_identity = tuple(
+            _preprocessor_identity(item, transformer_options)
+            for item in preprocessors
+        )
     except TypeError:
         preprocessor_identity = (
             (

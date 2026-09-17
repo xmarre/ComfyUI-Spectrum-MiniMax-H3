@@ -7,11 +7,16 @@ prove the exact reviewed core-BSA ownership, this adapter removes only those
 per-call QKV producer replacements from Spectrum's local transformer-options copy.
 The real Keyless attention then executes through its materialized Q/route/V path.
 
-A reviewed Untwist H3 preprocessor is preserved as a routing-only transform when
-it is the sole layer immediately above or below core BSA. Unknown attention
-wrappers remain fail-closed: silently discarding them could change the numerical
-workflow even if doing so happened to avoid the QKV attribute crash. The shared
-ModelPatcher is never mutated.
+Current canonical Untwist composes through Keyless's routing-preprocessor chain and
+therefore survives this BSA removal without owning attention. The older reviewed
+logical-K Untwist override is still preserved exactly once when it is the sole layer
+immediately above or below core BSA. Unknown attention wrappers remain fail-closed:
+silently discarding them could change the numerical workflow even if doing so
+happened to avoid the QKV attribute crash. The shared ModelPatcher is never mutated.
+
+The bypass history identity binds the complete remaining Keyless numerical route
+after BSA removal. Opaque Keyless providers or receipt policies remain actual-only;
+source-proving the removed BSA producer does not qualify unrelated providers.
 """
 from __future__ import annotations
 
@@ -23,11 +28,12 @@ from . import (
     core_bsa_compat,
     core_bsa_loader_compat,
     core_bsa_preprocess_compat,
+    keyless_runtime_compat,
 )
 from .keyless_compat import keyless_semantic_identity, validate_keyless_contract
 
 BYPASS_KEY = "spectrum_keyless_core_bsa_reference_bypass_v1"
-BYPASS_VERSION = 1
+BYPASS_VERSION = 2
 
 _ORIGINAL_PREPARE = None
 _ORIGINAL_PREFLIGHT = None
@@ -129,14 +135,7 @@ def _reviewed_untwist_restore(
     override: Any,
     options: dict[str, Any],
 ) -> tuple[Any, tuple[Any, ...]] | None:
-    """Accept a standalone reviewed Untwist layer whose inherited provider is dense.
-
-    The current Untwist H3 preprocessor changes only its logical ``k`` tensor and
-    leaves q/v unchanged. On Keyless materialized attention that tensor is exactly
-    ``route(V)``, so retaining this layer transforms routing while retrieval keeps
-    the original projected V. An inner provider would need its own Keyless audit and
-    is intentionally rejected here.
-    """
+    """Accept a standalone reviewed legacy Untwist layer whose inheritance is dense."""
     contract = getattr(override, "attention_preprocess_v1", None)
     if not isinstance(contract, tuple) or len(contract) != 2:
         return None
@@ -162,13 +161,7 @@ def _rebuild_outer_untwist_without_bsa(
     bsa_override: Any,
     preprocess_identity: tuple[Any, ...],
 ) -> Any | None:
-    """Recreate reviewed Untwist with dense inheritance after removing BSA.
-
-    The source-gated outer Untwist wrapper closes over BSA. Keeping that same
-    callable would re-enter the QKV producer even after block replacements were
-    removed, so construct the equivalent reviewed wrapper with no inherited
-    provider. This is only valid when BSA itself had no lower override.
-    """
+    """Recreate reviewed legacy Untwist with dense inheritance after removing BSA."""
     if _bsa_previous(bsa_override) is not None:
         return None
     current = options.get("optimized_attention_override")
@@ -202,7 +195,7 @@ def _rebuild_outer_untwist_without_bsa(
 
 
 def _resolve_direct_core_bsa(options: dict[str, Any], model: Any) -> CoreBSAReferenceProof | None:
-    """Resolve reviewed BSA directly or through the one reviewed Untwist layer."""
+    """Resolve reviewed BSA directly or through the one reviewed legacy Untwist layer."""
     current = options.get("optimized_attention_override")
 
     if core_bsa_compat._looks_like_core_bsa_callable(
@@ -244,6 +237,63 @@ def _resolve_direct_core_bsa(options: dict[str, Any], model: Any) -> CoreBSARefe
         restored_override=restored_override,
         preprocess_identity=preprocess_identity,
     )
+
+
+def _route_bound_bypass_identity(
+    proof: CoreBSAReferenceProof,
+    model: Any,
+    options: dict[str, Any],
+) -> tuple[Any, ...]:
+    return (
+        *proof.identity(model),
+        (
+            "keyless_runtime_identity",
+            keyless_runtime_compat._keyless_runtime_identity(options),
+        ),
+    )
+
+
+def _bypass_forecast_safe(options: dict[str, Any], identity: Any) -> bool:
+    if (
+        not isinstance(identity, tuple)
+        or len(identity) != 9
+        or identity[0] != BYPASS_KEY
+        or identity[1] != BYPASS_VERSION
+        or not isinstance(identity[-1], tuple)
+        or len(identity[-1]) != 2
+        or identity[-1][0] != "keyless_runtime_identity"
+    ):
+        return False
+    current_runtime = keyless_runtime_compat._keyless_runtime_identity(options)
+    if identity[-1][1] != current_runtime:
+        return False
+
+    # BSA ownership proves only the removed QKV producer. It must not promote an
+    # unrelated opaque Keyless provider or receipt-policy composition to forecast-safe.
+    if options.get(keyless_runtime_compat._KEYLESS_PROVIDER) is not None:
+        return False
+    policies = options.get(backend_history.POLICIES)
+    if isinstance(policies, dict) and policies:
+        return False
+    if policies not in (None, {}, ()):
+        return False
+
+    override = options.get("optimized_attention_override")
+    if override is None:
+        return True
+
+    # The only override that prepare_reference_options may intentionally restore is
+    # the source-gated legacy Untwist layer represented in the BSA proof itself.
+    outer_preprocess = identity[6]
+    if (
+        not isinstance(outer_preprocess, tuple)
+        or len(outer_preprocess) != 2
+        or outer_preprocess[0] != "outer_preprocess"
+        or outer_preprocess[1] is None
+    ):
+        return False
+    restored = _reviewed_untwist_restore(override, options)
+    return restored is not None and restored[1] == outer_preprocess[1]
 
 
 def prepare_reference_options(
@@ -292,7 +342,7 @@ def prepare_reference_options(
     else:
         copied["optimized_attention_override"] = proof.restored_override
     copied.pop(core_bsa_compat.PRIVATE_AUDIT_KEY, None)
-    identity = proof.identity(model)
+    identity = _route_bound_bypass_identity(proof, model, copied)
     copied[BYPASS_KEY] = identity
     return copied, identity
 
@@ -300,9 +350,8 @@ def prepare_reference_options(
 def _preflight(options: dict[str, Any], layout: Any, model: Any):
     identity = options.get(BYPASS_KEY)
     if identity is not None:
-        if not isinstance(identity, tuple) or not identity or identity[0] != BYPASS_KEY:
-            return (BYPASS_KEY, "invalid_marker"), False, None
-        return identity, True, None
+        safe = _bypass_forecast_safe(options, identity)
+        return identity if safe else (BYPASS_KEY, "invalid_or_opaque_bypass", identity), safe, None
     if _ORIGINAL_PREFLIGHT is None:
         raise RuntimeError("Keyless core-BSA fallback was not installed")
     return _ORIGINAL_PREFLIGHT(options, layout, model)
@@ -324,6 +373,7 @@ def _observe(runtime, run_id, step_id, options, policy):
             and identity
             and identity[0] == BYPASS_KEY
             and options.get(BYPASS_KEY) == identity
+            and _bypass_forecast_safe(options, identity)
         ):
             runtime.observe_backend_history(run_id, step_id, identity, (), True)
             return
