@@ -11,6 +11,7 @@ from .external_patch_hardening import install_external_patch_hardening
 from .external_patch_visual_reference import install_visual_reference_patch_compat
 from .forecast import HistoryWeightForecaster
 from .generic_correction import install_generic_residual_correction
+from .keyless_model_aware_compat import install_keyless_model_aware_compat
 from .minimax_h3 import locate_minimax_h3_inner, require_native_minimax_h3
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .postrun_safety import install_postrun_safety
@@ -27,6 +28,7 @@ from .replay_trust_shadow import install_replay_native_trust_shadow
 from .runtime import SpectrumH3Runtime
 from .trust_probe import install_forecast_trust_probe
 
+install_keyless_model_aware_compat()
 install_core_bsa_loader_compat()
 install_bsa_transition_probe_compat()
 install_bsa_transition_probe_manual_only()
