@@ -6,8 +6,7 @@ from .config import SpectrumH3Config
 from .keyless_compat import (
     require_spectrum_minimax_h3 as require_native_minimax_h3,
 )
-from .keyless_compat import validate_keyless_contract
-from .minimax_h3 import install_h3_wrapper, locate_minimax_h3_inner
+from .minimax_h3 import install_h3_wrapper
 from .objective_media_nodes import (
     NODE_CLASS_MAPPINGS as OBJECTIVE_NODE_CLASS_MAPPINGS,
 )
@@ -342,12 +341,6 @@ class SpectrumApplyMiniMaxH3:
         if not enabled:
             return (model,)
         require_native_minimax_h3(model)
-        inner, _ = locate_minimax_h3_inner(model)
-        if validate_keyless_contract(inner) is not None and str(model_aware_mode) != "off":
-            raise RuntimeError(
-                "Spectrum model-aware modes are not yet Keyless-aware; use model_aware_mode='off' "
-                "until the qv-specific model-profile contract is installed"
-            )
         resolved_degree = int(degree)
         resolved_warmup_steps = int(warmup_steps)
         if not isinstance(bootstrap_first_forecast, bool):
