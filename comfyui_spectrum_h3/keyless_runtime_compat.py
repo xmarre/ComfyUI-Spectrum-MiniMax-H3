@@ -134,6 +134,13 @@ def _callable_identity(value: Any) -> tuple[Any, ...]:
     )
 
 
+def _declared_identity(value: Any) -> Any:
+    """Freeze a declared identity without depending on ephemeral bound-method objects."""
+    if callable(value):
+        return ("callable", _callable_identity(value))
+    return _freeze_option(value)
+
+
 def _preprocessor_identity(value: Any) -> tuple[Any, ...]:
     declared = getattr(value, "identity", None)
     fn = getattr(value, "fn", None)
@@ -148,7 +155,7 @@ def _preprocessor_identity(value: Any) -> tuple[Any, ...]:
             type(value).__qualname__,
             id(value),
         )
-    return (_freeze_option(declared), implementation)
+    return (_declared_identity(declared), implementation)
 
 
 def _keyless_runtime_identity(transformer_options: dict[str, Any]) -> tuple[Any, ...]:
@@ -168,7 +175,7 @@ def _keyless_runtime_identity(transformer_options: dict[str, Any]) -> tuple[Any,
             "provider",
             getattr(provider, "api", None),
             _callable_identity(provider),
-            _freeze_option(getattr(provider, "identity", None)),
+            _declared_identity(getattr(provider, "identity", None)),
         )
     )
     preprocessors = transformer_options.get(_KEYLESS_PREPROCESSORS, ())
