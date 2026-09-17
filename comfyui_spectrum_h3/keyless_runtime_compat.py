@@ -4,7 +4,11 @@ import importlib
 from typing import Any
 
 from . import minimax_h3
-from .keyless_compat import KEYLESS_CONTRACT_KEY, validate_keyless_contract
+from .keyless_compat import (
+    KEYLESS_CONTRACT_KEY,
+    keyless_semantic_identity,
+    validate_keyless_contract,
+)
 
 _NATIVE_H3_MODULE = "comfy.ldm.minimax.model"
 _NATIVE_HELPERS = (
@@ -18,6 +22,7 @@ _NATIVE_HELPERS = (
 
 _ORIGINAL_IS_NATIVE_MINIMAX_H3 = minimax_h3.is_native_minimax_h3
 _ORIGINAL_NATIVE_MODULE = minimax_h3._native_module
+_ORIGINAL_TOPOLOGY_SIGNATURE = minimax_h3.topology_signature
 _INSTALLED = False
 
 
@@ -57,6 +62,30 @@ def _runtime_native_module(inner: Any):
     return module
 
 
+def _topology_signature(
+    inner: Any,
+    video_x,
+    audio_x,
+    context,
+    layout: Any,
+    transformer_options: dict[str, Any],
+    payload: dict[str, Any],
+) -> tuple[Any, ...]:
+    base = _ORIGINAL_TOPOLOGY_SIGNATURE(
+        inner,
+        video_x,
+        audio_x,
+        context,
+        layout,
+        transformer_options,
+        payload,
+    )
+    identity = keyless_semantic_identity(inner)
+    if identity is None:
+        return base
+    return (*base, ("keyless_semantic_identity", identity))
+
+
 def install_keyless_runtime_compat() -> None:
     """Extend Spectrum's H3 wrapper to exact Keyless v1 subclasses without fake QKV."""
     global _INSTALLED
@@ -64,4 +93,5 @@ def install_keyless_runtime_compat() -> None:
         return
     minimax_h3.is_native_minimax_h3 = _is_spectrum_minimax_h3
     minimax_h3._native_module = _runtime_native_module
+    minimax_h3.topology_signature = _topology_signature
     _INSTALLED = True
