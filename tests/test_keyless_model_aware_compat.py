@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from comfyui_spectrum_h3 import model_aware
 from comfyui_spectrum_h3 import keyless_compat
+from comfyui_spectrum_h3 import model_aware
 
 
 class Contract:
@@ -43,11 +43,13 @@ class Contract:
 
 
 def _keyless_inner(provenance="a"):
-    attention = lambda: SimpleNamespace(
-        qv_proj=SimpleNamespace(weight=SimpleNamespace(shape=(14336, 5376))),
-        q_norm=object(),
-        route_norm=object(),
-    )
+    def attention():
+        return SimpleNamespace(
+            qv_proj=SimpleNamespace(weight=SimpleNamespace(shape=(14336, 5376))),
+            q_norm=object(),
+            route_norm=object(),
+        )
+
     inner = SimpleNamespace(
         blocks=[SimpleNamespace(attn=attention()) for _ in range(50)],
         token_refiner=SimpleNamespace(blocks=[object(), object()]),
