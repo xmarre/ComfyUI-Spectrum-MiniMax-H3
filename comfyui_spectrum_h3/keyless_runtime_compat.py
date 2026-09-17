@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from . import minimax_h3
+from . import core_bsa_compat, minimax_h3
 from .keyless_compat import (
     KEYLESS_CONTRACT_KEY,
     keyless_semantic_identity,
@@ -72,12 +72,18 @@ def _runtime_native_module(inner: Any):
     return module
 
 
+def _lifetime_identity(value: Any) -> int:
+    """Return a process-lifetime identity that cannot alias after address reuse."""
+    return core_bsa_compat._lifetime_generation(value)
+
+
 def _freeze_option(value: Any) -> Any:
     """Build a bounded hashable identity for Keyless numerical routing options.
 
-    Tensor contents are deliberately not copied or synchronized. Object identity plus
-    PyTorch's mutation version is enough to invalidate Spectrum history when the same
-    tensor is edited in-place; replacing a tensor changes its object identity.
+    Tensor contents are deliberately not copied or synchronized. A process-lifetime
+    object generation plus PyTorch's mutation version invalidates Spectrum history
+    both when a tensor is replaced and when the same tensor is edited in-place,
+    without relying on recyclable CPython addresses.
     """
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -91,7 +97,7 @@ def _freeze_option(value: Any) -> Any:
             tuple(int(v) for v in value.shape),
             str(value.dtype),
             str(value.device),
-            id(value),
+            _lifetime_identity(value),
             version,
         )
     if isinstance(value, slice):
@@ -119,7 +125,7 @@ def _freeze_option(value: Any) -> Any:
         "object",
         type(value).__module__,
         type(value).__qualname__,
-        id(value),
+        _lifetime_identity(value),
     )
 
 
@@ -129,8 +135,8 @@ def _callable_identity(value: Any) -> tuple[Any, ...]:
     return (
         str(getattr(base, "__module__", type(base).__module__)),
         str(getattr(base, "__qualname__", type(base).__qualname__)),
-        id(base),
-        None if owner is None else id(owner),
+        _lifetime_identity(base),
+        None if owner is None else _lifetime_identity(owner),
     )
 
 
@@ -153,7 +159,7 @@ def _preprocessor_identity(value: Any) -> tuple[Any, ...]:
             "non_callable",
             type(value).__module__,
             type(value).__qualname__,
-            id(value),
+            _lifetime_identity(value),
         )
     return (_declared_identity(declared), implementation)
 
@@ -187,7 +193,7 @@ def _keyless_runtime_identity(transformer_options: dict[str, Any]) -> tuple[Any,
                 "invalid_container",
                 type(preprocessors).__module__,
                 type(preprocessors).__qualname__,
-                id(preprocessors),
+                _lifetime_identity(preprocessors),
             ),
         )
 
