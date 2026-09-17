@@ -1,0 +1,222 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from comfyui_spectrum_h3 import (
+    core_bsa_forecast_recovery,
+    keyless_compat,
+    keyless_core_bsa_fallback,
+)
+
+
+class Contract:
+    api = 1
+    architecture = "h3_keyless_core50_v1"
+    core_blocks = 50
+    token_refiner = "native_qkv"
+    token_refiner_blocks = 2
+    heads = 56
+    head_dim = 128
+    inner_dim = 7168
+    hidden_size = 5376
+    routing_source = "value"
+    retrieval_source = "raw_projected_value"
+    routing_norm = "rmsnorm"
+    routing_norm_epsilon = 1e-5
+    rope_policy = "h3_split_half_96_v1"
+    qv_order = "q_effective;v"
+    projection_attr = "qv_proj"
+    checkpoint_format_version = 1
+    provenance_identity = "artifact-a"
+
+    def identity(self):
+        return (
+            self.api,
+            self.architecture,
+            self.checkpoint_format_version,
+            self.qv_order,
+            self.routing_source,
+            self.retrieval_source,
+            self.provenance_identity,
+        )
+
+
+def _keyless_model():
+    def attention():
+        return SimpleNamespace(
+            qv_proj=SimpleNamespace(weight=SimpleNamespace(shape=(14336, 5376))),
+            q_norm=object(),
+            route_norm=object(),
+        )
+
+    model = SimpleNamespace(
+        blocks=[SimpleNamespace(attn=attention()) for _ in range(50)],
+        token_refiner=SimpleNamespace(blocks=[object(), object()]),
+        final_layer=object(),
+        hidden_size=5376,
+        patch_size=(1, 2, 2),
+        latents_dim=16,
+        audio_latents_dim=8,
+        sigma_shift_video=1.0,
+        sigma_shift_audio=1.0,
+        use_adaln_curves=True,
+        video_patch_proj=object(),
+        audio_patch_proj=object(),
+        adaln_t_table=object(),
+    )
+    setattr(model, keyless_compat.KEYLESS_CONTRACT_KEY, Contract())
+    return model
+
+
+def _proof():
+    return keyless_core_bsa_fallback.CoreBSAReferenceProof(
+        module=object(),
+        source_blob="0" * 40,
+        patch=object(),
+        settings_identity=(False, 1.3, 0.0, 0, 1.0, 0.0, 12288, (), "exact_kv"),
+        patch_generation=7,
+    )
+
+
+def _direct_bsa_options():
+    dit = {
+        ("double_block", index): object()
+        for index in range(50)
+    }
+    dit[("foreign", 3)] = "keep-me"
+    return {
+        "patches_replace": {"dit": dit, "other": {"x": "keep"}},
+        "optimized_attention_override": object(),
+        "callbacks": {"prepare": {"block_sparse_attention": object()}},
+        "unrelated": "keep",
+    }
+
+
+def test_direct_core_bsa_is_removed_only_from_local_keyless_options(monkeypatch):
+    model = _keyless_model()
+    options = _direct_bsa_options()
+    monkeypatch.setattr(
+        keyless_core_bsa_fallback.core_bsa_compat,
+        "has_core_bsa_evidence",
+        lambda value: True,
+    )
+    monkeypatch.setattr(
+        keyless_core_bsa_fallback,
+        "_resolve_direct_core_bsa",
+        lambda value, inner: _proof(),
+    )
+
+    prepared, identity = keyless_core_bsa_fallback.prepare_reference_options(options, model)
+    assert prepared is not options
+    assert options["optimized_attention_override"] is not None
+    assert len(options["patches_replace"]["dit"]) == 51
+    assert "optimized_attention_override" not in prepared
+    assert prepared["patches_replace"]["dit"] == {("foreign", 3): "keep-me"}
+    assert prepared["patches_replace"]["other"] == {"x": "keep"}
+    assert prepared["callbacks"] is options["callbacks"]
+    assert prepared["unrelated"] == "keep"
+    assert prepared[keyless_core_bsa_fallback.BYPASS_KEY] == identity
+    assert identity[0] == keyless_core_bsa_fallback.BYPASS_KEY
+    assert identity[-1] == "dense_materialized_route"
+
+
+def test_opaque_keyless_core_bsa_fails_before_qkv_execution(monkeypatch):
+    model = _keyless_model()
+    options = _direct_bsa_options()
+    monkeypatch.setattr(
+        keyless_core_bsa_fallback.core_bsa_compat,
+        "has_core_bsa_evidence",
+        lambda value: True,
+    )
+    monkeypatch.setattr(
+        keyless_core_bsa_fallback,
+        "_resolve_direct_core_bsa",
+        lambda value, inner: None,
+    )
+    with pytest.raises(RuntimeError, match="Refusing to execute an opaque QKV block replacement"):
+        keyless_core_bsa_fallback.prepare_reference_options(options, model)
+
+
+def test_native_qkv_options_are_not_touched(monkeypatch):
+    options = _direct_bsa_options()
+    native = SimpleNamespace()
+    monkeypatch.setattr(
+        keyless_core_bsa_fallback.core_bsa_compat,
+        "has_core_bsa_evidence",
+        lambda value: True,
+    )
+    prepared, identity = keyless_core_bsa_fallback.prepare_reference_options(options, native)
+    assert prepared is options
+    assert identity is None
+
+
+def test_bypass_marker_is_forecast_safe_without_core_bsa_receipts(monkeypatch):
+    identity = (keyless_core_bsa_fallback.BYPASS_KEY, 1, "semantic")
+    original_called = False
+
+    def original(*args, **kwargs):
+        nonlocal original_called
+        original_called = True
+        return None
+
+    monkeypatch.setattr(keyless_core_bsa_fallback, "_ORIGINAL_PREFLIGHT", original)
+    result = keyless_core_bsa_fallback._preflight(
+        {keyless_core_bsa_fallback.BYPASS_KEY: identity}, None, None
+    )
+    assert result == (identity, True, None)
+    assert original_called is False
+
+    observed = []
+    runtime = SimpleNamespace(
+        observe_backend_history=lambda *args: observed.append(args)
+    )
+    monkeypatch.setattr(keyless_core_bsa_fallback, "_ORIGINAL_OBSERVE", original)
+    keyless_core_bsa_fallback._observe(
+        runtime,
+        4,
+        9,
+        {keyless_core_bsa_fallback.BYPASS_KEY: identity},
+        (identity, True),
+    )
+    assert observed == [(4, 9, identity, (), True)]
+    assert original_called is False
+
+
+def test_prepare_strips_bsa_before_delegating_to_history_stack(monkeypatch):
+    model = _keyless_model()
+    options = _direct_bsa_options()
+    monkeypatch.setattr(
+        keyless_core_bsa_fallback.core_bsa_compat,
+        "has_core_bsa_evidence",
+        lambda value: True,
+    )
+    monkeypatch.setattr(
+        keyless_core_bsa_fallback,
+        "_resolve_direct_core_bsa",
+        lambda value, inner: _proof(),
+    )
+    delegated = []
+
+    def original(runtime, run_id, step_id, prepared, layout, inner):
+        delegated.append(prepared)
+        return prepared, (prepared[keyless_core_bsa_fallback.BYPASS_KEY], True)
+
+    monkeypatch.setattr(keyless_core_bsa_fallback, "_ORIGINAL_PREPARE", original)
+    prepared, policy = keyless_core_bsa_fallback._prepare(
+        object(), 1, 2, options, object(), model
+    )
+    assert delegated == [prepared]
+    assert "optimized_attention_override" not in prepared
+    assert not any(
+        key[0] == "double_block"
+        for key in prepared["patches_replace"]["dit"]
+    )
+    assert policy[0] == prepared[keyless_core_bsa_fallback.BYPASS_KEY]
+
+
+def test_installation_wraps_final_core_bsa_recovery_prepare():
+    # This ordering is an invariant: recovery installs a custom history.prepare
+    # implementation, so Keyless stripping must wrap it rather than be hidden by it.
+    assert keyless_core_bsa_fallback._ORIGINAL_PREPARE is core_bsa_forecast_recovery._prepare
