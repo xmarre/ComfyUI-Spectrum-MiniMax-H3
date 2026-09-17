@@ -285,12 +285,15 @@ def _bypass_forecast_safe(options: dict[str, Any], identity: Any) -> bool:
     # The only override that prepare_reference_options may intentionally restore is
     # the source-gated legacy Untwist layer represented in the BSA proof itself.
     outer_preprocess = identity[6]
-    return (
-        isinstance(outer_preprocess, tuple)
-        and len(outer_preprocess) == 2
-        and outer_preprocess[0] == "outer_preprocess"
-        and outer_preprocess[1] is not None
-    )
+    if (
+        not isinstance(outer_preprocess, tuple)
+        or len(outer_preprocess) != 2
+        or outer_preprocess[0] != "outer_preprocess"
+        or outer_preprocess[1] is None
+    ):
+        return False
+    restored = _reviewed_untwist_restore(override, options)
+    return restored is not None and restored[1] == outer_preprocess[1]
 
 
 def prepare_reference_options(
