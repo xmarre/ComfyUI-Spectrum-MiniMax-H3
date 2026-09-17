@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 from comfyui_spectrum_h3 import (
     keyless_compat,
     keyless_core_bsa_fallback,
@@ -172,6 +170,22 @@ def test_runtime_progress_mismatch_refuses_reviewed_stable_identity():
     assert generic[0] == preprocessor.identity
 
 
+def test_declared_digest_must_match_reviewed_snapshot(monkeypatch):
+    preprocessor = _preprocessor(progress=0.25)
+    monkeypatch.setattr(
+        preprocessor,
+        "identity",
+        "minimax_h3_untwist_keyless_route_v1:" + "0" * 64,
+    )
+    options = _options(preprocessor, progress=0.25)
+    assert keyless_untwist_compat.reviewed_keyless_untwist_identity(
+        preprocessor,
+        options,
+    ) is None
+    generic = keyless_runtime_compat._preprocessor_identity(preprocessor, options)
+    assert generic[0] == preprocessor.identity
+
+
 def test_missing_runtime_descriptor_refuses_reviewed_stable_identity():
     preprocessor = _preprocessor(progress=0.25)
     assert keyless_untwist_compat.reviewed_keyless_untwist_identity(
@@ -213,7 +227,8 @@ def test_core_bsa_reference_fallback_preserves_keyless_route_preprocessor(monkey
         model,
     )
 
-    assert bypass_identity == proof.identity(model)
+    assert bypass_identity[:-1] == proof.identity(model)
+    assert bypass_identity[-1][0] == "keyless_runtime_identity"
     assert prepared[_PREPROCESSORS_KEY] == (preprocessor,)
     assert prepared[_RUNTIME_KEY] == options[_RUNTIME_KEY]
     assert "optimized_attention_override" not in prepared
