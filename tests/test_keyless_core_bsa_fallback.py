@@ -94,6 +94,39 @@ def _direct_bsa_options():
     }
 
 
+def _reviewed_bsa_options(model):
+    try:
+        import comfy_extras.nodes_sparse_attention as nodes
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"core BSA is unavailable in this reviewed ComfyUI fixture: {exc}")
+    blob = keyless_core_bsa_fallback.core_bsa_compat._module_blob_sha(nodes)
+    if blob not in keyless_core_bsa_fallback.core_bsa_compat.AUDITED_BSA_GIT_BLOBS:
+        pytest.skip("this ComfyUI fixture is not the reviewed core BSA source")
+    patch = nodes.SparseAttnPatch(
+        tau=1.3,
+        topk_ratio=0.0,
+        vsa=False,
+        sigma_start=0.8,
+        sigma_end=0.0,
+        min_tokens=1,
+        dense_blocks=set(),
+        sink_conditioning="exact_kv",
+        extra_tokens=0,
+        verbose=False,
+    )
+    override = nodes.make_attention_override(patch, None)
+    patch.installed.add(override)
+    dit = {
+        ("double_block", index): nodes.make_h3_block_patch(block, index, patch)
+        for index, block in enumerate(model.blocks)
+    }
+    return {
+        "patches_replace": {"dit": dit},
+        "optimized_attention_override": override,
+        "callbacks": {"prepare": {"block_sparse_attention": object()}},
+    }
+
+
 def test_direct_core_bsa_is_removed_only_from_local_keyless_options(monkeypatch):
     model = _keyless_model()
     options = _direct_bsa_options()
@@ -120,6 +153,22 @@ def test_direct_core_bsa_is_removed_only_from_local_keyless_options(monkeypatch)
     assert prepared[keyless_core_bsa_fallback.BYPASS_KEY] == identity
     assert identity[0] == keyless_core_bsa_fallback.BYPASS_KEY
     assert identity[-1] == "dense_materialized_route"
+
+
+def test_reviewed_core_bsa_ownership_proof_never_requires_fake_keyless_qkv():
+    model = _keyless_model()
+    options = _reviewed_bsa_options(model)
+    assert all(not hasattr(block.attn, "qkv_proj") for block in model.blocks)
+
+    proof = keyless_core_bsa_fallback._resolve_direct_core_bsa(options, model)
+    assert proof is not None
+    assert proof.source_blob in keyless_core_bsa_fallback.core_bsa_compat.AUDITED_BSA_GIT_BLOBS
+
+    prepared, identity = keyless_core_bsa_fallback.prepare_reference_options(options, model)
+    assert identity == proof.identity(model)
+    assert "optimized_attention_override" not in prepared
+    assert prepared["patches_replace"]["dit"] == {}
+    assert all(not hasattr(block.attn, "qkv_proj") for block in model.blocks)
 
 
 def test_opaque_keyless_core_bsa_fails_before_qkv_execution(monkeypatch):
