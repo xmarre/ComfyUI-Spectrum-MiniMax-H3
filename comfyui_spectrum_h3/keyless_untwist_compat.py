@@ -8,14 +8,16 @@ see a new owner generation on every call and reset forecast history continuously
 
 Progress itself is already tracked by Spectrum's visual-reference external-patch
 runtime transaction. This adapter recognizes only the exact reviewed Untwist source,
-proves that its immutable snapshot matches the active runtime descriptor, and removes
-only the smooth per-call progress coordinate from backend-history identity. All
-static numerical semantics (ranges, scales, RoPE geometry, schedule window, scope,
-etc.) remain identity-bearing. Unknown or inconsistent preprocessors fall back to the
-generic Keyless identity path and therefore remain conservative.
+proves that its immutable snapshot and declared digest agree with the active runtime
+descriptor, and removes only the smooth per-call progress coordinate from backend-
+history identity. All static numerical semantics (ranges, scales, RoPE geometry,
+schedule window, scope, etc.) remain identity-bearing. Unknown or inconsistent
+preprocessors fall back to the generic Keyless identity path and remain conservative.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from pathlib import Path
 import sys
@@ -33,6 +35,8 @@ _UNTWIST_CLASS = "KeylessUntwistRoutingPreprocessor"
 _UNTWIST_PROVIDER = "comfyui-flux2-untwisting-rope"
 _UNTWIST_RUNTIME_KEY = "spectrum_h3_visual_reference_patch_runtime"
 _UNTWIST_IDENTITY_PREFIX = "minimax_h3_untwist_keyless_route_v1:"
+_UNTWIST_IDENTITY_SCHEMA = "minimax_h3_untwist_keyless_routing_preprocessor_v1"
+_UNTWIST_IDENTITY_VERSION = 1
 _REFERENCE_SCOPES = frozenset(
     {"image_only", "image_and_video", "all_visual_including_continuum"}
 )
@@ -108,7 +112,9 @@ def _runtime_identity(
     return (_UNTWIST_PROVIDER, matches[0][0], matches[0][1])
 
 
-def _snapshot_static_identity(snapshot: Any) -> tuple[Any, ...] | None:
+def _snapshot_semantics(
+    snapshot: Any,
+) -> tuple[str, float, tuple[Any, ...], dict[str, Any]] | None:
     required = (
         "instance_id",
         "expected_rows",
@@ -184,8 +190,6 @@ def _snapshot_static_identity(snapshot: Any) -> tuple[Any, ...] | None:
     if not isinstance(temporal, bool):
         return None
 
-    # Progress is intentionally returned separately. Spectrum's visual-reference
-    # external-patch transaction already identities and guards this coordinate.
     static = (
         expected_rows,
         tuple(ranges),
@@ -201,7 +205,39 @@ def _snapshot_static_identity(snapshot: Any) -> tuple[Any, ...] | None:
         numeric["end_percent"],
         temporal,
     )
-    return instance_id, numeric["progress"], static
+    identity_payload = {
+        "schema": _UNTWIST_IDENTITY_SCHEMA,
+        "version": _UNTWIST_IDENTITY_VERSION,
+        "instance_id": instance_id,
+        "expected_rows": expected_rows,
+        "reference_ranges": [list(item) for item in ranges],
+        "reference_scope": scope,
+        "rope_axis_count": axis_count,
+        "rope_freqs_per_axis": freq_count,
+        "high_scale_start": numeric["high_scale_start"],
+        "high_scale_end": numeric["high_scale_end"],
+        "low_scale_start": numeric["low_scale_start"],
+        "low_scale_end": numeric["low_scale_end"],
+        "beta": numeric["beta"],
+        "start_percent": numeric["start_percent"],
+        "end_percent": numeric["end_percent"],
+        "progress": numeric["progress"],
+        "scale_temporal_axis": temporal,
+    }
+    return instance_id, numeric["progress"], static, identity_payload
+
+
+def _expected_declared_identity(identity_payload: dict[str, Any]) -> str | None:
+    try:
+        encoded = json.dumps(
+            identity_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return _UNTWIST_IDENTITY_PREFIX + hashlib.sha256(encoded).hexdigest()
 
 
 def reviewed_keyless_untwist_identity(
@@ -214,23 +250,17 @@ def reviewed_keyless_untwist_identity(
         return None
     _module, blob = reviewed
 
-    declared = getattr(value, "identity", None)
-    if (
-        not isinstance(declared, str)
-        or not declared.startswith(_UNTWIST_IDENTITY_PREFIX)
-        or len(declared) != len(_UNTWIST_IDENTITY_PREFIX) + 64
-    ):
-        return None
-    try:
-        int(declared[len(_UNTWIST_IDENTITY_PREFIX) :], 16)
-    except ValueError:
-        return None
-
     snapshot = getattr(value, "_snapshot", None)
-    parsed = _snapshot_static_identity(snapshot)
+    parsed = _snapshot_semantics(snapshot)
     if parsed is None:
         return None
-    instance_id, progress, static = parsed
+    instance_id, progress, static, identity_payload = parsed
+
+    declared = getattr(value, "identity", None)
+    expected_declared = _expected_declared_identity(identity_payload)
+    if declared != expected_declared:
+        return None
+
     runtime = _runtime_identity(
         options,
         instance_id=instance_id,
