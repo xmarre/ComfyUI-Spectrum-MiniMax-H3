@@ -226,6 +226,34 @@ def test_keyless_runtime_identity_is_stable_for_unchanged_options(monkeypatch):
     assert first == second
 
 
+def test_callable_declared_provider_identity_is_stable(monkeypatch):
+    monkeypatch.setattr(
+        keyless_runtime_compat,
+        "_ORIGINAL_TOPOLOGY_SIGNATURE",
+        lambda *args, **kwargs: (("shape", "same"),),
+    )
+
+    class Provider:
+        api = 1
+
+        def __call__(self, **_kwargs):
+            return None
+
+        def identity(self):
+            return ("provider", "v1")
+
+    provider = Provider()
+    options = {"minimax_h3_keyless_provider_v1": provider}
+    inner = _populate_keyless(SimpleNamespace())
+    first = keyless_runtime_compat._topology_signature(
+        inner, None, None, None, None, options, {}
+    )
+    second = keyless_runtime_compat._topology_signature(
+        inner, None, None, None, None, options, {}
+    )
+    assert first == second
+
+
 def test_keyless_provider_change_invalidates_topology(monkeypatch):
     monkeypatch.setattr(
         keyless_runtime_compat,
