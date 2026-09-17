@@ -116,10 +116,10 @@ def _freeze_option(value: Any) -> Any:
     if all(hasattr(value, name) for name in ("start", "stop", "indices", "identity")):
         return (
             "row_domain",
-            getattr(value, "start"),
-            getattr(value, "stop"),
-            _freeze_option(getattr(value, "indices")),
-            _freeze_option(getattr(value, "identity")),
+            value.start,
+            value.stop,
+            _freeze_option(value.indices),
+            _freeze_option(value.identity),
         )
     return (
         "object",
