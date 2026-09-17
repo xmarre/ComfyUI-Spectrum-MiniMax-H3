@@ -25,7 +25,9 @@ class Contract:
     qv_order = "q_effective;v"
     projection_attr = "qv_proj"
     checkpoint_format_version = 1
-    provenance_identity = "artifact-a"
+
+    def __init__(self, provenance="artifact-a"):
+        self.provenance_identity = provenance
 
     def identity(self):
         return (
@@ -39,7 +41,7 @@ class Contract:
         )
 
 
-def _populate_keyless(instance):
+def _populate_keyless(instance, provenance="artifact-a"):
     def attention():
         return SimpleNamespace(
             qv_proj=SimpleNamespace(weight=SimpleNamespace(shape=(14336, 5376))),
@@ -60,7 +62,7 @@ def _populate_keyless(instance):
     instance.video_patch_proj = object()
     instance.audio_patch_proj = object()
     instance.adaln_t_table = object()
-    setattr(instance, keyless_compat.KEYLESS_CONTRACT_KEY, Contract())
+    setattr(instance, keyless_compat.KEYLESS_CONTRACT_KEY, Contract(provenance))
     return instance
 
 
@@ -161,3 +163,44 @@ def test_native_runtime_helper_resolution_is_unchanged(monkeypatch):
         lambda value: sentinel if value is inner else None,
     )
     assert keyless_runtime_compat._runtime_native_module(inner) is sentinel
+
+
+def test_keyless_topology_binds_architecture_and_checkpoint_provenance(monkeypatch):
+    monkeypatch.setattr(
+        keyless_runtime_compat,
+        "_ORIGINAL_TOPOLOGY_SIGNATURE",
+        lambda *args, **kwargs: (("shape", "same"),),
+    )
+    first = keyless_runtime_compat._topology_signature(
+        _populate_keyless(SimpleNamespace(), "artifact-a"),
+        None,
+        None,
+        None,
+        None,
+        {},
+        {},
+    )
+    second = keyless_runtime_compat._topology_signature(
+        _populate_keyless(SimpleNamespace(), "artifact-b"),
+        None,
+        None,
+        None,
+        None,
+        {},
+        {},
+    )
+    assert first != second
+    assert first[-1][0] == "keyless_semantic_identity"
+    assert first[-1][1][-1] == "artifact-a"
+
+
+def test_native_topology_signature_is_unchanged(monkeypatch):
+    expected = (("shape", "native"),)
+    monkeypatch.setattr(
+        keyless_runtime_compat,
+        "_ORIGINAL_TOPOLOGY_SIGNATURE",
+        lambda *args, **kwargs: expected,
+    )
+    assert keyless_runtime_compat._topology_signature(
+        SimpleNamespace(), None, None, None, None, {}, {}
+    ) == expected
