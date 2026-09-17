@@ -236,6 +236,36 @@ def test_core_bsa_reference_fallback_preserves_keyless_route_preprocessor(monkey
     assert options[_PREPROCESSORS_KEY] == (preprocessor,)
 
 
+def test_bsa_bypass_rejects_replaced_legacy_untwist_override():
+    model = _model()
+    proof = keyless_core_bsa_fallback.CoreBSAReferenceProof(
+        module=object(),
+        source_blob="0" * 40,
+        patch=object(),
+        settings_identity=(False, 1.3, 0.0, 0, 1.0, 0.0, 12288, (), "exact_kv"),
+        patch_generation=7,
+        preprocess_identity=(("legacy-untwist",), ("runtime",)),
+    )
+    options = {"optimized_attention_override": object()}
+    identity = keyless_core_bsa_fallback._route_bound_bypass_identity(
+        proof,
+        model,
+        options,
+    )
+    options[keyless_core_bsa_fallback.BYPASS_KEY] = identity
+
+    result_identity, safe, audit = keyless_core_bsa_fallback._preflight(
+        options,
+        None,
+        model,
+    )
+
+    assert result_identity[0] == keyless_core_bsa_fallback.BYPASS_KEY
+    assert result_identity[1] == "invalid_or_opaque_bypass"
+    assert safe is False
+    assert audit is None
+
+
 def test_unreviewed_duck_preprocessor_keeps_generic_lifetime_identity():
     class Preprocessor:
         identity = "minimax_h3_untwist_keyless_route_v1:" + "a" * 64
