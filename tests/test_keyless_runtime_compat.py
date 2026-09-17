@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from comfyui_spectrum_h3 import keyless_compat, keyless_runtime_compat, minimax_h3
 
@@ -190,8 +191,137 @@ def test_keyless_topology_binds_architecture_and_checkpoint_provenance(monkeypat
         {},
     )
     assert first != second
-    assert first[-1][0] == "keyless_semantic_identity"
-    assert first[-1][1][-1] == "artifact-a"
+    assert first[-2][0] == "keyless_semantic_identity"
+    assert first[-2][1][-1] == "artifact-a"
+    assert first[-1][0] == "keyless_runtime_identity"
+
+
+def test_keyless_runtime_identity_is_stable_for_unchanged_options(monkeypatch):
+    monkeypatch.setattr(
+        keyless_runtime_compat,
+        "_ORIGINAL_TOPOLOGY_SIGNATURE",
+        lambda *args, **kwargs: (("shape", "same"),),
+    )
+
+    class Provider:
+        api = 1
+
+        def __call__(self, **_kwargs):
+            return None
+
+    provider = Provider()
+    mask = torch.ones(4, dtype=torch.bool)
+    options = {
+        "minimax_h3_keyless_provider_v1": provider,
+        "minimax_h3_keyless_mask_v1": mask,
+        "minimax_h3_keyless_value_domain_v1": (0, 1, 2, 3),
+    }
+    inner = _populate_keyless(SimpleNamespace())
+    first = keyless_runtime_compat._topology_signature(
+        inner, None, None, None, None, options, {}
+    )
+    second = keyless_runtime_compat._topology_signature(
+        inner, None, None, None, None, options, {}
+    )
+    assert first == second
+
+
+def test_keyless_provider_change_invalidates_topology(monkeypatch):
+    monkeypatch.setattr(
+        keyless_runtime_compat,
+        "_ORIGINAL_TOPOLOGY_SIGNATURE",
+        lambda *args, **kwargs: (("shape", "same"),),
+    )
+
+    class Provider:
+        api = 1
+
+        def __call__(self, **_kwargs):
+            return None
+
+    inner = _populate_keyless(SimpleNamespace())
+    first = keyless_runtime_compat._topology_signature(
+        inner,
+        None,
+        None,
+        None,
+        None,
+        {"minimax_h3_keyless_provider_v1": Provider()},
+        {},
+    )
+    second = keyless_runtime_compat._topology_signature(
+        inner,
+        None,
+        None,
+        None,
+        None,
+        {"minimax_h3_keyless_provider_v1": Provider()},
+        {},
+    )
+    assert first != second
+
+
+def test_keyless_preprocessor_and_value_domain_changes_invalidate_topology(monkeypatch):
+    monkeypatch.setattr(
+        keyless_runtime_compat,
+        "_ORIGINAL_TOPOLOGY_SIGNATURE",
+        lambda *args, **kwargs: (("shape", "same"),),
+    )
+
+    def route_transform(value):
+        return value
+
+    class Preprocessor:
+        def __init__(self, identity):
+            self.identity = identity
+            self.fn = route_transform
+
+    inner = _populate_keyless(SimpleNamespace())
+    base_options = {
+        "minimax_h3_keyless_routing_preprocessors_v1": (Preprocessor("untwist-a"),),
+        "minimax_h3_keyless_value_domain_v1": SimpleNamespace(
+            start=0, stop=8, indices=None, identity="domain-a"
+        ),
+    }
+    first = keyless_runtime_compat._topology_signature(
+        inner, None, None, None, None, base_options, {}
+    )
+    changed_preprocessor = dict(base_options)
+    changed_preprocessor["minimax_h3_keyless_routing_preprocessors_v1"] = (
+        Preprocessor("untwist-b"),
+    )
+    second = keyless_runtime_compat._topology_signature(
+        inner, None, None, None, None, changed_preprocessor, {}
+    )
+    assert first != second
+
+    changed_domain = dict(base_options)
+    changed_domain["minimax_h3_keyless_value_domain_v1"] = SimpleNamespace(
+        start=0, stop=7, indices=None, identity="domain-b"
+    )
+    third = keyless_runtime_compat._topology_signature(
+        inner, None, None, None, None, changed_domain, {}
+    )
+    assert first != third
+
+
+def test_keyless_in_place_mask_change_invalidates_topology(monkeypatch):
+    monkeypatch.setattr(
+        keyless_runtime_compat,
+        "_ORIGINAL_TOPOLOGY_SIGNATURE",
+        lambda *args, **kwargs: (("shape", "same"),),
+    )
+    inner = _populate_keyless(SimpleNamespace())
+    mask = torch.ones(4, dtype=torch.bool)
+    options = {"minimax_h3_keyless_mask_v1": mask}
+    first = keyless_runtime_compat._topology_signature(
+        inner, None, None, None, None, options, {}
+    )
+    mask[0] = False
+    second = keyless_runtime_compat._topology_signature(
+        inner, None, None, None, None, options, {}
+    )
+    assert first != second
 
 
 def test_native_topology_signature_is_unchanged(monkeypatch):
