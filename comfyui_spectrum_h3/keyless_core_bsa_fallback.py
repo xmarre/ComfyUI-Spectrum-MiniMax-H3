@@ -22,9 +22,9 @@ from .keyless_compat import keyless_semantic_identity, validate_keyless_contract
 BYPASS_KEY = "spectrum_keyless_core_bsa_reference_bypass_v1"
 BYPASS_VERSION = 1
 
-_ORIGINAL_PREPARE = backend_history.prepare
-_ORIGINAL_PREFLIGHT = backend_history._preflight
-_ORIGINAL_OBSERVE = backend_history.observe
+_ORIGINAL_PREPARE = None
+_ORIGINAL_PREFLIGHT = None
+_ORIGINAL_OBSERVE = None
 _INSTALLED = False
 
 
@@ -141,10 +141,14 @@ def _preflight(options: dict[str, Any], layout: Any, model: Any):
         if not isinstance(identity, tuple) or not identity or identity[0] != BYPASS_KEY:
             return (BYPASS_KEY, "invalid_marker"), False, None
         return identity, True, None
+    if _ORIGINAL_PREFLIGHT is None:
+        raise RuntimeError("Keyless core-BSA fallback was not installed")
     return _ORIGINAL_PREFLIGHT(options, layout, model)
 
 
 def _prepare(runtime, run_id, step_id, options, layout, model):
+    if _ORIGINAL_PREPARE is None:
+        raise RuntimeError("Keyless core-BSA fallback was not installed")
     prepared, _identity = prepare_reference_options(options, model)
     return _ORIGINAL_PREPARE(runtime, run_id, step_id, prepared, layout, model)
 
@@ -161,14 +165,19 @@ def _observe(runtime, run_id, step_id, options, policy):
         ):
             runtime.observe_backend_history(run_id, step_id, identity, (), True)
             return
+    if _ORIGINAL_OBSERVE is None:
+        raise RuntimeError("Keyless core-BSA fallback was not installed")
     return _ORIGINAL_OBSERVE(runtime, run_id, step_id, options, policy)
 
 
 def install_keyless_core_bsa_fallback() -> None:
-    """Install the per-call Keyless reference fallback before recovery wrappers."""
-    global _INSTALLED
+    """Wrap the final backend-history stack after core-BSA forecast recovery."""
+    global _INSTALLED, _ORIGINAL_PREPARE, _ORIGINAL_PREFLIGHT, _ORIGINAL_OBSERVE
     if _INSTALLED:
         return
+    _ORIGINAL_PREPARE = backend_history.prepare
+    _ORIGINAL_PREFLIGHT = backend_history._preflight
+    _ORIGINAL_OBSERVE = backend_history.observe
     backend_history._preflight = _preflight
     backend_history.prepare = _prepare
     backend_history.observe = _observe
