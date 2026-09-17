@@ -69,7 +69,7 @@ jobs:
         with:
           persist-credentials: false
           repository: xmarre/ComfyUI-Untwisting-RoPE
-          ref: 63c8d8df5e08dfdad4b397480d966b90f9b5a6c6
+          ref: bf70deacc68603511dfd2e6148c267119b4aa3a3
           path: UntwistRoPE
 
       - name: Check out reviewed Flow interop
@@ -139,6 +139,12 @@ jobs:
             comfyui_spectrum_h3/experiments.py \
             comfyui_spectrum_h3/er_sde_ksampler_contract.py \
             comfyui_spectrum_h3/er_sde_stochastic.py \
+            comfyui_spectrum_h3/keyless_backend_history.py \
+            comfyui_spectrum_h3/keyless_compat.py \
+            comfyui_spectrum_h3/keyless_core_bsa_fallback.py \
+            comfyui_spectrum_h3/keyless_model_aware_compat.py \
+            comfyui_spectrum_h3/keyless_runtime_compat.py \
+            comfyui_spectrum_h3/keyless_untwist_compat.py \
             comfyui_spectrum_h3/refdelta_interop.py \
             comfyui_spectrum_h3/minimax_h3.py \
             comfyui_spectrum_h3/objective_media.py \
@@ -160,6 +166,12 @@ jobs:
             tests/test_core_bsa_forecast_recovery.py \
             tests/test_core_bsa_preprocess_compat.py \
             tests/test_core_bsa_source_hardening.py \
+            tests/test_keyless_backend_history.py \
+            tests/test_keyless_compat.py \
+            tests/test_keyless_core_bsa_fallback.py \
+            tests/test_keyless_model_aware_compat.py \
+            tests/test_keyless_runtime_compat.py \
+            tests/test_keyless_untwist_route_compat.py \
             tests/test_reviewed_bsa_fixture_gate.py \
             tests/test_scheduler_bootstrap_entitlement.py \
             tests/test_comfy_compiler_compat.py \
