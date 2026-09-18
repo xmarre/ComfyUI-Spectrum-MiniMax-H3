@@ -11,6 +11,10 @@ from .external_patch_hardening import install_external_patch_hardening
 from .external_patch_visual_reference import install_visual_reference_patch_compat
 from .forecast import HistoryWeightForecaster
 from .generic_correction import install_generic_residual_correction
+from .keyless_backend_history import install_keyless_backend_history
+from .keyless_core_bsa_fallback import install_keyless_core_bsa_fallback
+from .keyless_model_aware_compat import install_keyless_model_aware_compat
+from .keyless_runtime_compat import install_keyless_runtime_compat
 from .minimax_h3 import locate_minimax_h3_inner, require_native_minimax_h3
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .postrun_safety import install_postrun_safety
@@ -27,6 +31,15 @@ from .replay_trust_shadow import install_replay_native_trust_shadow
 from .runtime import SpectrumH3Runtime
 from .trust_probe import install_forecast_trust_probe
 
+# Keyless runtime/model semantics must be established before any wrapper or
+# compatibility layer captures native-H3 helper identities.
+install_keyless_runtime_compat()
+install_keyless_model_aware_compat()
+# Numerical Keyless identity must be under the later Core-BSA recovery/fallback
+# wrappers so their source-gated special cases can compose without hiding it.
+install_keyless_backend_history()
+# Loader compatibility teaches the source audit about ComfyUI's path-loaded BSA
+# module alias before either BSA recovery or Keyless fallback relies on ownership.
 install_core_bsa_loader_compat()
 install_bsa_transition_probe_compat()
 install_bsa_transition_probe_manual_only()
@@ -48,9 +61,11 @@ install_external_patch_compat()
 install_visual_reference_patch_compat()
 install_external_patch_hardening()
 install_er_sde_offline_replay_safety()
-# The BSA recovery wrapper must see the final scheduler/rollback decision made by
-# the compatibility layers above. Compiler compatibility remains outermost.
+# The native-QKV BSA recovery wrapper must see the final scheduler/rollback
+# decision. The Keyless dense-reference fallback then wraps that final history
+# stack so it cannot be bypassed by recovery's custom prepare/observe functions.
 install_core_bsa_forecast_recovery()
+install_keyless_core_bsa_fallback()
 # Compiler compatibility must be outermost: it owns the thread-local lifetime
 # from Spectrum step entry through every already-installed finalize/end wrapper.
 install_comfy_compiler_compat()

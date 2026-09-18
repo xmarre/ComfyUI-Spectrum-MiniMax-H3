@@ -41,6 +41,12 @@ jobs:
             comfy_kitchen_version: "0.2.33"
             comfy_aimdo_version: "0.5.3"
             fixture_required: true
+          - comfy_repository: xmarre/ComfyUI
+            comfy_ref: 7c7affc4e07840930374b724b1f7e10981c8e9ae
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.35"
+            comfy_aimdo_version: "0.5.5"
+            keyless_bsa_fixture_required: true
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
@@ -52,7 +58,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          repository: comfyanonymous/ComfyUI
+          repository: ${{ matrix.comfy_repository || 'comfyanonymous/ComfyUI' }}
           ref: ${{ matrix.comfy_ref }}
           path: ComfyUI
 
@@ -69,7 +75,7 @@ jobs:
         with:
           persist-credentials: false
           repository: xmarre/ComfyUI-Untwisting-RoPE
-          ref: 63c8d8df5e08dfdad4b397480d966b90f9b5a6c6
+          ref: b8946986c629f3fe81e90c01d7633a09dc6e8238
           path: UntwistRoPE
 
       - name: Check out reviewed Flow interop
@@ -139,6 +145,12 @@ jobs:
             comfyui_spectrum_h3/experiments.py \
             comfyui_spectrum_h3/er_sde_ksampler_contract.py \
             comfyui_spectrum_h3/er_sde_stochastic.py \
+            comfyui_spectrum_h3/keyless_backend_history.py \
+            comfyui_spectrum_h3/keyless_compat.py \
+            comfyui_spectrum_h3/keyless_core_bsa_fallback.py \
+            comfyui_spectrum_h3/keyless_model_aware_compat.py \
+            comfyui_spectrum_h3/keyless_runtime_compat.py \
+            comfyui_spectrum_h3/keyless_untwist_compat.py \
             comfyui_spectrum_h3/refdelta_interop.py \
             comfyui_spectrum_h3/minimax_h3.py \
             comfyui_spectrum_h3/objective_media.py \
@@ -160,6 +172,12 @@ jobs:
             tests/test_core_bsa_forecast_recovery.py \
             tests/test_core_bsa_preprocess_compat.py \
             tests/test_core_bsa_source_hardening.py \
+            tests/test_keyless_backend_history.py \
+            tests/test_keyless_compat.py \
+            tests/test_keyless_core_bsa_fallback.py \
+            tests/test_keyless_model_aware_compat.py \
+            tests/test_keyless_runtime_compat.py \
+            tests/test_keyless_untwist_route_compat.py \
             tests/test_reviewed_bsa_fixture_gate.py \
             tests/test_scheduler_bootstrap_entitlement.py \
             tests/test_comfy_compiler_compat.py \
@@ -219,6 +237,7 @@ jobs:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
           PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE:${{ github.workspace }}/FlowRegenerate
           SPECTRUM_REQUIRE_REVIEWED_BSA_FIXTURE: ${{ matrix.fixture_required && '1' || '0' }}
+          SPECTRUM_REQUIRE_KEYLESS_BSA_FIXTURE: ${{ matrix.keyless_bsa_fixture_required && '1' || '0' }}
         run: |
           python -m pytest -q \
             --ignore=tests/test_external_patch_compat.py \
