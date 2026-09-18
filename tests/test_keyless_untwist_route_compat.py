@@ -124,8 +124,10 @@ def test_reviewed_keyless_untwist_source_is_exactly_pinned():
         _options(preprocessor, progress=0.25),
     )
     assert identity is not None
-    assert identity[0] == "reviewed_keyless_untwist_route_v1"
+    assert identity[0] == "reviewed_keyless_untwist_route_v2"
+    assert identity[1] == "1de8f77d0c439ec073daad1a5a0928f2ad9a343e"
     assert identity[1] in keyless_untwist_compat.AUDITED_UNTWIST_KEYLESS_GIT_BLOBS
+    assert callable(getattr(preprocessor, "apply_domain", None))
 
 
 def test_reviewed_untwist_progress_changes_do_not_reset_keyless_backend_history_identity():

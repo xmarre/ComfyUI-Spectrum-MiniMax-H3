@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -74,7 +75,10 @@ def _reviewed_nodes():
 
     blob = keyless_core_bsa_fallback.core_bsa_compat._module_blob_sha(nodes)
     if blob not in keyless_core_bsa_fallback.KEYLESS_AWARE_BSA_GIT_BLOBS:
-        pytest.skip(f"fixture is not the reviewed Keyless-aware Core-BSA source: {blob}")
+        message = f"fixture is not the reviewed Keyless-aware Core-BSA source: {blob}"
+        if os.environ.get("SPECTRUM_REQUIRE_KEYLESS_BSA_FIXTURE") == "1":
+            pytest.fail(message)
+        pytest.skip(message)
     return nodes
 
 

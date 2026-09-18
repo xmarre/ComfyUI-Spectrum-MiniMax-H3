@@ -39,10 +39,12 @@ from .keyless_compat import keyless_semantic_identity, validate_keyless_contract
 BYPASS_KEY = "spectrum_keyless_core_bsa_reference_bypass_v1"
 BYPASS_VERSION = 2
 
-# xmarre/ComfyUI PR #7, based on Comfy-Org/ComfyUI master
-# 9a77c1db9eff68d7320dcd98f0757b4450161d4b. This source explicitly recognizes
-# h3_keyless_core50_v1 and keeps Keyless on the generic materialized Q/route(V)/V
-# override without installing the native H3 QKV block producer.
+# xmarre/ComfyUI PR #7 at 7c7affc4e07840930374b724b1f7e10981c8e9ae,
+# rebuilt as one commit on Comfy-Org/ComfyUI a8686f2b33fc540f137df50c0f0719953830a5e7.
+# The reviewed file blob is stable across those unrelated upstream rebases. This
+# source explicitly recognizes h3_keyless_core50_v1 and keeps Keyless on the
+# generic materialized Q/route(V)/V override without installing the native H3
+# QKV block producer.
 KEYLESS_AWARE_BSA_GIT_BLOBS = frozenset(
     {"3f508f899f5d5629d8a5b31d9ef2c26ccd7ae919"}
 )
