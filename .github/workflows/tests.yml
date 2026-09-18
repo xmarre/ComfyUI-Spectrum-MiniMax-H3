@@ -64,6 +64,14 @@ jobs:
           ref: 21d0191d933fedf2885df082d33eb1bc2fffd529
           path: RefDeltaSolver
 
+      - name: Check out reviewed RES4LYF sampler source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: ClownsharkBatwing/RES4LYF
+          ref: e8437efef69cacf3f08fbd9f90fcc517868c5cb8
+          path: RES4LYF
+
       - name: Check out reviewed Untwist interop
         uses: actions/checkout@v4
         with:
@@ -185,6 +193,7 @@ jobs:
             tests/test_objective_media_sequential.py \
             tests/test_postrun_safety.py \
             tests/test_refdelta_interop.py \
+            tests/test_res4lyf_support.py \
             tests/test_runtime.py \
             tests/test_sampler_contract.py \
             tests/test_sampling.py \
@@ -197,6 +206,7 @@ jobs:
       - name: Run focused external compatibility suites
         env:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
+          SPECTRUM_RES4LYF_PATH: ${{ github.workspace }}/RES4LYF
           PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE:${{ github.workspace }}/FlowRegenerate
         run: |
           python -m pytest -q \
@@ -212,7 +222,8 @@ jobs:
             tests/test_model_aware.py \
             tests/test_native_equivalence.py \
             tests/test_er_sde_stochastic_compensation.py \
-            tests/test_sa_solver_state_conditioning.py
+            tests/test_sa_solver_state_conditioning.py \
+            tests/test_res4lyf_support.py
 
       - name: Run tests against native MiniMax H3
         env:
@@ -233,4 +244,5 @@ jobs:
             --ignore=tests/test_model_aware.py \
             --ignore=tests/test_native_equivalence.py \
             --ignore=tests/test_er_sde_stochastic_compensation.py \
-            --ignore=tests/test_sa_solver_state_conditioning.py
+            --ignore=tests/test_sa_solver_state_conditioning.py \
+            --ignore=tests/test_res4lyf_support.py
