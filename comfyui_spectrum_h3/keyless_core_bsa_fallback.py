@@ -21,6 +21,9 @@ source-proving the removed BSA producer does not qualify unrelated providers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import sys
+import types
 from typing import Any
 
 from . import (
@@ -29,16 +32,178 @@ from . import (
     core_bsa_loader_compat,
     core_bsa_preprocess_compat,
     keyless_runtime_compat,
+    source_code_audit,
 )
 from .keyless_compat import keyless_semantic_identity, validate_keyless_contract
 
 BYPASS_KEY = "spectrum_keyless_core_bsa_reference_bypass_v1"
 BYPASS_VERSION = 2
 
+# xmarre/ComfyUI PR #7, based on Comfy-Org/ComfyUI master
+# 9a77c1db9eff68d7320dcd98f0757b4450161d4b. This source explicitly recognizes
+# h3_keyless_core50_v1 and keeps Keyless on the generic materialized Q/route(V)/V
+# override without installing the native H3 QKV block producer.
+KEYLESS_AWARE_BSA_GIT_BLOBS = frozenset(
+    {"3f508f899f5d5629d8a5b31d9ef2c26ccd7ae919"}
+)
+
 _ORIGINAL_PREPARE = None
 _ORIGINAL_PREFLIGHT = None
 _ORIGINAL_OBSERVE = None
 _INSTALLED = False
+
+
+@dataclass(frozen=True)
+class KeylessAwareCoreBSAProof:
+    module: Any
+    source_blob: str
+    patch: Any
+    settings_identity: tuple[Any, ...]
+    patch_generation: int
+
+
+def _keyless_aware_module_from_override(override: Any) -> tuple[Any, str] | None:
+    """Resolve only the reviewed Keyless-aware generic Core-BSA override source."""
+    base = getattr(override, "__func__", override)
+    if getattr(base, "__qualname__", None) != "make_attention_override.<locals>.override":
+        return None
+    code = getattr(base, "__code__", None)
+    module_name = getattr(base, "__module__", None)
+    if not isinstance(code, types.CodeType) or not isinstance(module_name, str):
+        return None
+    module = sys.modules.get(module_name)
+    if module is None:
+        return None
+    source = getattr(module, "__file__", None)
+    if not isinstance(source, str):
+        return None
+    try:
+        source_path = Path(source).resolve()
+        code_path = Path(code.co_filename).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    extras = core_bsa_loader_compat._comfy_extras_dir()
+    if (
+        extras is None
+        or source_path != code_path
+        or source_path.name != "nodes_sparse_attention.py"
+        or source_path.parent != extras
+    ):
+        return None
+
+    blob = core_bsa_compat._module_blob_sha(module)
+    if blob not in KEYLESS_AWARE_BSA_GIT_BLOBS:
+        return None
+    required = (
+        "SparseAttnPatch",
+        "make_attention_override",
+        "make_h3_block_patch",
+        "_keyless_h3_contract",
+        "KEYLESS_H3_CONTRACT_KEY",
+        "KEYLESS_H3_ARCHITECTURE",
+        "HEAD_DIM",
+        "BLOCK_SIZE",
+        "PRODUCER_CHUNK",
+    )
+    if any(not hasattr(module, name) for name in required):
+        return None
+    if (
+        module.KEYLESS_H3_CONTRACT_KEY != "minimax_h3_keyless_contract_v1"
+        or module.KEYLESS_H3_ARCHITECTURE != "h3_keyless_core50_v1"
+    ):
+        return None
+    try:
+        constants_ok = (
+            int(module.HEAD_DIM) == 128
+            and int(module.BLOCK_SIZE) == 64
+            and int(module.PRODUCER_CHUNK) == 4096
+        )
+    except (TypeError, ValueError):
+        return None
+    if not constants_ok:
+        return None
+    if not source_code_audit.matches_nested_source_code(
+        base,
+        source_path,
+        ("make_attention_override", "override"),
+    ):
+        return None
+    if not core_bsa_loader_compat._reviewed_defaults(
+        base,
+        "make_attention_override",
+        "override",
+    ):
+        return None
+    return module, blob
+
+
+def _keyless_aware_bsa_proof(
+    options: dict[str, Any],
+    model: Any,
+) -> KeylessAwareCoreBSAProof | None:
+    """Prove Core BSA's Keyless-aware generic override without promoting forecasts.
+
+    The reviewed source executes only the already-materialized Q/route(V)/V
+    override for Keyless and installs no QKV-only H3 block producer. Spectrum
+    therefore leaves it intact. Backend history remains actual-only until a
+    separate route/receipt contract proves dense/sparse transitions.
+    """
+    current = options.get("optimized_attention_override")
+    resolved = _keyless_aware_module_from_override(current)
+    if resolved is None:
+        return None
+    module, source_blob = resolved
+
+    try:
+        if module._keyless_h3_contract(model) is None:
+            return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    closure = core_bsa_compat._closure_values(current)
+    if closure is None or set(closure) != {"patch", "previous"}:
+        return None
+    patch = closure["patch"]
+    if type(patch) is not module.SparseAttnPatch:
+        return None
+    if closure["previous"] is not None:
+        # A lower optimized-attention owner needs its own Keyless audit. Canonical
+        # Untwist v0.2.4+ routes through the Keyless routing-preprocessor chain
+        # instead and therefore does not require an inherited attention override.
+        return None
+    if current not in getattr(patch, "installed", set()):
+        return None
+
+    settings = core_bsa_compat._settings_identity(patch)
+    if settings is None or settings[0]:
+        return None
+
+    # The defining Keyless-aware property is absence of the native H3 sparse
+    # producer. Preserve unrelated block owners such as ControlNet, but reject
+    # any Core-BSA block replacement even if someone forged the marker manually.
+    block_patch_code = core_bsa_compat._nested_code(module.make_h3_block_patch, "block_patch")
+    dit = (
+        options.get("patches_replace", {})
+        .get("dit", {})
+        if isinstance(options.get("patches_replace", {}), dict)
+        else {}
+    )
+    if not isinstance(dit, dict):
+        return None
+    if block_patch_code is not None and any(
+        getattr(getattr(replacement, "__func__", replacement), "__code__", None)
+        is block_patch_code
+        for replacement in dit.values()
+    ):
+        return None
+
+    return KeylessAwareCoreBSAProof(
+        module=module,
+        source_blob=source_blob,
+        patch=patch,
+        settings_identity=settings,
+        patch_generation=core_bsa_compat._lifetime_generation(patch),
+    )
 
 
 @dataclass(frozen=True)
@@ -309,6 +474,15 @@ def prepare_reference_options(
     if validate_keyless_contract(model) is None:
         return options, None
     if not core_bsa_compat.has_core_bsa_evidence(options):
+        return options, None
+
+    keyless_aware = _keyless_aware_bsa_proof(options, model)
+    if keyless_aware is not None:
+        # This source no longer carries a QKV-only block producer on Keyless, so
+        # there is nothing to strip. Keep the sparse materialized override intact.
+        # The underlying backend-history stack sees this new source as unreported
+        # and conservatively forces actual calls until a dedicated route contract
+        # is validated.
         return options, None
 
     proof = _resolve_direct_core_bsa(options, model)
