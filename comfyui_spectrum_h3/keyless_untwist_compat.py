@@ -26,17 +26,30 @@ from typing import Any
 from . import core_bsa_compat
 
 
+_AUDITED_UNTWIST_KEYLESS_SOURCE_CONTRACTS = {
+    # Untwist #11: full-domain Keyless routing preprocessor.
+    "53079e70b7996b1a872d9ff1e5f219cc1f110c3e": (
+        "minimax_h3_untwist_keyless_route_v1:",
+        "minimax_h3_untwist_keyless_routing_preprocessor_v1",
+        1,
+        False,
+    ),
+    # Untwist #12: additive domain-aware routing-position remapping.
+    "1de8f77d0c439ec073daad1a5a0928f2ad9a343e": (
+        "minimax_h3_untwist_keyless_route_v2:",
+        "minimax_h3_untwist_keyless_routing_preprocessor_v2",
+        2,
+        True,
+    ),
+}
 AUDITED_UNTWIST_KEYLESS_GIT_BLOBS = frozenset(
-    {"53079e70b7996b1a872d9ff1e5f219cc1f110c3e"}
+    _AUDITED_UNTWIST_KEYLESS_SOURCE_CONTRACTS
 )
 _UNTWIST_TOPLEVEL_MODULE = "flux_untwist.keyless_h3"
 _UNTWIST_MODULE_SUFFIX = ".flux_untwist.keyless_h3"
 _UNTWIST_CLASS = "KeylessUntwistRoutingPreprocessor"
 _UNTWIST_PROVIDER = "comfyui-flux2-untwisting-rope"
 _UNTWIST_RUNTIME_KEY = "spectrum_h3_visual_reference_patch_runtime"
-_UNTWIST_IDENTITY_PREFIX = "minimax_h3_untwist_keyless_route_v1:"
-_UNTWIST_IDENTITY_SCHEMA = "minimax_h3_untwist_keyless_routing_preprocessor_v1"
-_UNTWIST_IDENTITY_VERSION = 1
 _REFERENCE_SCOPES = frozenset(
     {"image_only", "image_and_video", "all_visual_including_continuum"}
 )
@@ -114,6 +127,9 @@ def _runtime_identity(
 
 def _snapshot_semantics(
     snapshot: Any,
+    *,
+    identity_schema: str,
+    identity_version: int,
 ) -> tuple[str, float, tuple[Any, ...], dict[str, Any]] | None:
     required = (
         "instance_id",
@@ -206,8 +222,8 @@ def _snapshot_semantics(
         temporal,
     )
     identity_payload = {
-        "schema": _UNTWIST_IDENTITY_SCHEMA,
-        "version": _UNTWIST_IDENTITY_VERSION,
+        "schema": identity_schema,
+        "version": identity_version,
         "instance_id": instance_id,
         "expected_rows": expected_rows,
         "reference_ranges": [list(item) for item in ranges],
@@ -227,7 +243,11 @@ def _snapshot_semantics(
     return instance_id, numeric["progress"], static, identity_payload
 
 
-def _expected_declared_identity(identity_payload: dict[str, Any]) -> str | None:
+def _expected_declared_identity(
+    identity_payload: dict[str, Any],
+    *,
+    identity_prefix: str,
+) -> str | None:
     try:
         encoded = json.dumps(
             identity_payload,
@@ -237,7 +257,7 @@ def _expected_declared_identity(identity_payload: dict[str, Any]) -> str | None:
         ).encode("utf-8")
     except (TypeError, ValueError):
         return None
-    return _UNTWIST_IDENTITY_PREFIX + hashlib.sha256(encoded).hexdigest()
+    return identity_prefix + hashlib.sha256(encoded).hexdigest()
 
 
 def reviewed_keyless_untwist_identity(
@@ -249,15 +269,28 @@ def reviewed_keyless_untwist_identity(
     if reviewed is None:
         return None
     _module, blob = reviewed
+    source_contract = _AUDITED_UNTWIST_KEYLESS_SOURCE_CONTRACTS.get(blob)
+    if source_contract is None:
+        return None
+    identity_prefix, identity_schema, identity_version, requires_domain_fn = source_contract
+    if requires_domain_fn and not callable(getattr(value, "apply_domain", None)):
+        return None
 
     snapshot = getattr(value, "_snapshot", None)
-    parsed = _snapshot_semantics(snapshot)
+    parsed = _snapshot_semantics(
+        snapshot,
+        identity_schema=identity_schema,
+        identity_version=identity_version,
+    )
     if parsed is None:
         return None
     instance_id, progress, static, identity_payload = parsed
 
     declared = getattr(value, "identity", None)
-    expected_declared = _expected_declared_identity(identity_payload)
+    expected_declared = _expected_declared_identity(
+        identity_payload,
+        identity_prefix=identity_prefix,
+    )
     if declared != expected_declared:
         return None
 
@@ -270,7 +303,7 @@ def reviewed_keyless_untwist_identity(
         return None
 
     return (
-        "reviewed_keyless_untwist_route_v1",
+        f"reviewed_keyless_untwist_route_v{identity_version}",
         blob,
         runtime,
         static,
