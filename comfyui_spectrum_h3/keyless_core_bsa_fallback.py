@@ -473,16 +473,16 @@ def prepare_reference_options(
     """
     if validate_keyless_contract(model) is None:
         return options, None
-    if not core_bsa_compat.has_core_bsa_evidence(options):
-        return options, None
 
     keyless_aware = _keyless_aware_bsa_proof(options, model)
     if keyless_aware is not None:
         # This source no longer carries a QKV-only block producer on Keyless, so
         # there is nothing to strip. Keep the sparse materialized override intact.
-        # The underlying backend-history stack sees this new source as unreported
-        # and conservatively forces actual calls until a dedicated route contract
-        # is validated.
+        # The underlying backend-history stack sees this optimized-attention owner
+        # as actual-only until a dedicated route contract is validated.
+        return options, None
+
+    if not core_bsa_compat.has_core_bsa_evidence(options):
         return options, None
 
     proof = _resolve_direct_core_bsa(options, model)
