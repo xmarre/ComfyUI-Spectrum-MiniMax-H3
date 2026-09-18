@@ -1,3 +1,23 @@
+# Spectrum MiniMax H3 v0.2.28
+
+v0.2.28 fixes reviewed-source auditing on Windows checkouts whose Git text conversion materializes Python files with CRLF line endings.
+
+## Windows CRLF source-audit fix
+
+Spectrum pins canonical Git blob hashes for reviewed compatibility sources. The previous `_hash_git_blob()` implementation hashed raw working-tree bytes instead. With `core.autocrlf=true`, Git can check out the same reviewed Python source with CRLF while its canonical repository blob remains LF, causing the source gate to report `source_unreviewed`.
+
+For Core BlockSparseAttention this made backend ownership unprovable, so the backend-history safety gate conservatively promoted forecast decisions to actual H3 transformer evaluations. A reviewed Windows checkout could therefore run all-actual even though `git diff` was clean.
+
+The audited hash path now normalizes only CRLF pairs to LF before constructing the Git blob payload. This matches Git's text normalization for the reported checkout case while keeping substantive source changes fail-closed. The raw working-tree size is still checked before normalization, lone CR bytes are not normalized, and non-line-ending source modifications still produce a different digest.
+
+Because Core BSA, Flow attention/Mixed-Grid, Untwist preprocessing, loader checks and diagnostics all consume the shared source-blob helper, the fix applies consistently across those reviewed-source gates rather than special-casing one adapter.
+
+Regression coverage reproduces a CRLF working-tree copy, verifies that it hashes to the same canonical Git blob identity as LF source, and separately verifies that an actual source-content change still fails the digest comparison.
+
+Sampler equations, Spectrum scheduling, backend receipt semantics, BSA route ownership, cold-to-primed history recovery, Flow/Untwist behavior and fallback policy are otherwise unchanged.
+
+---
+
 # Spectrum MiniMax H3 v0.2.27
 
 v0.2.27 combines the unreleased Core BlockSparseAttention forecast-recovery work from PR #106 with PR #107's forecast streaming and CUDA target-lifetime fix. The release restores the reviewed Mixed-Grid production schedule while substantially reducing Spectrum's forecast-head VRAM pressure.

@@ -139,12 +139,20 @@ def has_core_bsa_evidence(options: dict[str, Any]) -> bool:
 
 @lru_cache(maxsize=8)
 def _hash_git_blob(path: str, mtime_ns: int, size: int) -> str | None:
+    """Hash working-tree Python source against LF-normalized audited Git blobs.
+
+    Git text normalization stores CRLF working-tree checkouts as LF in the
+    repository. Normalize only CRLF pairs before constructing the blob object so
+    core.autocrlf=true checkouts compare to the same reviewed source. Lone CR
+    bytes and every other source change remain significant.
+    """
     try:
         data = Path(path).read_bytes()
     except OSError:
         return None
     if len(data) != size:
         return None
+    data = data.replace(b"\r\n", b"\n")
     payload = f"blob {len(data)}\0".encode() + data
     return hashlib.sha1(payload, usedforsecurity=False).hexdigest()
 

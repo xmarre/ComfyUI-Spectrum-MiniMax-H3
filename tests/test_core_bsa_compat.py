@@ -1,3 +1,4 @@
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -38,6 +39,36 @@ def _audited_nodes():
     if core_bsa_compat._module_blob_sha(nodes) not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS:
         pytest.skip("this ComfyUI fixture is not the reviewed core BSA source")
     return nodes
+
+
+def test_git_blob_hash_normalizes_crlf_checkout_without_weakening_other_bytes(tmp_path):
+    canonical = b"alpha = 1\nbeta = 2\n"
+    expected_payload = f"blob {len(canonical)}\0".encode() + canonical
+    expected = hashlib.sha1(expected_payload, usedforsecurity=False).hexdigest()
+
+    crlf_path = tmp_path / "crlf.py"
+    crlf_path.write_bytes(canonical.replace(b"\n", b"\r\n"))
+    crlf_stat = crlf_path.stat()
+    assert (
+        core_bsa_compat._hash_git_blob(
+            str(crlf_path.resolve()),
+            int(crlf_stat.st_mtime_ns),
+            int(crlf_stat.st_size),
+        )
+        == expected
+    )
+
+    changed_path = tmp_path / "changed.py"
+    changed_path.write_bytes(b"alpha = 1\nbeta = 3\n")
+    changed_stat = changed_path.stat()
+    assert (
+        core_bsa_compat._hash_git_blob(
+            str(changed_path.resolve()),
+            int(changed_stat.st_mtime_ns),
+            int(changed_stat.st_size),
+        )
+        != expected
+    )
 
 
 def _layout(seq_len=128):
