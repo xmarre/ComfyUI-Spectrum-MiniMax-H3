@@ -71,7 +71,15 @@ def _keyless_model():
 
 
 def _reviewed_nodes():
-    import comfy_extras.nodes_sparse_attention as nodes
+    try:
+        import comfy_extras.nodes_sparse_attention as nodes
+    except ModuleNotFoundError as exc:
+        if exc.name != "comfy_extras.nodes_sparse_attention":
+            raise
+        message = "fixture predates comfy_extras.nodes_sparse_attention"
+        if os.environ.get("SPECTRUM_REQUIRE_KEYLESS_BSA_FIXTURE") == "1":
+            pytest.fail(message)
+        pytest.skip(message)
 
     blob = keyless_core_bsa_fallback.core_bsa_compat._module_blob_sha(nodes)
     if blob not in keyless_core_bsa_fallback.KEYLESS_AWARE_BSA_GIT_BLOBS:
