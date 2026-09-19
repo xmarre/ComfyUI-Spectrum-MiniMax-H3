@@ -64,6 +64,14 @@ jobs:
           ref: 21d0191d933fedf2885df082d33eb1bc2fffd529
           path: RefDeltaSolver
 
+      - name: Check out reviewed RES4LYF source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: ClownsharkBatwing/RES4LYF
+          ref: e8437efef69cacf3f08fbd9f90fcc517868c5cb8
+          path: RES4LYF
+
       - name: Check out reviewed Untwist interop
         uses: actions/checkout@v4
         with:
@@ -185,6 +193,7 @@ jobs:
             tests/test_objective_media_sequential.py \
             tests/test_postrun_safety.py \
             tests/test_refdelta_interop.py \
+            tests/test_res4lyf_source_fixture.py \
             tests/test_runtime.py \
             tests/test_sampler_contract.py \
             tests/test_sampling.py \
@@ -198,8 +207,10 @@ jobs:
         env:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
           PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE:${{ github.workspace }}/FlowRegenerate
+          RES4LYF_PATH: ${{ github.workspace }}/RES4LYF
         run: |
           python -m pytest -q \
+            tests/test_res4lyf_source_fixture.py \
             tests/test_external_patch_compat.py \
             tests/test_external_patch_hardening.py \
             tests/test_external_patch_transaction_parity.py \
@@ -218,6 +229,7 @@ jobs:
         env:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
           PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE:${{ github.workspace }}/FlowRegenerate
+          RES4LYF_PATH: ${{ github.workspace }}/RES4LYF
           SPECTRUM_REQUIRE_REVIEWED_BSA_FIXTURE: ${{ matrix.fixture_required && '1' || '0' }}
         run: |
           python -m pytest -q \
