@@ -1414,3 +1414,25 @@ def test_source_defaults_audit_compares_literals_names_and_mutability(tmp_path):
     assert matches(method, "method")
     # A name resolving to a mutable object cannot be frozen by identity.
     assert not matches(audited.mutable, "mutable")
+
+
+def test_default_that_changes_native_output_is_rejected(monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    from comfyui_spectrum_h3 import sampling as sampling_module
+
+    denoise = _denoiser(*_manifold())
+    before = _native_res4lyf(beta, "res_2m", denoise)
+    get_sde_step = rk_sampler_beta.RK_NoiseSampler.get_sde_step
+    monkeypatch.setattr(
+        get_sde_step,
+        "__defaults__",
+        (*get_sde_step.__defaults__[:-1], False),
+    )
+    after = _native_res4lyf(beta, "res_2m", denoise)
+
+    # The altered default changes the untouched sampler's numerical trajectory.
+    assert not torch.equal(before, after)
+    sampler = SimpleNamespace(sampler_function=beta.sample_res_2m)
+    _module, cls, reason = sampling_module._res4lyf_reviewed_noise_sampler(sampler)
+    assert cls is None
+    assert "get_sde_step defaults are not the reviewed native defaults" in reason
