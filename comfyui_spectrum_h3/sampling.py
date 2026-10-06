@@ -3283,6 +3283,10 @@ def res4lyf_associate_model_call(
         return decision
     run_id = int(decision["run_id"])
     step_id = int(decision["step_id"])
+    already_invalid = bridge.invalid_reason is not None
+    if already_invalid and bool(decision["actual"]):
+        # The run already failed closed; exact calls need no association.
+        return decision
     try:
         bridge.associate(x, timestep, run_id=run_id, step_id=step_id)
         return decision
@@ -3291,12 +3295,13 @@ def res4lyf_associate_model_call(
         # No H3 evaluation has happened yet for this step. Converting it to an
         # exact call and disabling later forecasts keeps the native trajectory.
         runtime.fallback_current_step(run_id, step_id, reason)
-        LOG.warning(
-            "Spectrum H3 RES4LYF stochastic bridge forced exact H3 evaluation and "
-            "disabled forecasting for this run step=%s reason=%s",
-            step_id,
-            exc,
-        )
+        if not already_invalid:
+            LOG.warning(
+                "Spectrum H3 RES4LYF stochastic bridge forced exact H3 evaluation "
+                "and disabled forecasting for this run step=%s reason=%s",
+                step_id,
+                exc,
+            )
         fallback_decision = dict(decision)
         fallback_decision["actual"] = True
         fallback_decision["reason"] = reason
@@ -3323,6 +3328,9 @@ def res4lyf_consume_model_result(
         step_id=step_id,
         mode=runtime.current_step_mode(run_id, step_id),
     )
+    if bridge.invalid_reason is not None and descriptor.mode != "forecast":
+        # Forecasting already failed closed; exact results need no anchoring.
+        return result
     try:
         return bridge.consume(result, timestep, descriptor)
     except RES4LYFStochasticError as exc:
@@ -3827,10 +3835,14 @@ def _run_tracked_res4lyf_sde(
         )
         return float(value.item())
 
+    continuum_active = _continuum_actual_prefix(
+        (extra_args or {}).get("model_options")
+    ) > 0
     bridge = RES4LYFStochasticBridge(
         run_id=int(runtime.active_run_id),
         coordinate_fn=coordinate,
         debug=runtime.config.debug,
+        hold_only=continuum_active,
     )
     tracked_extra_args = dict(extra_args or {})
     tracked_model_options = dict(tracked_extra_args.get("model_options") or {})
@@ -3845,9 +3857,10 @@ def _run_tracked_res4lyf_sde(
         LOG.warning(
             "Spectrum H3 RES4LYF stochastic tracking active run_id=%s sampler=%s "
             "forecast_source=solver_space_causal_dense_output "
-            "raw_feature_forecast=transaction_only",
+            "raw_feature_forecast=transaction_only continuum=%s",
             runtime.active_run_id,
             sampler_name(sampler),
+            int(continuum_active),
         )
     try:
         with tracked_res4lyf_noise_sampler(

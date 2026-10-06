@@ -124,9 +124,13 @@ class RES4LYFStochasticBridge:
         run_id: int,
         coordinate_fn: Callable[[float], float],
         debug: bool,
+        hold_only: bool = False,
     ) -> None:
         self.run_id = int(run_id)
         self.debug = bool(debug)
+        # H3 Continuum continuation chunks keep a zero-order hold for every
+        # forecast, matching the reviewed SA-Solver Continuum policy.
+        self.hold_only = bool(hold_only)
         self._coordinate_fn = coordinate_fn
         self._bound_noise_sampler: Any = None
         self._invalid_reason: str | None = None
@@ -253,13 +257,10 @@ class RES4LYFStochasticBridge:
         if not torch.is_tensor(result) or not torch.is_tensor(landing):
             self.invalidate("RES4LYF noise swap did not return a tensor state")
             return
-        # RES4LYF's float64 swap coefficients promote the noised state; the
-        # sampler then writes it into its work-dtype state buffer before the
-        # next model call. Association compares against that exact cast.
         if result.shape != landing.shape or result.device != landing.device:
             self.invalidate("RES4LYF noise swap changed latent shape or device")
             return
-        if not result.is_floating_point():
+        if not result.is_floating_point() or not landing.is_floating_point():
             self.invalidate("RES4LYF noise swap returned a non-floating state")
             return
         try:
@@ -268,10 +269,19 @@ class RES4LYFStochasticBridge:
             self.invalidate(str(exc))
             return
         increment_rms = _rms(result - landing) if self.debug else None
+        # RES4LYF's float64 noise promotes the swap result; the sampler writes it
+        # into its work-dtype state buffer before the next model call. Retain an
+        # owned copy of exactly that cast so a later in-place edit of RES4LYF's
+        # tensor cannot pass association unnoticed.
+        noised = result.detach().to(
+            dtype=landing.dtype,
+            memory_format=torch.contiguous_format,
+            copy=True,
+        )
         self._pending = _Transition(
             kind=kind,
             target_sigma=sigma,
-            noised=result,
+            noised=noised,
             increment_rms=increment_rms,
         )
         self.transitions_recorded += 1
@@ -321,7 +331,7 @@ class RES4LYFStochasticBridge:
                 not torch.is_tensor(x)
                 or x.shape != noised.shape
                 or x.device != noised.device
-                or not x.is_floating_point()
+                or x.dtype != noised.dtype
             ):
                 self.invalidate(
                     f"RES4LYF {pending.kind} noised state does not match the next "
@@ -334,7 +344,7 @@ class RES4LYFStochasticBridge:
                     f"{pending.target_sigma:.8g}, next H3 call is at sigma {sigma:.8g}"
                 )
                 raise RES4LYFStochasticError(self._invalid_reason or "sigma mismatch")
-            if not torch.equal(x, noised.to(dtype=x.dtype)):
+            if not torch.equal(x, noised):
                 self.invalidate(
                     f"RES4LYF {pending.kind} noised state was modified before the next "
                     "H3 model call"
@@ -443,7 +453,12 @@ class RES4LYFStochasticBridge:
         coordinate: float,
         descriptor: RES4LYFStepDescriptor,
     ) -> RES4LYFDenseOutputPrediction:
-        """Bounded causal denoised-space prediction from exact H3 anchors."""
+        """Bounded causal denoised-space prediction from exact H3 anchors.
+
+        The coordinate is the model's half-log-SNR. H3's per-stream audio
+        schedule is a flow time shift, which only offsets logit(sigma) by a
+        constant, so one scalar extrapolation weight is exact for both streams.
+        """
         if not self._anchors:
             raise RES4LYFStochasticError("RES4LYF dense output has no exact H3 anchor")
         latest = self._anchors[-1]
@@ -470,6 +485,8 @@ class RES4LYFStochasticBridge:
                 alpha=0.0,
             )
 
+        if self.hold_only:
+            return hold("latest_actual_hold_continuum")
         if len(self._anchors) == 1:
             return hold("latest_actual_hold")
         previous = self._anchors[-2]

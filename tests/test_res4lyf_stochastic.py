@@ -83,8 +83,8 @@ def _forecast(bridge, raw, sigma, step_id, x=None, run_id=1):
 def test_noised_state_is_associated_once_with_the_exact_following_call():
     bridge = _bridge()
     landing = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
-    # RES4LYF's float64 coefficients promote the swap result; the sampler casts
-    # it back into its float32 state buffer before the model call.
+    # RES4LYF's float64 noise promotes the swap result; the sampler casts it
+    # back into its float32 state buffer before the model call.
     noised = torch.tensor([[1.25, 1.5]], dtype=torch.float64)
     _swap(bridge, "step", landing, noised, 0.6)
     assert bridge.has_pending
@@ -105,6 +105,22 @@ def test_noised_state_is_associated_once_with_the_exact_following_call():
     assert bridge.associate(torch.zeros(1, 2), torch.tensor([0.5]), run_id=1, step_id=5) == (
         "deterministic"
     )
+
+
+def test_in_place_edit_of_the_swap_result_is_detected():
+    bridge = _bridge()
+    landing = torch.zeros(1, 2, dtype=torch.float32)
+    noised = torch.tensor([[0.5, -0.5]], dtype=torch.float64)
+    _swap(bridge, "step", landing, noised, 0.6)
+    noised.add_(1.0)
+
+    with pytest.raises(RES4LYFStochasticError, match="was modified"):
+        bridge.associate(
+            noised.to(torch.float32),
+            torch.tensor([0.6]),
+            run_id=1,
+            step_id=1,
+        )
 
 
 def test_noop_swap_records_no_transition():
@@ -260,6 +276,24 @@ def test_untrusted_extrapolation_geometry_holds_latest_anchor(target_sigma, reas
     _actual(bridge, latest, 0.7, 2)
 
     result = _forecast(bridge, torch.zeros(1, 2), target_sigma, 3)
+
+    torch.testing.assert_close(result, latest, rtol=0, atol=0)
+
+
+def test_continuum_keeps_a_zero_order_hold_for_every_forecast():
+    bridge = RES4LYFStochasticBridge(
+        run_id=1,
+        coordinate_fn=_coordinate,
+        debug=False,
+        hold_only=True,
+    )
+    assert bridge.bind_noise_sampler(object())
+    _actual(bridge, torch.tensor([[0.0, 2.0]]), 0.8, 0)
+    _forecast(bridge, torch.zeros(1, 2), 0.75, 1)
+    latest = torch.tensor([[1.0, 1.0]])
+    _actual(bridge, latest, 0.7, 2)
+
+    result = _forecast(bridge, torch.zeros(1, 2), 0.65, 3)
 
     torch.testing.assert_close(result, latest, rtol=0, atol=0)
 
@@ -518,7 +552,17 @@ def _native_res4lyf(beta, name, denoise):
     )
 
 
-def _spectrum_res4lyf(beta, name, denoise, config, monkeypatch, *, leaky_forecast=True):
+def _spectrum_res4lyf(
+    beta,
+    name,
+    denoise,
+    config,
+    monkeypatch,
+    *,
+    leaky_forecast=True,
+    perturb_call=None,
+    denoise_mask=None,
+):
     from comfyui_spectrum_h3 import sampling as sampling_module
     from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
     from comfyui_spectrum_h3.sampling import (
@@ -576,6 +620,9 @@ def _spectrum_res4lyf(beta, name, denoise, config, monkeypatch, *, leaky_forecas
             return fake_h3(x, timestep, model_options, seed)
 
     def guided_call(x, sigma, model_options, seed):
+        if perturb_call is not None and len(record["modes"]) == perturb_call:
+            # Stand-in for an unreviewed outer PREDICT_NOISE wrapper that edits x.
+            x = x + 1e-3
         result = predict_noise_wrapper(PredictExecutor(guider), x, sigma, model_options, seed)
         record["modes"].append(runtime.last_completed_mode)
         record["returned"][len(record["modes"]) - 1] = result
@@ -604,7 +651,6 @@ def _spectrum_res4lyf(beta, name, denoise, config, monkeypatch, *, leaky_forecas
             disable_pbar,
         ):
             del latent_image
-            assert denoise_mask is None
             bridge = extra_args["model_options"]["transformer_options"].get(
                 RES4LYF_STOCHASTIC_BRIDGE_KEY
             )
@@ -634,7 +680,7 @@ def _spectrum_res4lyf(beta, name, denoise, config, monkeypatch, *, leaky_forecas
             seed,
             latent_shapes=None,
         ):
-            del latent_image, seed, latent_shapes
+            del latent_image, seed, latent_shapes, denoise_mask
             return sampler_sample_wrapper(
                 SamplerExecutor(),
                 guider,
@@ -643,10 +689,11 @@ def _spectrum_res4lyf(beta, name, denoise, config, monkeypatch, *, leaky_forecas
                 callback,
                 noise,
                 None,
-                denoise_mask,
+                denoise_mask_,
                 disable_pbar,
             )
 
+    denoise_mask_ = denoise_mask
     monkeypatch.setattr(sampling_module, "_res4lyf_preflight_reason", lambda *_args: None)
     result = outer_sample_wrapper(
         OuterExecutor(),
@@ -743,3 +790,137 @@ def test_res4lyf_sde_forecasts_use_noise_free_solver_space_dense_output(name, mo
         # off-manifold noise that the noise-blind raw forecast leaks.
         assert off_manifold(returned) < 1e-10
         assert off_manifold(raw) > 1e-4
+
+
+def test_modified_noised_state_forces_exact_call_and_disables_forecasts(monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    denoise = _denoiser(*_manifold())
+    _, baseline = _spectrum_res4lyf(beta, "res_2s", denoise, _config(), monkeypatch)
+    first_forecast = baseline["modes"].index("forecast")
+
+    result, record = _spectrum_res4lyf(
+        beta,
+        "res_2s",
+        denoise,
+        _config(),
+        monkeypatch,
+        perturb_call=first_forecast,
+    )
+
+    assert torch.isfinite(result).all()
+    assert record["modes"][first_forecast] == "actual"
+    assert "forecast" not in record["modes"][first_forecast:]
+    assert "was modified" in (record["bridge"].invalid_reason or "")
+    assert record["runtime"].stats.disabled
+    assert rk_sampler_beta.RK_NoiseSampler.__name__ == "RK_NoiseSampler"
+
+
+def test_denoise_mask_keeps_res4lyf_sde_all_actual(monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    original = rk_sampler_beta.RK_NoiseSampler
+    denoise = _denoiser(*_manifold())
+
+    class _MaskedModelK(_ModelK):
+        def __call__(self, x, sigma, denoise_mask=None, model_options=None, seed=None):
+            return self.inner_model(x, sigma, model_options=model_options or {}, seed=seed)
+
+    monkeypatch.setattr(sys.modules[__name__], "_ModelK", _MaskedModelK)
+    _, record = _spectrum_res4lyf(
+        beta,
+        "res_2m",
+        denoise,
+        _config(),
+        monkeypatch,
+        denoise_mask=torch.ones(_SHAPE),
+    )
+
+    assert set(record["modes"]) == {"actual"}
+    assert record.get("bridge") is None
+    assert record["runtime"].stats.disabled
+    assert "denoise mask" in (record["runtime"].stats.disable_reason or "")
+    assert rk_sampler_beta.RK_NoiseSampler is original
+
+
+def test_dense_output_failure_retries_the_same_step_as_exact():
+    from comfyui_spectrum_h3.config import SpectrumH3Config
+    from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
+    from comfyui_spectrum_h3.sampling import (
+        BINDING_KEY,
+        RUN_ID_KEY,
+        STEP_ID_KEY,
+        SpectrumH3Binding,
+        predict_noise_wrapper,
+    )
+
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            warmup_steps=1,
+            tail_actual_steps=0,
+            max_history=4,
+            window_size=3.0,
+            offline_smoothing_replay=False,
+            model_aware_mode="off",
+            bootstrap_first_forecast=False,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([0.9, 0.8, 0.6, 0.0]),
+        "sample_res_2m",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    # The bridge has no exact anchor, so dense output is impossible for the
+    # forecast below even though the runtime schedule selects one.
+    bridge = RES4LYFStochasticBridge(run_id=run_id, coordinate_fn=_coordinate, debug=False)
+    assert bridge.bind_noise_sampler(object())
+    guider = SimpleNamespace(model_options={BINDING_KEY: SpectrumH3Binding(runtime)})
+    attempts = []
+    exact = torch.tensor([[7.0, 8.0]])
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, _x, _timestep, model_options, _seed):
+            options = model_options["transformer_options"]
+            call_id, actual = runtime.begin_model_call(
+                options[RUN_ID_KEY],
+                options[STEP_ID_KEY],
+                topology=(("target_audio_rows", 1), ("target_video_rows", 1)),
+                labels=((0, "positive"),),
+                expected_shape=(1, 2, 1),
+            )
+            attempts.append(actual)
+            if actual:
+                runtime.observe_actual(
+                    options[RUN_ID_KEY],
+                    options[STEP_ID_KEY],
+                    call_id,
+                    torch.full((1, 2, 1), float(len(attempts))),
+                )
+            else:
+                assert runtime.predict(
+                    options[RUN_ID_KEY],
+                    options[STEP_ID_KEY],
+                    call_id,
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                ) is not None
+            return exact
+
+    options = {"transformer_options": {RES4LYF_STOCHASTIC_BRIDGE_KEY: bridge}}
+    for sigma in (0.9, 0.8):
+        predict_noise_wrapper(Executor(), torch.zeros(1, 2), torch.tensor([sigma]), options, 0)
+        # Drop the warm-up anchors so the forecast has no exact anchor to use.
+        bridge._anchors.clear()
+    attempts.clear()
+
+    result = predict_noise_wrapper(Executor(), torch.zeros(1, 2), torch.tensor([0.6]), options, 0)
+
+    assert attempts == [False, True]
+    assert result is exact
+    assert runtime.last_completed_mode == "actual"
+    assert runtime.stats.forecast_fallbacks == 1
+    assert bridge.anchor_steps == (2,)
+    runtime.end_run(run_id)
