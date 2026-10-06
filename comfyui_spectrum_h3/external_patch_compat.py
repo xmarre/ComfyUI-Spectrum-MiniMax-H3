@@ -1141,6 +1141,9 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
 
     try:
         try:
+            decision = sampling.res4lyf_associate_model_call(
+                runtime, model_options, x, timestep, decision
+            )
             result = execute_attempt(decision)
             _log_effective_step(runtime, decision)
             runtime.log_offline_transition(
@@ -1149,6 +1152,9 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
                 step=decision["step_id"],
             )
             result = consume_er_sde_increment(result, decision)
+            result = sampling.res4lyf_consume_model_result(
+                runtime, model_options, timestep, result, decision
+            )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
         except sampling.ForecastRetryActual as retry:
@@ -1174,6 +1180,9 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
                 retry=True,
             )
             result = consume_er_sde_increment(result, retry_decision)
+            result = sampling.res4lyf_consume_model_result(
+                runtime, model_options, timestep, result, retry_decision
+            )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
     except BaseException:

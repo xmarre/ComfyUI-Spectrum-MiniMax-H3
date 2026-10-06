@@ -105,7 +105,7 @@ jobs:
             pytest ruff numpy scipy torchsde psutil safetensors einops tqdm pyyaml pillow packaging \
             transformers tokenizers sentencepiece aiohttp yarl alembic SQLAlchemy filelock \
             "av>=17.0.0" requests simpleeval blake3 kornia spandrel pydantic pydantic-settings \
-            PyOpenGL comfy-angle \
+            PyOpenGL comfy-angle PyWavelets \
             "comfy-kitchen==${COMFY_KITCHEN_VERSION}" "comfy-aimdo==${COMFY_AIMDO_VERSION}"
           python -m pip wheel --no-deps --wheel-dir /tmp/spectrum-h3-wheel .
 
@@ -148,6 +148,7 @@ jobs:
             comfyui_spectrum_h3/er_sde_ksampler_contract.py \
             comfyui_spectrum_h3/er_sde_stochastic.py \
             comfyui_spectrum_h3/refdelta_interop.py \
+            comfyui_spectrum_h3/res4lyf_stochastic.py \
             comfyui_spectrum_h3/minimax_h3.py \
             comfyui_spectrum_h3/objective_media.py \
             comfyui_spectrum_h3/objective_media_bounded.py \
@@ -194,6 +195,7 @@ jobs:
             tests/test_postrun_safety.py \
             tests/test_refdelta_interop.py \
             tests/test_res4lyf_source_fixture.py \
+            tests/test_res4lyf_stochastic.py \
             tests/test_runtime.py \
             tests/test_sampler_contract.py \
             tests/test_sampling.py \
@@ -231,6 +233,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/ComfyUI:${{ github.workspace }}/RefDeltaSolver:${{ github.workspace }}/UntwistRoPE:${{ github.workspace }}/FlowRegenerate
           RES4LYF_PATH: ${{ github.workspace }}/RES4LYF
           SPECTRUM_REQUIRE_REVIEWED_BSA_FIXTURE: ${{ matrix.fixture_required && '1' || '0' }}
+          SPECTRUM_REQUIRE_RES4LYF_RUNTIME: ${{ matrix.fixture_required && '1' || '0' }}
         run: |
           python -m pytest -q \
             --ignore=tests/test_external_patch_compat.py \

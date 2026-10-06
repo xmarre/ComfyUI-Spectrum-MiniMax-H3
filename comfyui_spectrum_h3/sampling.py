@@ -31,6 +31,13 @@ from .refdelta_interop import (
     RefDeltaInteropBridge,
     RefDeltaInteropError,
 )
+from .res4lyf_stochastic import (
+    RES4LYF_STOCHASTIC_BRIDGE_KEY,
+    RES4LYFStepDescriptor,
+    RES4LYFStochasticBridge,
+    RES4LYFStochasticError,
+    tracked_res4lyf_noise_sampler,
+)
 from .rollback import run_selective_rollback_euler
 from .runtime import (
     ForecastRetryActual,
@@ -154,7 +161,7 @@ SA_SOLVER_SAMPLERS = NATIVE_SA_SOLVER_SAMPLERS | REFDELTA_SA_SOLVER_SAMPLERS
 REFDELTA_BACKEND_SAMPLERS = REFDELTA_SEEDS_SAMPLERS | REFDELTA_SA_SOLVER_SAMPLERS
 SUPPORTED_SAMPLERS = (
     SUPPORTED_SINGLE_CALL_SAMPLERS
-    | RES4LYF_ODE_SAMPLERS
+    | RES4LYF_RES_SAMPLERS
     | SEEDS_SAMPLERS
     | SA_SOLVER_SAMPLERS
 )
@@ -1240,18 +1247,6 @@ def _res4lyf_preflight_reason(
     sampler: Any,
     model_options: dict[str, Any] | None,
 ) -> str | None:
-    name = sampler_name(sampler)
-    if name in RES4LYF_SDE_SAMPLERS:
-        # Real H3 media validation from issue #103 showed substantial audio
-        # degradation for stochastic res_2m while the corresponding ODE path
-        # remained clean. The SDE wrappers inject a new latent-noise transition
-        # after each outer RK step; Spectrum does not yet own/compensate that
-        # external stochastic state the way it does for reviewed ER-SDE.
-        return (
-            "stochastic RES4LYF SDE forecasting is temporarily disabled after "
-            "real H3 audio regression; use an *_ode variant or the untouched sampler"
-        )
-
     supported, reason = _res4lyf_sampler_contract(sampler)
     if not supported:
         return reason or "RES4LYF sampler contract is unproven"
@@ -3275,6 +3270,76 @@ def outer_sample_wrapper(
         runtime.release_offline_archive()
 
 
+def res4lyf_associate_model_call(
+    runtime: SpectrumH3Runtime,
+    model_options: dict[str, Any] | None,
+    x: Any,
+    timestep: Any,
+    decision: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind a RES4LYF SDE model call to its stochastic input before execution."""
+    bridge = _res4lyf_stochastic_bridge(model_options)
+    if bridge is None:
+        return decision
+    run_id = int(decision["run_id"])
+    step_id = int(decision["step_id"])
+    try:
+        bridge.associate(x, timestep, run_id=run_id, step_id=step_id)
+        return decision
+    except RES4LYFStochasticError as exc:
+        reason = f"RES4LYF stochastic-state contract failed: {exc}"
+        # No H3 evaluation has happened yet for this step. Converting it to an
+        # exact call and disabling later forecasts keeps the native trajectory.
+        runtime.fallback_current_step(run_id, step_id, reason)
+        LOG.warning(
+            "Spectrum H3 RES4LYF stochastic bridge forced exact H3 evaluation and "
+            "disabled forecasting for this run step=%s reason=%s",
+            step_id,
+            exc,
+        )
+        fallback_decision = dict(decision)
+        fallback_decision["actual"] = True
+        fallback_decision["reason"] = reason
+        return fallback_decision
+
+
+def res4lyf_consume_model_result(
+    runtime: SpectrumH3Runtime,
+    model_options: dict[str, Any] | None,
+    timestep: Any,
+    result: Any,
+    decision: dict[str, Any],
+) -> Any:
+    """Hand RES4LYF exact results unchanged and forecasts as dense output."""
+    bridge = _res4lyf_stochastic_bridge(model_options)
+    if bridge is None:
+        return result
+    run_id = int(decision["run_id"])
+    step_id = int(decision["step_id"])
+    # The runtime step mode is authoritative: it reflects fallbacks taken
+    # inside the H3 wrapper and forecast-to-actual retries.
+    descriptor = RES4LYFStepDescriptor(
+        run_id=run_id,
+        step_id=step_id,
+        mode=runtime.current_step_mode(run_id, step_id),
+    )
+    try:
+        return bridge.consume(result, timestep, descriptor)
+    except RES4LYFStochasticError as exc:
+        if descriptor.mode == "forecast":
+            raise ForecastRetryActual(
+                f"RES4LYF solver-space dense output failed: {exc}"
+            ) from exc
+        bridge.invalidate(str(exc))
+        LOG.warning(
+            "Spectrum H3 RES4LYF dense-output anchor rejected on exact step=%s "
+            "reason=%s; later forecasts in this run fail closed",
+            step_id,
+            exc,
+        )
+        return result
+
+
 def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
     guider = executor.class_obj
     binding = _binding_from_model_options(getattr(guider, "model_options", None))
@@ -3397,6 +3462,9 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
 
     try:
         try:
+            decision = res4lyf_associate_model_call(
+                runtime, model_options, x, timestep, decision
+            )
             result = execute_attempt(decision)
             runtime.log_offline_transition(
                 "actual_executor_return" if decision["actual"] else "forecast_executor_return",
@@ -3404,6 +3472,9 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 step=decision["step_id"],
             )
             result = consume_er_sde_increment(result, decision)
+            result = res4lyf_consume_model_result(
+                runtime, model_options, timestep, result, decision
+            )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
         except ForecastRetryActual as retry:
@@ -3428,6 +3499,9 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 retry=True,
             )
             result = consume_er_sde_increment(result, retry_decision)
+            result = res4lyf_consume_model_result(
+                runtime, model_options, timestep, result, retry_decision
+            )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
     except BaseException:
@@ -3648,6 +3722,167 @@ def _run_tracked_er_sde(
             tracker.clear()
 
 
+def _res4lyf_stochastic_bridge(
+    model_options: dict[str, Any] | None,
+) -> RES4LYFStochasticBridge | None:
+    transformer_options = (model_options or {}).get("transformer_options") or {}
+    bridge = transformer_options.get(RES4LYF_STOCHASTIC_BRIDGE_KEY)
+    return bridge if isinstance(bridge, RES4LYFStochasticBridge) else None
+
+
+def _res4lyf_reviewed_noise_sampler(sampler: Any) -> tuple[Any, type | None, str | None]:
+    """Return RES4LYF's beta sampler module and its audited noise-sampler class."""
+    function = getattr(sampler, "sampler_function", None)
+    rk_sampler_module = getattr(function, "__globals__", {}).get("rk_sampler_beta")
+    if rk_sampler_module is None:
+        return None, None, "RES4LYF named wrapper does not reference rk_sampler_beta"
+    noise_sampler_class = getattr(rk_sampler_module, "RK_NoiseSampler", None)
+    if not inspect.isclass(noise_sampler_class) or noise_sampler_class.__name__ != "RK_NoiseSampler":
+        return rk_sampler_module, None, "RES4LYF RK_NoiseSampler is not the native class"
+    noise_sampler_module = inspect.getmodule(noise_sampler_class)
+    if (
+        noise_sampler_module is None
+        or _module_blob_sha(noise_sampler_module)
+        not in RES4LYF_AUDITED_GIT_BLOBS["noise_sampler"]
+    ):
+        return rk_sampler_module, None, "RES4LYF RK_NoiseSampler source is not reviewed"
+    for method in ("init_noise_samplers", "swap_noise_step", "swap_noise_substep"):
+        if not inspect.isfunction(noise_sampler_class.__dict__.get(method)):
+            return (
+                rk_sampler_module,
+                None,
+                f"RES4LYF RK_NoiseSampler.{method} is not the reviewed native method",
+            )
+    return rk_sampler_module, noise_sampler_class, None
+
+
+def _run_tracked_res4lyf_sde(
+    executor,
+    runtime: SpectrumH3Runtime,
+    model_wrap,
+    sigmas,
+    extra_args,
+    callback,
+    noise,
+    latent_image,
+    denoise_mask,
+    disable_pbar,
+):
+    """Run a reviewed RES4LYF SDE wrapper with stochastic-state ownership.
+
+    RES4LYF itself performs every RK update, noise draw, AV-specific noise
+    scaling and RNG step. Spectrum only observes RES4LYF's noise swaps, proves
+    that each noised state is consumed by exactly the following H3 call, and
+    replaces forecast results with causal solver-space dense output.
+    """
+
+    def run_native(reason: str | None = None):
+        if reason is not None:
+            runtime.disable_forecasting_for_run(reason)
+            LOG.warning(
+                "Spectrum H3 disabled forecasting for this RES4LYF SDE run; "
+                "preserving all-actual sampling because the stochastic bridge "
+                "is unavailable: %s",
+                reason,
+            )
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+
+    if not runtime.supported_sampler:
+        return run_native()
+    if denoise_mask is not None:
+        return run_native(
+            "RES4LYF SDE stochastic-state association with a denoise mask is not reviewed"
+        )
+    if "multigpu_clones" in ((extra_args or {}).get("model_options") or {}):
+        return run_native(
+            "RES4LYF SDE stochastic-state association does not support multi-GPU "
+            "parallel model calls"
+        )
+    sampler = executor.class_obj
+    rk_sampler_module, noise_sampler_class, reason = _res4lyf_reviewed_noise_sampler(
+        sampler
+    )
+    if reason is not None or noise_sampler_class is None:
+        return run_native(reason or "RES4LYF noise sampler is unavailable")
+    try:
+        model_sampling = model_wrap.model_patcher.get_model_object("model_sampling")
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        return run_native(f"model_sampling is unavailable: {exc}")
+
+    import comfy.k_diffusion.sampling as native_sampling
+
+    def coordinate(sigma: float) -> float:
+        value = native_sampling.sigma_to_half_log_snr(
+            torch.tensor(sigma, dtype=torch.float64),
+            model_sampling,
+        )
+        return float(value.item())
+
+    bridge = RES4LYFStochasticBridge(
+        run_id=int(runtime.active_run_id),
+        coordinate_fn=coordinate,
+        debug=runtime.config.debug,
+    )
+    tracked_extra_args = dict(extra_args or {})
+    tracked_model_options = dict(tracked_extra_args.get("model_options") or {})
+    tracked_transformer_options = dict(
+        tracked_model_options.get("transformer_options") or {}
+    )
+    tracked_transformer_options[RES4LYF_STOCHASTIC_BRIDGE_KEY] = bridge
+    tracked_model_options["transformer_options"] = tracked_transformer_options
+    tracked_extra_args["model_options"] = tracked_model_options
+
+    if runtime.config.debug:
+        LOG.warning(
+            "Spectrum H3 RES4LYF stochastic tracking active run_id=%s sampler=%s "
+            "forecast_source=solver_space_causal_dense_output "
+            "raw_feature_forecast=transaction_only",
+            runtime.active_run_id,
+            sampler_name(sampler),
+        )
+    try:
+        with tracked_res4lyf_noise_sampler(
+            rk_sampler_module,
+            noise_sampler_class,
+            bridge,
+            model_wrap,
+        ):
+            return executor(
+                model_wrap,
+                sigmas,
+                tracked_extra_args,
+                callback,
+                noise,
+                latent_image,
+                denoise_mask,
+                disable_pbar,
+            )
+    except RES4LYFStochasticError as exc:
+        if bridge.bound:
+            raise
+        return run_native(str(exc))
+    finally:
+        if bridge.invalid_reason is not None or runtime.config.debug:
+            LOG.warning(
+                "Spectrum H3 RES4LYF stochastic tracking finished run_id=%s "
+                "transitions_recorded=%s transitions_consumed=%s invalid_reason=%s",
+                bridge.run_id,
+                bridge.transitions_recorded,
+                bridge.transitions_consumed,
+                bridge.invalid_reason,
+            )
+        bridge.clear()
+
+
 def sampler_sample_wrapper(
     executor,
     model_wrap,
@@ -3707,6 +3942,19 @@ def sampler_sample_wrapper(
         )
     if name in ER_SDE_SAMPLERS:
         return _run_tracked_er_sde(
+            executor,
+            runtime,
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+    if name in RES4LYF_SDE_SAMPLERS:
+        return _run_tracked_res4lyf_sde(
             executor,
             runtime,
             model_wrap,

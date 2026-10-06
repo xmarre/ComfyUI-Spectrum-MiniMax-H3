@@ -46,11 +46,12 @@ def test_reviewed_res4lyf_ode_variants_are_allowlisted_but_not_replayable(functi
 
 
 @pytest.mark.parametrize("function_name", sorted(RES4LYF_SDE_SAMPLERS))
-def test_res4lyf_sde_variants_are_recognized_but_not_accelerated(function_name):
+def test_res4lyf_sde_variants_are_allowlisted_but_not_replayable(function_name):
     sampler = _sampler(function_name)
 
     assert function_name in RES4LYF_RES_SAMPLERS
-    assert not sampler_is_supported(sampler)
+    assert sampler_is_supported(sampler)
+    assert max_consecutive_forecasts(sampler) == 1
     assert not sampler_supports_seeded_replay(sampler)
 
 
@@ -281,7 +282,8 @@ def test_fixed_stage_res4lyf_requires_one_exact_refresh(function_name):
     assert min_actual_steps_after_forecast(_sampler(function_name)) == 1
 
 
-def test_outer_wrapper_keeps_res4lyf_sde_native_after_media_regression(monkeypatch):
+@pytest.mark.parametrize("function_name", ("sample_res_2m", "sample_res_3s_ode"))
+def test_outer_wrapper_keeps_unreviewed_res4lyf_contract_native(function_name):
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(
             warmup_steps=0,
@@ -310,7 +312,8 @@ def test_outer_wrapper_keeps_res4lyf_sde_native_after_media_regression(monkeypat
         Executor(),
         torch.zeros(1),
         torch.zeros(1),
-        _sampler("sample_res_2m"),
+        # The stand-in sampler function is not the audited RES4LYF wrapper.
+        _sampler(function_name),
         torch.tensor([1.0, 0.8, 0.6, 0.4, 0.0]),
     )
 
@@ -319,7 +322,11 @@ def test_outer_wrapper_keeps_res4lyf_sde_native_after_media_regression(monkeypat
     assert runtime.active_run_id is None
 
 
-def test_outer_wrapper_uses_res4lyf_active_intervals_and_explicit_topology(monkeypatch):
+@pytest.mark.parametrize("function_name", ("sample_res_2m_ode", "sample_res_2m"))
+def test_outer_wrapper_uses_res4lyf_active_intervals_and_explicit_topology(
+    function_name,
+    monkeypatch,
+):
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(
             warmup_steps=0,
@@ -368,7 +375,7 @@ def test_outer_wrapper_uses_res4lyf_active_intervals_and_explicit_topology(monke
         Executor(),
         torch.zeros(1),
         torch.zeros(1),
-        _sampler("sample_res_2m_ode"),
+        _sampler(function_name),
         sigmas,
     )
 
