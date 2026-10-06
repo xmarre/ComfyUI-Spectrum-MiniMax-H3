@@ -41,6 +41,12 @@ jobs:
             comfy_kitchen_version: "0.2.33"
             comfy_aimdo_version: "0.5.3"
             fixture_required: true
+          - comfy_ref: 6b747c0428c343e1417219641db93a4fb7cb69ae
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.37"
+            comfy_aimdo_version: "0.5.5"
+            res4lyf_ref: 56e44755d866c87ff9cb4b6608c8e42155db6ecc
+            fixture_required: true
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
@@ -64,12 +70,12 @@ jobs:
           ref: 21d0191d933fedf2885df082d33eb1bc2fffd529
           path: RefDeltaSolver
 
-      - name: Check out reviewed RES4LYF source
+      - name: Check out RES4LYF runtime fixture
         uses: actions/checkout@v4
         with:
           persist-credentials: false
           repository: ClownsharkBatwing/RES4LYF
-          ref: e8437efef69cacf3f08fbd9f90fcc517868c5cb8
+          ref: ${{ matrix.res4lyf_ref || 'e8437efef69cacf3f08fbd9f90fcc517868c5cb8' }}
           path: RES4LYF
 
       - name: Check out reviewed Untwist interop

@@ -8,10 +8,10 @@ native RES4LYF with a synthetic denoiser establish call topology, noise ownershi
 and all-actual numerical parity, including shifted AV noise; they do not establish
 speech quality or visual quality when H3 calls are skipped.
 
-The reviewed RES4LYF source revision is
-`e8437efef69cacf3f08fbd9f90fcc517868c5cb8`. Spectrum checks the audited source
-files and live noise-sampler class. A different implementation can keep the run
-all-actual. Record the installed ComfyUI, Spectrum and RES4LYF revisions from the
+Support does not require a particular RES4LYF source revision. CPU coverage
+includes RES4LYF 1.2.0 on ComfyUI 0.38.0 and the earlier September fixture.
+Spectrum checks native API bindings and live stochastic-state ownership.
+Record the installed ComfyUI, Spectrum and RES4LYF revisions from the
 ComfyUI Patcher, including the Spectrum PR overlay revision, with the results.
 
 ## Matched comparison

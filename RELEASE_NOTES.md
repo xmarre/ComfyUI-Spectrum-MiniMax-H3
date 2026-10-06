@@ -2,9 +2,10 @@
 
 ## Named RES4LYF RES samplers
 
-Adds reviewed Spectrum support for RES4LYF beta `res_2m`, `res_3m`, `res_2s`,
-`res_3s`, `res_5s`, `res_6s` and their `*_ode` variants at reviewed source
-revision `e8437efef69cacf3f08fbd9f90fcc517868c5cb8`. The generic `rk_beta`
+Adds Spectrum support for RES4LYF beta `res_2m`, `res_3m`, `res_2s`,
+`res_3s`, `res_5s`, `res_6s` and their `*_ode` variants. Support uses native
+APIs and live stochastic-state checks rather than a source-revision whitelist.
+The generic `rk_beta`
 sampler remains native-only.
 
 ODE forecasting follows native stage topology and recurrence refreshes. SDE
@@ -20,7 +21,8 @@ call exactly and disable subsequent forecasting. Input changes detected on
 an exact call also disable forecasting immediately while retaining its result.
 
 CPU regressions cover tracked native equivalence for all six SDE wrappers,
-including shifted AV noise. Accelerated H3 speech/video quality remains
+including shifted AV noise and RES4LYF 1.2.0 packed AV noise on ComfyUI 0.38.0.
+Accelerated H3 speech/video quality remains
 unvalidated. Follow [RES4LYF GPU validation](docs/RES4LYF_GPU_VALIDATION.md)
 before treating this path as accepted for production media.
 

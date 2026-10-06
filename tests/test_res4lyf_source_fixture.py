@@ -1,58 +1,50 @@
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from comfyui_spectrum_h3.core_bsa_compat import _module_blob_sha
-from comfyui_spectrum_h3.sampling import RES4LYF_AUDITED_GIT_BLOBS
-
-
-RES4LYF_REVIEWED_SOURCES = {
-    "wrappers": "beta/__init__.py",
-    "sampler": "beta/rk_sampler_beta.py",
-    "coefficients": "beta/rk_coefficients_beta.py",
-    "phi": "beta/phi_functions.py",
-    "method": "beta/rk_method_beta.py",
-    "noise_sampler": "beta/rk_noise_sampler_beta.py",
-    "guide": "beta/rk_guide_func_beta.py",
-    "helper": "helper.py",
-}
+RES4LYF_SOURCES = (
+    "beta/__init__.py",
+    "beta/rk_sampler_beta.py",
+    "beta/rk_coefficients_beta.py",
+    "beta/phi_functions.py",
+    "beta/rk_method_beta.py",
+    "beta/rk_noise_sampler_beta.py",
+    "beta/rk_guide_func_beta.py",
+    "helper.py",
+)
 
 
 def _fixture_root() -> Path:
     path = os.environ.get("RES4LYF_PATH")
     if not path:
-        pytest.skip("reviewed RES4LYF source fixture is unavailable")
+        pytest.skip("RES4LYF source fixture is unavailable")
     root = Path(path)
     if not root.is_dir():
         pytest.fail(f"RES4LYF_PATH is not a directory: {root}")
     return root
 
 
-@pytest.mark.parametrize(("source_key", "relative_path"), RES4LYF_REVIEWED_SOURCES.items())
-def test_reviewed_res4lyf_source_hash_matches_runtime_normalization(
-    source_key: str,
+@pytest.mark.parametrize("relative_path", RES4LYF_SOURCES)
+def test_res4lyf_fixture_source_is_available_and_parses(
     relative_path: str,
 ):
     root = _fixture_root()
     source = root / relative_path
     if not source.is_file():
-        pytest.fail(f"reviewed RES4LYF fixture is missing {relative_path}")
+        pytest.fail(f"RES4LYF fixture is missing {relative_path}")
 
-    normalized_blob = _module_blob_sha(SimpleNamespace(__file__=str(source)))
-
-    assert normalized_blob in RES4LYF_AUDITED_GIT_BLOBS[source_key]
+    assert ast.parse(source.read_bytes(), filename=str(source)) is not None
 
 
-def test_reviewed_fixture_exercises_committed_crlf_sources():
+def test_fixture_exercises_committed_crlf_sources():
     root = _fixture_root()
 
-    # These reviewed upstream files are committed with CRLF. This is the exact
-    # case that originally made raw GitHub blob IDs disagree with
-    # _module_blob_sha(), which intentionally normalizes CRLF to LF.
+    # Both supported fixtures contain CRLF sources. Live source-code comparisons
+    # must accept those line endings as well as LF working-tree copies.
     for relative_path in (
         "beta/__init__.py",
         "beta/rk_coefficients_beta.py",

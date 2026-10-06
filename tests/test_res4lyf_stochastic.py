@@ -3,11 +3,13 @@ from __future__ import annotations
 import contextlib
 import importlib
 import importlib.util
+import inspect
 import math
 import os
 import sys
 import types
 from collections import Counter
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1022,7 +1024,7 @@ def test_dense_output_failure_retries_the_same_step_as_exact():
 
 
 @pytest.mark.parametrize("name", ("res_2m", "res_3s_ode"))
-def test_reviewed_res4lyf_contract_accepts_pinned_source_and_audits_phi(name, monkeypatch):
+def test_res4lyf_contract_accepts_native_api_and_rejects_split_phi(name, monkeypatch):
     beta, _rk_sampler_beta = _res4lyf_runtime_fixture()
     import comfy.samplers
 
@@ -1032,18 +1034,12 @@ def test_reviewed_res4lyf_contract_accepts_pinned_source_and_audits_phi(name, mo
 
     assert sampling_module._res4lyf_sampler_contract(sampler) == (True, None)
 
-    original_blob = sampling_module._module_blob_sha
-
-    def changed_phi(module):
-        if module.__name__.endswith(".beta.phi_functions"):
-            return "0" * 40
-        return original_blob(module)
-
-    monkeypatch.setattr(sampling_module, "_module_blob_sha", changed_phi)
+    method = inspect.getmodule(_rk_sampler_beta.RK_Method_Beta)
+    monkeypatch.setattr(method, "Phi", object())
     supported, reason = sampling_module._res4lyf_sampler_contract(sampler)
 
     assert not supported
-    assert "phi-function source" in reason
+    assert "Phi implementation provenance" in reason
 
 
 def test_tracking_failure_after_association_retries_the_forecast_exactly(monkeypatch):
@@ -1603,3 +1599,47 @@ def test_input_mutation_on_an_exact_call_disables_forecasting_immediately():
     assert runtime.stats.disabled
     assert "changed between association" in runtime.stats.disable_reason
     runtime.end_run(run_id)
+
+
+@pytest.mark.parametrize("name", RES4LYF_SDE_WRAPPERS)
+def test_current_res4lyf_packed_av_noise_is_native_with_real_forecasts(name, monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    monkeypatch.setattr(sys.modules[__name__], "_SHAPE", (1, 1, 16))
+    denoise = _denoiser(*_manifold())
+    native = _native_res4lyf(beta, name, denoise, av=True)
+    generator_types = []
+
+    def observe_generator(_index, _actual, bridge):
+        generator = bridge._bound_noise_sampler.noise_sampler
+        generator_types.append(type(generator._base).__name__)
+
+    actual, actual_record = _spectrum_res4lyf(
+        beta, name, denoise, _config(warmup_steps=10_000), monkeypatch,
+        av=True, inside_call=observe_generator,
+    )
+    assert torch.equal(actual, native)
+    assert actual_record["bridge"].invalid_reason is None
+    if hasattr(rk_sampler_beta.RK_NoiseSampler, "_build_noise_sampler"):
+        assert set(generator_types) == {"PackedNoiseGenerator"}
+
+    _, forecast_record = _spectrum_res4lyf(beta, name, denoise, _config(), monkeypatch, av=True)
+    assert "forecast" in forecast_record["modes"]
+    assert forecast_record["runtime"].stats.forecast_model_calls > 0
+    assert forecast_record["bridge"].invalid_reason is None
+
+
+@pytest.mark.parametrize("name", ("res_2m", "res_3s_ode"))
+def test_unrelated_source_edit_does_not_disable_res4lyf(name, tmp_path, monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    import comfy.samplers
+
+    from comfyui_spectrum_h3 import sampling as sampling_module
+
+    sampler = comfy.samplers.KSAMPLER(getattr(beta, f"sample_{name}"))
+    assert sampling_module._res4lyf_sampler_contract(sampler) == (True, None)
+    for module in (beta, rk_sampler_beta, inspect.getmodule(rk_sampler_beta.RK_NoiseSampler)):
+        source = Path(module.__file__)
+        changed = tmp_path / (module.__name__.replace(".", "_") + ".py")
+        changed.write_bytes(source.read_bytes() + b"\n# unrelated upstream documentation change\n")
+        monkeypatch.setattr(module, "__file__", str(changed))
+    assert sampling_module._res4lyf_sampler_contract(sampler) == (True, None)

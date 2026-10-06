@@ -13,7 +13,6 @@ from typing import Any
 import torch
 
 from . import source_code_audit
-from .core_bsa_compat import _module_blob_sha
 from .er_sde_ksampler_contract import (
     KSamplerSampleContract,
     validate_ksampler_sample,
@@ -136,21 +135,6 @@ RES4LYF_MULTISTEP_REFRESH_STEPS = {
     "sample_res_3m": 2,
     "sample_res_3m_ode": 2,
 }
-# _module_blob_sha() deliberately LF-normalizes CRLF working-tree files before
-# constructing the Git blob ID. RES4LYF's reviewed revision stores several of
-# these sources with CRLF in Git itself, so the audited IDs below are the
-# normalized-source IDs, not GitHub's raw blob IDs for those CRLF files.
-RES4LYF_AUDITED_GIT_BLOBS = {
-    "wrappers": frozenset({"193656836254064a37af2aeb8df26f74119561ec"}),
-    "sampler": frozenset({"c095ba487ff9f90f7efc1b4656687e832135d56f"}),
-    "coefficients": frozenset({"1c1ce60f687ab4b0611bffdad2b405086c0eb71d"}),
-    "phi": frozenset({"8016425febf6d0c300658e678991d52e25918bb0"}),
-    "method": frozenset({"37651bc075a0aef7022cfb5be02a9a2a40ad0d8e"}),
-    "noise_sampler": frozenset({"e86fea7b37794df6d537b9d199d6a39743a12afb"}),
-    "guide": frozenset({"048b8f3ca3775f8379c040a28bda222b9e74e8fb"}),
-    "helper": frozenset({"b8ffdf0c0ac9515dd5cd8fb3c047130d07621bb0"}),
-}
-
 NATIVE_SEEDS_SAMPLERS = frozenset({"sample_seeds_2", "sample_seeds_3"})
 REFDELTA_SEEDS_SAMPLERS = frozenset(
     {"sample_refdelta_seeds_2", "sample_refdelta_seeds_3"}
@@ -1156,7 +1140,7 @@ def _ksampler_sample_contract(sampler: Any) -> KSamplerSampleContract:
 
 
 def _res4lyf_sampler_contract(sampler: Any) -> tuple[bool, str | None]:
-    """Validate the exact reviewed named RES4LYF beta wrapper/runtime sources."""
+    """Validate native named-wrapper APIs without a source-revision whitelist."""
     import comfy.samplers
 
     name = sampler_name(sampler)
@@ -1170,8 +1154,11 @@ def _res4lyf_sampler_contract(sampler: Any) -> tuple[bool, str | None]:
     wrapper_module = inspect.getmodule(function)
     if wrapper_module is None or getattr(wrapper_module, name, None) is not function:
         return False, "RES4LYF sampler function is not the installed named wrapper"
-    if _module_blob_sha(wrapper_module) not in RES4LYF_AUDITED_GIT_BLOBS["wrappers"]:
-        return False, "RES4LYF beta wrapper source is not a reviewed revision"
+    wrapper_path = getattr(wrapper_module, "__file__", None)
+    if not wrapper_path or not source_code_audit.matches_nested_source_code(
+        function, Path(wrapper_path), (name,),
+    ):
+        return False, "RES4LYF named wrapper does not match its installed source"
 
     rk_sampler_module = getattr(function, "__globals__", {}).get("rk_sampler_beta")
     if rk_sampler_module is None:
@@ -1179,17 +1166,10 @@ def _res4lyf_sampler_contract(sampler: Any) -> tuple[bool, str | None]:
     sample_rk_beta = getattr(rk_sampler_module, "sample_rk_beta", None)
     if not inspect.isfunction(sample_rk_beta) or inspect.getmodule(sample_rk_beta) is not rk_sampler_module:
         return False, "RES4LYF sample_rk_beta provenance is unreviewed"
-    if _module_blob_sha(rk_sampler_module) not in RES4LYF_AUDITED_GIT_BLOBS["sampler"]:
-        return False, "RES4LYF beta RK sampler source is not a reviewed revision"
-
     noise_sampler_class = getattr(rk_sampler_module, "RK_NoiseSampler", None)
     noise_sampler_module = inspect.getmodule(noise_sampler_class)
-    if (
-        noise_sampler_module is None
-        or _module_blob_sha(noise_sampler_module)
-        not in RES4LYF_AUDITED_GIT_BLOBS["noise_sampler"]
-    ):
-        return False, "RES4LYF beta noise/sigma preprocessing source is not reviewed"
+    if noise_sampler_module is None:
+        return False, "RES4LYF noise-sampler module is unavailable"
     live_reason = _res4lyf_live_noise_sampler_reason(
         noise_sampler_class,
         noise_sampler_module,
@@ -1199,45 +1179,30 @@ def _res4lyf_sampler_contract(sampler: Any) -> tuple[bool, str | None]:
 
     latent_guide_class = getattr(rk_sampler_module, "LatentGuide", None)
     latent_guide_module = inspect.getmodule(latent_guide_class)
-    if (
-        latent_guide_module is None
-        or _module_blob_sha(latent_guide_module)
-        not in RES4LYF_AUDITED_GIT_BLOBS["guide"]
-    ):
-        return False, "RES4LYF beta guide/call-routing source is not reviewed"
+    if latent_guide_module is None:
+        return False, "RES4LYF latent-guide module is unavailable"
 
     extra_options_class = getattr(rk_sampler_module, "ExtraOptions", None)
     helper_module = inspect.getmodule(extra_options_class)
-    if (
-        helper_module is None
-        or _module_blob_sha(helper_module)
-        not in RES4LYF_AUDITED_GIT_BLOBS["helper"]
-    ):
-        return False, "RES4LYF ExtraOptions defaults source is not reviewed"
+    if helper_module is None:
+        return False, "RES4LYF ExtraOptions module is unavailable"
 
     rk_method_class = getattr(rk_sampler_module, "RK_Method_Beta", None)
     rk_method_module = inspect.getmodule(rk_method_class)
     if rk_method_module is None:
         return False, "RES4LYF RK method module provenance is unavailable"
-    if _module_blob_sha(rk_method_module) not in RES4LYF_AUDITED_GIT_BLOBS["method"]:
-        return False, "RES4LYF beta RK method source is not a reviewed revision"
     coefficients = getattr(rk_method_module, "get_rk_methods_beta", None)
     coefficient_module = inspect.getmodule(coefficients)
     if coefficient_module is None:
         return False, "RES4LYF RK coefficient module provenance is unavailable"
-    if (
-        _module_blob_sha(coefficient_module)
-        not in RES4LYF_AUDITED_GIT_BLOBS["coefficients"]
-    ):
-        return False, "RES4LYF beta RK coefficient source is not a reviewed revision"
     # Both the tableau builder and the RK method evaluate RES phi functions
     # through the same Phi implementation; it is part of the numerical contract.
     phi_class = getattr(coefficient_module, "Phi", None)
     if phi_class is None or getattr(rk_method_module, "Phi", None) is not phi_class:
         return False, "RES4LYF Phi implementation provenance is unavailable"
     phi_module = inspect.getmodule(phi_class)
-    if phi_module is None or _module_blob_sha(phi_module) not in RES4LYF_AUDITED_GIT_BLOBS["phi"]:
-        return False, "RES4LYF beta phi-function source is not a reviewed revision"
+    if phi_module is None:
+        return False, "RES4LYF Phi module is unavailable"
 
     if type(sampler) is not comfy.samplers.KSAMPLER:
         return False, "RES4LYF sampler object is not native ComfyUI KSAMPLER"
@@ -3883,12 +3848,8 @@ def _res4lyf_reviewed_noise_sampler(sampler: Any) -> tuple[Any, type | None, str
     if not inspect.isclass(noise_sampler_class) or noise_sampler_class.__name__ != "RK_NoiseSampler":
         return rk_sampler_module, None, "RES4LYF RK_NoiseSampler is not the native class"
     noise_sampler_module = inspect.getmodule(noise_sampler_class)
-    if (
-        noise_sampler_module is None
-        or _module_blob_sha(noise_sampler_module)
-        not in RES4LYF_AUDITED_GIT_BLOBS["noise_sampler"]
-    ):
-        return rk_sampler_module, None, "RES4LYF RK_NoiseSampler source is not reviewed"
+    if noise_sampler_module is None:
+        return rk_sampler_module, None, "RES4LYF RK_NoiseSampler module is unavailable"
     live_reason = _res4lyf_live_noise_sampler_reason(
         noise_sampler_class,
         noise_sampler_module,
