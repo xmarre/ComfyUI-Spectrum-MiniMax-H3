@@ -1153,7 +1153,7 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
             )
             result = consume_er_sde_increment(result, decision)
             result = sampling.res4lyf_consume_model_result(
-                runtime, model_options, timestep, result, decision
+                runtime, model_options, x, timestep, result, decision
             )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
@@ -1181,7 +1181,7 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
             )
             result = consume_er_sde_increment(result, retry_decision)
             result = sampling.res4lyf_consume_model_result(
-                runtime, model_options, timestep, result, retry_decision
+                runtime, model_options, x, timestep, result, retry_decision
             )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result

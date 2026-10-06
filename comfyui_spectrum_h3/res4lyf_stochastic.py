@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import logging
 import math
 import threading
+import types
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -141,6 +143,9 @@ class RES4LYFStochasticBridge:
         self._associated_step_id: int | None = None
         self._associated_kind: str | None = None
         self._associated_input: Any = None
+        # Owned copy of the validated input contents. Identity alone cannot
+        # detect an in-place edit, and inference tensors have no version counter.
+        self._associated_snapshot: torch.Tensor | None = None
         self._associated_sigma: float | None = None
         # Noise swaps observed since the last associated model call. Every SDE
         # model call after the first must be preceded by at least one swap.
@@ -357,6 +362,7 @@ class RES4LYFStochasticBridge:
             if (
                 self._associated_kind is None
                 or x is not self._associated_input
+                or not self._input_unchanged(x)
                 or sigma != self._associated_sigma
                 or self._swaps_since_call
                 or self._pending is not None
@@ -377,6 +383,10 @@ class RES4LYFStochasticBridge:
             )
             raise RES4LYFStochasticError(self._invalid_reason or "missing swap")
 
+        if not torch.is_tensor(x) or not x.is_floating_point():
+            self.invalidate("H3 model input is not a floating-point tensor")
+            raise RES4LYFStochasticError(self._invalid_reason or "input type")
+
         pending = self._pending
         # Transfer ownership before validation so no exit leaves a stale state.
         self._pending = None
@@ -384,6 +394,7 @@ class RES4LYFStochasticBridge:
             # Either the run's first call, or every swap since the previous call
             # was a verified no-op.
             kind = "deterministic"
+            snapshot = x.detach().clone(memory_format=torch.contiguous_format)
         else:
             noised = pending.noised
             if (
@@ -410,6 +421,8 @@ class RES4LYFStochasticBridge:
                 )
                 raise RES4LYFStochasticError(self._invalid_reason or "state mismatch")
             kind = f"stochastic_{pending.kind}"
+            # The owned noised copy already equals x bit for bit.
+            snapshot = noised
             self.transitions_consumed += 1
             if self.debug:
                 LOG.warning(
@@ -423,9 +436,21 @@ class RES4LYFStochasticBridge:
         self._associated_step_id = int(step_id)
         self._associated_kind = kind
         self._associated_input = x
+        self._associated_snapshot = snapshot
         self._associated_sigma = sigma
         self._swaps_since_call = 0
         return kind
+
+    def _input_unchanged(self, x: Any) -> bool:
+        snapshot = self._associated_snapshot
+        return (
+            snapshot is not None
+            and torch.is_tensor(x)
+            and x.shape == snapshot.shape
+            and x.dtype == snapshot.dtype
+            and x.device == snapshot.device
+            and bool(torch.equal(x, snapshot))
+        )
 
     # ------------------------------------------------------------------
     # Solver-space result ownership
@@ -436,6 +461,8 @@ class RES4LYFStochasticBridge:
         result: Any,
         timestep: Any,
         descriptor: RES4LYFStepDescriptor,
+        *,
+        model_input: Any,
     ) -> torch.Tensor:
         """Return the denoised value RES4LYF may consume for this model call."""
         if descriptor.run_id != self.run_id:
@@ -455,6 +482,16 @@ class RES4LYFStochasticBridge:
             raise RES4LYFStochasticError(
                 "RES4LYF model result arrived without its stochastic-state association"
             )
+        # Every attempt of this call, including an exact retry after a failed
+        # forecast, must have run on the validated input contents.
+        if model_input is not self._associated_input or not self._input_unchanged(model_input):
+            self.invalidate(
+                f"H3 model input for step {descriptor.step_id} changed between "
+                "association and its result"
+            )
+            if descriptor.mode == "forecast":
+                raise RES4LYFStochasticError(self._invalid_reason or "input changed")
+            return result
         coordinate = self._coordinate(timestep)
         if descriptor.mode == "actual":
             self._observe_actual(result, coordinate, descriptor)
@@ -593,6 +630,7 @@ class RES4LYFStochasticBridge:
         self._closed = True
         self._integrity_check = None
         self._associated_input = None
+        self._associated_snapshot = None
         self._associated_sigma = None
         self._swaps_since_call = 0
         self._pending = None
@@ -671,12 +709,85 @@ def tracked_noise_sampler_class(
 _INSTALL_LOCK = threading.Lock()
 
 
-def _class_callables(cls: type) -> dict[str, Any]:
-    return {
-        name: value
-        for name, value in vars(cls).items()
-        if callable(value) or isinstance(value, (staticmethod, classmethod, property))
-    }
+_EMPTY_CELL = object()
+
+
+def _referenced_names(code: types.CodeType) -> set[str]:
+    names = set(code.co_names)
+    for constant in code.co_consts:
+        if isinstance(constant, types.CodeType):
+            names |= _referenced_names(constant)
+    return names
+
+
+def _implementation_state(cls: type) -> dict[str, tuple[Any, ...]]:
+    """Capture everything that determines what each class callable executes.
+
+    Function objects are mutable: their code, defaults, keyword defaults and
+    closure cells can be replaced in place, and the module globals their code
+    reads can be rebound. Record those objects themselves so a later identity
+    comparison detects any change without trusting the function reference.
+    """
+    state: dict[str, tuple[Any, ...]] = {}
+    for name, value in vars(cls).items():
+        if isinstance(value, (staticmethod, classmethod)):
+            function = value.__func__
+        elif inspect.isfunction(value):
+            function = value
+        elif callable(value) or isinstance(value, property):
+            state[name] = (value,)
+            continue
+        else:
+            continue
+        if not inspect.isfunction(function):
+            state[name] = (value, function)
+            continue
+        cells = []
+        for cell in function.__closure__ or ():
+            try:
+                cells.append(cell.cell_contents)
+            except ValueError:
+                cells.append(_EMPTY_CELL)
+        defaults = function.__defaults__ or ()
+        kwdefaults = sorted((function.__kwdefaults__ or {}).items(), key=lambda item: item[0])
+        module_globals = function.__globals__
+        referenced = sorted(_referenced_names(function.__code__) & set(module_globals))
+        state[name] = (
+            value,
+            function,
+            function.__code__,
+            module_globals,
+            len(defaults),
+            *defaults,
+            len(kwdefaults),
+            *(item for pair in kwdefaults for item in pair),
+            len(cells),
+            *cells,
+            len(referenced),
+            *(item for key in referenced for item in (key, module_globals[key])),
+        )
+    return state
+
+
+def _same_implementation(
+    current: dict[str, tuple[Any, ...]],
+    snapshot: dict[str, tuple[Any, ...]],
+) -> bool:
+    if current.keys() != snapshot.keys():
+        return False
+    for name, recorded in snapshot.items():
+        live = current[name]
+        if len(live) != len(recorded):
+            return False
+        for live_item, recorded_item in zip(live, recorded, strict=True):
+            if live_item is recorded_item:
+                continue
+            # Lengths and global names are plain values; everything else must
+            # be the identical object.
+            if type(live_item) in (int, str) and live_item == recorded_item:
+                continue
+            return False
+    return True
 
 
 @contextlib.contextmanager
@@ -702,10 +813,10 @@ def tracked_res4lyf_noise_sampler(
             )
         tracked = tracked_noise_sampler_class(original_class, bridge, owner_guider)
         rk_sampler_module.RK_NoiseSampler = tracked
-    snapshot = _class_callables(original_class)
+    snapshot = _implementation_state(original_class)
 
     def integrity() -> str | None:
-        if _class_callables(original_class) != snapshot:
+        if not _same_implementation(_implementation_state(original_class), snapshot):
             return "RES4LYF RK_NoiseSampler methods changed during the tracked run"
         return None
 

@@ -3354,6 +3354,7 @@ def res4lyf_associate_model_call(
 def res4lyf_consume_model_result(
     runtime: SpectrumH3Runtime,
     model_options: dict[str, Any] | None,
+    x: Any,
     timestep: Any,
     result: Any,
     decision: dict[str, Any],
@@ -3374,7 +3375,7 @@ def res4lyf_consume_model_result(
     bridge.check_integrity()
     if bridge.invalid_reason is None:
         try:
-            return bridge.consume(result, timestep, descriptor)
+            return bridge.consume(result, timestep, descriptor, model_input=x)
         except RES4LYFStochasticError as exc:
             if descriptor.mode == "forecast" and bridge.invalid_reason is None:
                 # Tracking is intact; only this dense output is unavailable.
@@ -3531,7 +3532,7 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
             )
             result = consume_er_sde_increment(result, decision)
             result = res4lyf_consume_model_result(
-                runtime, model_options, timestep, result, decision
+                runtime, model_options, x, timestep, result, decision
             )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
@@ -3558,7 +3559,7 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
             )
             result = consume_er_sde_increment(result, retry_decision)
             result = res4lyf_consume_model_result(
-                runtime, model_options, timestep, result, retry_decision
+                runtime, model_options, x, timestep, result, retry_decision
             )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
             return result
@@ -3801,8 +3802,8 @@ def _res4lyf_live_noise_sampler_reason(cls: Any, module: Any) -> str | None:
 
     The Git-blob audit covers the file on disk, not callables replaced after
     import. Compile the audited file and require each live function on the class
-    to match its lexical counterpart, execute in the audited module's globals,
-    and carry no closure other than the class cell.
+    to match its lexical counterpart and its written defaults, execute in the
+    audited module's globals, and carry no closure other than the class cell.
     """
     path = getattr(module, "__file__", None)
     if (
@@ -3843,6 +3844,15 @@ def _res4lyf_live_noise_sampler_reason(cls: Any, module: Any) -> str | None:
         ):
             return (
                 f"RES4LYF RK_NoiseSampler.{name} is not the reviewed native implementation"
+            )
+        if not source_code_audit.matches_source_defaults(
+            function,
+            source_path,
+            ("RK_NoiseSampler", name),
+            immutable_types=(torch.dtype,),
+        ):
+            return (
+                f"RES4LYF RK_NoiseSampler.{name} defaults are not the reviewed native defaults"
             )
     for name in RES4LYF_NOISE_SAMPLER_REQUIRED_METHODS:
         if not inspect.isfunction(vars(cls).get(name)):

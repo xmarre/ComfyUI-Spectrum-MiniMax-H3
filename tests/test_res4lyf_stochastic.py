@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.util
 import math
@@ -65,8 +66,9 @@ def _between_calls(bridge: RES4LYFStochasticBridge) -> None:
 
 def _actual(bridge, value, sigma, step_id, x=None, run_id=1):
     _between_calls(bridge)
+    model_input = torch.zeros_like(value) if x is None else x
     bridge.associate(
-        torch.zeros_like(value) if x is None else x,
+        model_input,
         torch.tensor([sigma]),
         run_id=run_id,
         step_id=step_id,
@@ -75,13 +77,15 @@ def _actual(bridge, value, sigma, step_id, x=None, run_id=1):
         value,
         torch.tensor([sigma]),
         RES4LYFStepDescriptor(run_id, step_id, "actual"),
+        model_input=model_input,
     )
 
 
 def _forecast(bridge, raw, sigma, step_id, x=None, run_id=1):
     _between_calls(bridge)
+    model_input = torch.zeros_like(raw) if x is None else x
     bridge.associate(
-        torch.zeros_like(raw) if x is None else x,
+        model_input,
         torch.tensor([sigma]),
         run_id=run_id,
         step_id=step_id,
@@ -90,6 +94,7 @@ def _forecast(bridge, raw, sigma, step_id, x=None, run_id=1):
         raw,
         torch.tensor([sigma]),
         RES4LYFStepDescriptor(run_id, step_id, "forecast"),
+        model_input=model_input,
     )
 
 
@@ -363,13 +368,16 @@ def test_result_requires_association_and_rejects_replay():
             torch.zeros(1, 2),
             torch.tensor([0.5]),
             RES4LYFStepDescriptor(1, 0, "actual"),
+            model_input=torch.zeros(1, 2),
         )
-    bridge.associate(torch.zeros(1, 2), torch.tensor([0.5]), run_id=1, step_id=0)
+    x = torch.zeros(1, 2)
+    bridge.associate(x, torch.tensor([0.5]), run_id=1, step_id=0)
     with pytest.raises(RES4LYFStochasticError, match="replay"):
         bridge.consume(
             torch.zeros(1, 2),
             torch.tensor([0.5]),
             RES4LYFStepDescriptor(1, 0, "replay"),
+            model_input=x,
         )
 
 
@@ -1176,3 +1184,233 @@ def test_foreign_replacement_during_the_run_is_preserved(monkeypatch):
     assert overlap[0] is not native_class
     assert issubclass(overlap[0], native_class)
     assert rk_sampler_beta.RK_NoiseSampler is foreign
+
+
+@pytest.mark.parametrize("inference", (False, True))
+def test_in_place_edit_of_the_same_input_is_not_an_unchanged_retry(inference):
+    context = torch.inference_mode() if inference else contextlib.nullcontext()
+    with context:
+        bridge = _bridge()
+        landing = torch.zeros(1, 2)
+        noised = torch.tensor([[0.5, -0.5]])
+        _swap(bridge, "step", landing, noised, 0.8)
+        x = noised.clone()
+        assert bridge.associate(x, torch.tensor([0.8]), run_id=1, step_id=3) == "stochastic_step"
+        x.add_(0.01)
+
+        with pytest.raises(RES4LYFStochasticError, match="associated again"):
+            bridge.associate(x, torch.tensor([0.8]), run_id=1, step_id=3)
+    assert bridge.invalid_reason is not None
+
+
+@pytest.mark.parametrize("mode", ("actual", "forecast"))
+def test_result_for_an_input_edited_after_association_fails_closed(mode):
+    bridge = _bridge()
+    _actual(bridge, torch.ones(1, 2), 0.9, 0)
+    _noop_swap(bridge)
+    x = torch.zeros(1, 2)
+    bridge.associate(x, torch.tensor([0.8]), run_id=1, step_id=1)
+    x.add_(0.01)
+    result = torch.full((1, 2), 3.0)
+    descriptor = RES4LYFStepDescriptor(1, 1, mode)
+
+    if mode == "forecast":
+        with pytest.raises(RES4LYFStochasticError, match="changed between association"):
+            bridge.consume(result, torch.tensor([0.8]), descriptor, model_input=x)
+    else:
+        assert bridge.consume(result, torch.tensor([0.8]), descriptor, model_input=x) is result
+    assert "changed between association" in (bridge.invalid_reason or "")
+
+
+def test_retry_after_input_edit_during_forecast_disables_forecasting():
+    from comfyui_spectrum_h3.config import SpectrumH3Config
+    from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
+    from comfyui_spectrum_h3.sampling import (
+        BINDING_KEY,
+        RUN_ID_KEY,
+        STEP_ID_KEY,
+        SpectrumH3Binding,
+        predict_noise_wrapper,
+    )
+
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            warmup_steps=1,
+            tail_actual_steps=0,
+            max_history=4,
+            window_size=3.0,
+            offline_smoothing_replay=False,
+            model_aware_mode="off",
+            bootstrap_first_forecast=False,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([0.9, 0.8, 0.6, 0.0]),
+        "sample_res_2m",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    bridge = RES4LYFStochasticBridge(run_id=run_id, coordinate_fn=_coordinate, debug=False)
+    assert bridge.bind_noise_sampler(object())
+    guider = SimpleNamespace(model_options={BINDING_KEY: SpectrumH3Binding(runtime)})
+    attempts = []
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, x, _timestep, model_options, _seed):
+            options = model_options["transformer_options"]
+            call_id, actual = runtime.begin_model_call(
+                options[RUN_ID_KEY],
+                options[STEP_ID_KEY],
+                topology=(("target_audio_rows", 1), ("target_video_rows", 1)),
+                labels=((0, "positive"),),
+                expected_shape=(1, 2, 1),
+            )
+            attempts.append(actual)
+            if actual:
+                runtime.observe_actual(
+                    options[RUN_ID_KEY],
+                    options[STEP_ID_KEY],
+                    call_id,
+                    torch.full((1, 2, 1), float(len(attempts))),
+                )
+            else:
+                assert runtime.predict(
+                    options[RUN_ID_KEY],
+                    options[STEP_ID_KEY],
+                    call_id,
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                ) is not None
+                # A misbehaving layer edits the solver state in place, and the
+                # missing anchors force the executor retry below.
+                x.add_(0.01)
+                bridge._anchors.clear()
+            return torch.full((1, 2), 7.0)
+
+    options = {"transformer_options": {RES4LYF_STOCHASTIC_BRIDGE_KEY: bridge}}
+    for sigma in (0.9, 0.8):
+        predict_noise_wrapper(Executor(), torch.zeros(1, 2), torch.tensor([sigma]), options, 0)
+        _noop_swap(bridge)
+    attempts.clear()
+
+    predict_noise_wrapper(Executor(), torch.zeros(1, 2), torch.tensor([0.6]), options, 0)
+
+    # The retry ran without re-association; its result check caught the edit.
+    assert attempts == [False, True]
+    assert "changed between association" in (bridge.invalid_reason or "")
+    assert runtime.stats.disabled
+    assert runtime.last_completed_mode == "actual"
+    runtime.end_run(run_id)
+
+
+def _altered_constant_code(code, old, new):
+    return code.replace(
+        co_consts=tuple(new if value == old and type(value) is float else value for value in code.co_consts)
+    )
+
+
+@pytest.mark.parametrize("mutation", ("code", "defaults"))
+def test_in_place_function_mutation_during_the_run_fails_closed(mutation, monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    denoise = _denoiser(*_manifold())
+    _, baseline = _spectrum_res4lyf(beta, "res_2s", denoise, _config(), monkeypatch)
+    target = baseline["modes"].index("forecast")
+    native_class = rk_sampler_beta.RK_NoiseSampler
+    substep = native_class.swap_noise_substep
+    assert 0.999 in substep.__code__.co_consts
+
+    def mutate(index, actual, _bridge):
+        if index == target and not actual:
+            # The function object stays the same; only its implementation changes.
+            if mutation == "code":
+                monkeypatch.setattr(
+                    substep,
+                    "__code__",
+                    _altered_constant_code(substep.__code__, 0.999, 0.02),
+                )
+            else:
+                monkeypatch.setattr(substep, "__defaults__", (torch.tensor(0.7), None, None, None))
+
+    _, record = _spectrum_res4lyf(
+        beta,
+        "res_2s",
+        denoise,
+        _config(),
+        monkeypatch,
+        inside_call=mutate,
+    )
+
+    assert record["modes"][target] == "actual"
+    assert torch.equal(record["returned"][target], record["exact"][target])
+    assert "forecast" not in record["modes"][target:]
+    assert "methods changed" in (record["bridge"].invalid_reason or "")
+    assert record["runtime"].stats.disabled
+    assert native_class.swap_noise_substep is substep
+
+
+def test_replaced_noise_sampler_defaults_keep_the_run_all_actual(monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    import comfy.samplers
+
+    from comfyui_spectrum_h3 import sampling as sampling_module
+
+    swap = rk_sampler_beta.RK_NoiseSampler.swap_noise_step
+    monkeypatch.setattr(swap, "__defaults__", (torch.tensor(0.7), None, None))
+    sampler = comfy.samplers.KSAMPLER(beta.sample_res_2m)
+
+    _module, cls, reason = sampling_module._res4lyf_reviewed_noise_sampler(sampler)
+    assert cls is None
+    assert "swap_noise_step defaults are not the reviewed native defaults" in reason
+    supported, contract_reason = sampling_module._res4lyf_sampler_contract(sampler)
+    assert not supported
+    assert "defaults" in contract_reason
+
+    denoise = _denoiser(*_manifold())
+    _, record = _spectrum_res4lyf(beta, "res_2m", denoise, _config(), monkeypatch)
+    assert set(record["modes"]) == {"actual"}
+    assert record.get("bridge") is None
+
+
+def test_source_defaults_audit_compares_literals_names_and_mutability(tmp_path):
+    from pathlib import Path
+
+    from comfyui_spectrum_h3 import source_code_audit
+
+    source = tmp_path / "audited.py"
+    source.write_text(
+        "import torch\n"
+        "MUTABLE = []\n"
+        "class Audited:\n"
+        "    def method(self, a=1, b=-0.5, c='x', d=None, *, e=torch.float64):\n"
+        "        return a\n"
+        "    def mutable(self, value=MUTABLE):\n"
+        "        return value\n"
+    )
+    namespace: dict[str, object] = {"__name__": "audited"}
+    exec(compile(source.read_text(), str(source), "exec"), namespace)  # noqa: S102
+    audited = namespace["Audited"]
+    method = audited.method
+
+    def matches(function, name):
+        return source_code_audit.matches_source_defaults(
+            function,
+            Path(source),
+            ("Audited", name),
+            immutable_types=(torch.dtype,),
+        )
+
+    assert matches(method, "method")
+    for defaults in ((True, -0.5, "x", None), (1, -0.5, "y", None), (1, -0.5, "x")):
+        method.__defaults__ = defaults
+        assert not matches(method, "method")
+    method.__defaults__ = (1, -0.5, "x", None)
+    method.__kwdefaults__ = {"e": torch.float32}
+    assert not matches(method, "method")
+    method.__kwdefaults__ = {"e": torch.float64}
+    assert matches(method, "method")
+    # A name resolving to a mutable object cannot be frozen by identity.
+    assert not matches(audited.mutable, "mutable")
