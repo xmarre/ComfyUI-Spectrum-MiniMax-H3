@@ -20,6 +20,10 @@ code and defaults. Mid-run changes discard affected forecasts, retry the same
 call exactly and disable subsequent forecasting. Input changes detected on
 an exact call also disable forecasting immediately while retaining its result.
 
+Debug RMS diagnostics preserve float64 native noise increments and accumulate
+lower-precision inputs in float32. Enabling debug logging does not narrow the
+native swap result or change solver outputs.
+
 CPU regressions cover tracked native equivalence for all six SDE wrappers,
 including shifted AV noise and RES4LYF 1.2.0 packed AV noise on ComfyUI 0.38.0.
 Accelerated H3 speech/video quality remains

@@ -20,6 +20,7 @@ from comfyui_spectrum_h3.res4lyf_stochastic import (
     RES4LYFStepDescriptor,
     RES4LYFStochasticBridge,
     RES4LYFStochasticError,
+    _rms,
     tracked_noise_sampler_class,
     tracked_res4lyf_noise_sampler,
 )
@@ -28,6 +29,17 @@ from comfyui_spectrum_h3.res4lyf_stochastic import (
 def _coordinate(sigma: float) -> float:
     # Half-log-SNR for a CONST/flow model: log((1 - sigma) / sigma).
     return math.log((1.0 - sigma) / sigma)
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64))
+@pytest.mark.parametrize("device", ("cpu", "cuda"))
+def test_debug_rms_accepts_native_noise_dtypes(dtype, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    scale = 1e100 if dtype == torch.float64 else 1.0
+    value = torch.tensor([3.0 * scale, 4.0 * scale], dtype=dtype, device=device)
+    assert _rms(value) == pytest.approx(math.sqrt(12.5) * scale)
+    assert _rms(value[:0]) == 0.0
 
 
 def _bridge(run_id: int = 1) -> RES4LYFStochasticBridge:
@@ -1614,7 +1626,7 @@ def test_current_res4lyf_packed_av_noise_is_native_with_real_forecasts(name, mon
         generator_types.append(type(generator._base).__name__)
 
     actual, actual_record = _spectrum_res4lyf(
-        beta, name, denoise, _config(warmup_steps=10_000), monkeypatch,
+        beta, name, denoise, _config(warmup_steps=10_000, debug=True), monkeypatch,
         av=True, inside_call=observe_generator,
     )
     assert torch.equal(actual, native)
@@ -1622,7 +1634,9 @@ def test_current_res4lyf_packed_av_noise_is_native_with_real_forecasts(name, mon
     if hasattr(rk_sampler_beta.RK_NoiseSampler, "_build_noise_sampler"):
         assert set(generator_types) == {"PackedNoiseGenerator"}
 
-    _, forecast_record = _spectrum_res4lyf(beta, name, denoise, _config(), monkeypatch, av=True)
+    _, forecast_record = _spectrum_res4lyf(
+        beta, name, denoise, _config(debug=True), monkeypatch, av=True,
+    )
     assert "forecast" in forecast_record["modes"]
     assert forecast_record["runtime"].stats.forecast_model_calls > 0
     assert forecast_record["bridge"].invalid_reason is None

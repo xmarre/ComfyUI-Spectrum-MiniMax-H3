@@ -99,7 +99,10 @@ def _scalar_sigma(value: Any) -> float:
 def _rms(value: torch.Tensor) -> float:
     if value.numel() == 0:
         return 0.0
-    norm = torch.linalg.vector_norm(value.detach(), dtype=torch.float32)
+    # Native noise swaps can promote the increment to float64. vector_norm
+    # allows wider accumulation, but rejects a narrowing dtype argument.
+    accumulation_dtype = torch.float64 if value.dtype == torch.float64 else torch.float32
+    norm = torch.linalg.vector_norm(value.detach(), dtype=accumulation_dtype)
     return float((norm / math.sqrt(value.numel())).item())
 
 
