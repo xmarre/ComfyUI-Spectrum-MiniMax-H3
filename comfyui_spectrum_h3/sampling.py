@@ -3375,7 +3375,11 @@ def res4lyf_consume_model_result(
     bridge.check_integrity()
     if bridge.invalid_reason is None:
         try:
-            return bridge.consume(result, timestep, descriptor, model_input=x)
+            result = bridge.consume(result, timestep, descriptor, model_input=x)
+            # An exact result is retained when consume detects an input edit,
+            # but that same call must still disable subsequent forecasting.
+            if bridge.invalid_reason is None:
+                return result
         except RES4LYFStochasticError as exc:
             if descriptor.mode == "forecast" and bridge.invalid_reason is None:
                 # Tracking is intact; only this dense output is unavailable.

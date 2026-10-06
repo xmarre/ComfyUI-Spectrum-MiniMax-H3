@@ -557,7 +557,7 @@ def _denoiser(mu, basis):
 
 
 class _Guider:
-    def __init__(self, model_sampling, call):
+    def __init__(self, model_sampling, call, *, av=False):
         self.inner_model = SimpleNamespace(
             device=torch.device("cpu"),
             model_sampling=model_sampling,
@@ -568,6 +568,14 @@ class _Guider:
             get_model_object=lambda name: model_sampling if name == "model_sampling" else None
         )
         self._call = call
+        if av:
+            # Exercise RES4LYF's packed-column AV noise split and distinct
+            # stream schedules without loading an H3 transformer or VAE.
+            self.conds = {
+                "positive": [{"model_conds": {"latent_shapes": SimpleNamespace(cond=[(1, 1, 8), (1, 1, 8)])}}]
+            }
+            self.inner_model.diffusion_model.sigma_shift_video = 12.0
+            self.inner_model.diffusion_model.sigma_shift_audio = 8.0
 
     def __call__(self, x, sigma, model_options=None, seed=None):
         return self._call(x, sigma, model_options or {}, seed)
@@ -593,9 +601,9 @@ _SIGMAS = torch.tensor(
 )
 
 
-def _native_res4lyf(beta, name, denoise):
+def _native_res4lyf(beta, name, denoise, *, av=False):
     model_sampling = _flow_model_sampling()
-    guider = _Guider(model_sampling, lambda x, sigma, _options, _seed: denoise(x, sigma))
+    guider = _Guider(model_sampling, lambda x, sigma, _options, _seed: denoise(x, sigma), av=av)
     torch.manual_seed(4242)  # RES4LYF seeds SDE noise from torch.initial_seed() + 1.
     return getattr(beta, f"sample_{name}")(
         _ModelK(guider),
@@ -619,6 +627,7 @@ def _spectrum_res4lyf(
     denoise_mask=None,
     before_call=None,
     inside_call=None,
+    av=False,
 ):
     from comfyui_spectrum_h3 import sampling as sampling_module
     from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
@@ -701,7 +710,7 @@ def _spectrum_res4lyf(
         record["returned"][len(record["modes"]) - 1] = result
         return result
 
-    guider = _Guider(model_sampling, guided_call)
+    guider = _Guider(model_sampling, guided_call, av=av)
     guider.model_options[BINDING_KEY] = SpectrumH3Binding(runtime)
 
     sampler = SimpleNamespace(
@@ -798,7 +807,8 @@ def _config(**overrides):
 
 
 @pytest.mark.parametrize("name", RES4LYF_SDE_WRAPPERS)
-def test_tracked_all_actual_res4lyf_sde_is_bitwise_native(name, monkeypatch):
+@pytest.mark.parametrize("av", (False, True))
+def test_tracked_all_actual_res4lyf_sde_is_bitwise_native(name, av, monkeypatch):
     beta, rk_sampler_beta = _res4lyf_runtime_fixture()
     from comfyui_spectrum_h3.sampling import (
         _res4lyf_effective_sigmas,
@@ -807,7 +817,12 @@ def test_tracked_all_actual_res4lyf_sde_is_bitwise_native(name, monkeypatch):
 
     original = rk_sampler_beta.RK_NoiseSampler
     denoise = _denoiser(*_manifold())
-    native = _native_res4lyf(beta, name, denoise)
+    native = _native_res4lyf(beta, name, denoise, av=av)
+    av_shifts = []
+
+    def observe_av(_index, _actual, bridge):
+        noise_sampler = bridge._bound_noise_sampler
+        av_shifts.append((noise_sampler.av_split, noise_sampler.av_shift_audio))
 
     tracked, record = _spectrum_res4lyf(
         beta,
@@ -815,9 +830,15 @@ def test_tracked_all_actual_res4lyf_sde_is_bitwise_native(name, monkeypatch):
         denoise,
         _config(warmup_steps=10_000),
         monkeypatch,
+        av=av,
+        inside_call=observe_av,
     )
 
     assert torch.equal(tracked, native)
+    assert set(av_shifts) == ({(8, 8.0)} if av else {(None, None)})
+    if av:
+        # Prove the AV branch affects this fixture's numerical trajectory.
+        assert not torch.equal(native, _native_res4lyf(beta, name, denoise))
     assert rk_sampler_beta.RK_NoiseSampler is original
     assert set(record["modes"]) == {"actual"}
     effective, reason = _res4lyf_effective_sigmas(_SIGMAS, _flow_model_sampling())
@@ -1448,7 +1469,7 @@ def _native_av_sampler(rk_sampler_beta):
 
 @pytest.mark.parametrize(
     "change",
-    ("unwrapped_staticmethod", "noncallable", "removed", "kind_flip", "extra_callable"),
+    ("unwrapped_staticmethod", "noncallable", "removed", "kind_flip", "extra_callable", "extra_descriptor"),
 )
 def test_live_callable_inventory_and_binding_kinds_are_audited(change, monkeypatch):
     beta, rk_sampler_beta = _res4lyf_runtime_fixture()
@@ -1473,8 +1494,15 @@ def test_live_callable_inventory_and_binding_kinds_are_audited(change, monkeypat
     elif change == "kind_flip":
         monkeypatch.setattr(cls, "get_sde_coeff", staticmethod(vars(cls)["get_sde_coeff"]))
         expected = "get_sde_coeff is missing or not the reviewed function"
-    else:
+    elif change == "extra_callable":
         monkeypatch.setattr(cls, "extra_helper", lambda self: None, raising=False)
+        expected = "extra_helper is an unreviewed callable attribute"
+    else:
+        class ForeignDescriptor:
+            def __get__(self, instance, owner=None):
+                return lambda: None
+
+        monkeypatch.setattr(cls, "extra_helper", ForeignDescriptor(), raising=False)
         expected = "extra_helper is an unreviewed callable attribute"
 
     if change in {"unwrapped_staticmethod", "noncallable"}:
@@ -1488,7 +1516,7 @@ def test_live_callable_inventory_and_binding_kinds_are_audited(change, monkeypat
     assert expected in reason
 
 
-@pytest.mark.parametrize("change", ("unwrapped_staticmethod", "noncallable"))
+@pytest.mark.parametrize("change", ("unwrapped_staticmethod", "noncallable", "extra_descriptor"))
 def test_descriptor_change_during_the_run_fails_closed(change, monkeypatch):
     beta, rk_sampler_beta = _res4lyf_runtime_fixture()
     denoise = _denoiser(*_manifold())
@@ -1499,6 +1527,13 @@ def test_descriptor_change_during_the_run_fails_closed(change, monkeypatch):
 
     def mutate(index, actual, _bridge):
         if index == target and not actual:
+            if change == "extra_descriptor":
+                class ForeignDescriptor:
+                    def __get__(self, instance, owner=None):
+                        return lambda: None
+
+                monkeypatch.setattr(cls, "extra_helper", ForeignDescriptor(), raising=False)
+                return
             replacement = original.__func__ if change == "unwrapped_staticmethod" else None
             monkeypatch.setattr(cls, "_av_renoise_var", replacement)
 
@@ -1516,3 +1551,55 @@ def test_descriptor_change_during_the_run_fails_closed(change, monkeypatch):
     assert "forecast" not in record["modes"][target:]
     assert "methods changed" in (record["bridge"].invalid_reason or "")
     assert record["runtime"].stats.disabled
+
+
+def test_foreign_descriptor_subclass_is_not_a_reviewed_binding(monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    from comfyui_spectrum_h3 import sampling as sampling_module
+
+    cls = rk_sampler_beta.RK_NoiseSampler
+    native = _native_av_sampler(rk_sampler_beta)
+    before = native.scale_av_noise(torch.ones(1, 4), 0.8, 0.6)
+    original = vars(cls)["_av_renoise_var"]
+
+    class ForeignStaticMethod(staticmethod):
+        def __get__(self, instance, owner=None):
+            return lambda _sigma_from, _sigma_to: 0.0
+
+    # The underlying function still has the reviewed code and defaults, but
+    # this descriptor substitutes another callable on instance access.
+    monkeypatch.setattr(cls, "_av_renoise_var", ForeignStaticMethod(original.__func__))
+    after = native.scale_av_noise(torch.ones(1, 4), 0.8, 0.6)
+    assert not torch.equal(before, after)
+    sampler = SimpleNamespace(sampler_function=beta.sample_res_2m)
+    assert sampling_module._res4lyf_reviewed_noise_sampler(sampler)[2] is not None
+
+
+def test_input_mutation_on_an_exact_call_disables_forecasting_immediately():
+    from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
+    from comfyui_spectrum_h3.sampling import res4lyf_consume_model_result
+
+    runtime = SpectrumH3Runtime(_config())
+    run_id = runtime.start_run(
+        torch.tensor([0.9, 0.8, 0.6, 0.0]),
+        "sample_res_2m",
+        supported_sampler=True,
+    )
+    decision = runtime.begin_step(torch.tensor([0.9]))
+    assert decision["actual"]
+    bridge = _bridge(run_id)
+    x = torch.zeros(1, 2)
+    bridge.associate(x, torch.tensor([0.9]), run_id=run_id, step_id=decision["step_id"])
+    x.add_(0.01)
+    result = torch.ones(1, 2)
+    options = {"transformer_options": {RES4LYF_STOCHASTIC_BRIDGE_KEY: bridge}}
+
+    returned = res4lyf_consume_model_result(
+        runtime, options, x, torch.tensor([0.9]), result, decision
+    )
+
+    assert returned is result
+    assert "changed between association" in bridge.invalid_reason
+    assert runtime.stats.disabled
+    assert "changed between association" in runtime.stats.disable_reason
+    runtime.end_run(run_id)

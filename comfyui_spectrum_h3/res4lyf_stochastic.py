@@ -734,7 +734,7 @@ def _implementation_state(cls: type) -> dict[str, tuple[Any, ...]]:
             function = value.__func__
         elif inspect.isfunction(value):
             function = value
-        elif callable(value) or isinstance(value, property):
+        elif callable(value) or any(hasattr(type(value), hook) for hook in ("__get__", "__set__", "__delete__")):
             state[name] = (value,)
             continue
         else:

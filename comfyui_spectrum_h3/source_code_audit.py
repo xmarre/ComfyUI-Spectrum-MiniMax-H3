@@ -326,11 +326,13 @@ def _reference_class_inventory(
 
 
 def _live_binding_kind(value: Any) -> str | None:
-    if isinstance(value, staticmethod):
+    # A descriptor subclass can override __get__ while retaining the reviewed
+    # __func__. Only the built-in descriptor has the source's binding semantics.
+    if type(value) is staticmethod:
         return "staticmethod" if isinstance(value.__func__, types.FunctionType) else None
-    if isinstance(value, classmethod):
+    if type(value) is classmethod:
         return "classmethod" if isinstance(value.__func__, types.FunctionType) else None
-    if isinstance(value, property):
+    if type(value) is property:
         return "property"
     if isinstance(value, types.FunctionType):
         return "function"
@@ -376,6 +378,14 @@ def class_callable_inventory_reason(
     for name, value in live.items():
         if name in expected:
             continue
-        if callable(value) or isinstance(value, (staticmethod, classmethod, property)):
+        # These storage descriptors are created by Python, not by the class
+        # body. An arbitrary descriptor must not pass as a noncallable value.
+        if (
+            name in {"__dict__", "__weakref__"}
+            and type(value) is types.GetSetDescriptorType
+            and value.__objclass__ is cls
+        ):
+            continue
+        if callable(value) or any(hasattr(type(value), hook) for hook in ("__get__", "__set__", "__delete__")):
             return f"{class_name}.{name} is an unreviewed callable attribute"
     return None

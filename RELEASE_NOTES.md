@@ -1,3 +1,29 @@
+# Unreleased
+
+## Named RES4LYF RES samplers
+
+Adds reviewed Spectrum support for RES4LYF beta `res_2m`, `res_3m`, `res_2s`,
+`res_3s`, `res_5s`, `res_6s` and their `*_ode` variants at reviewed source
+revision `e8437efef69cacf3f08fbd9f90fcc517868c5cb8`. The generic `rk_beta`
+sampler remains native-only.
+
+ODE forecasting follows native stage topology and recurrence refreshes. SDE
+forecast results use bounded causal denoised-space output from exact H3 anchors;
+native RES4LYF owns noise generation, stream scaling and solver updates. Startup,
+the final outer interval and unreviewed paths retain exact execution. Offline
+smoothing replay is disabled for these wrappers.
+
+The SDE bridge checks stochastic input ownership and the live noise-sampler
+implementation, including callable inventory, built-in binding descriptors,
+code and defaults. Mid-run changes discard affected forecasts, retry the same
+call exactly and disable subsequent forecasting. Input changes detected on
+an exact call also disable forecasting immediately while retaining its result.
+
+CPU regressions cover tracked native equivalence for all six SDE wrappers,
+including shifted AV noise. Accelerated H3 speech/video quality remains
+unvalidated. Follow [RES4LYF GPU validation](docs/RES4LYF_GPU_VALIDATION.md)
+before treating this path as accepted for production media.
+
 # Spectrum MiniMax H3 v0.2.28
 
 v0.2.28 fixes reviewed-source auditing on Windows checkouts whose Git text conversion materializes Python files with CRLF line endings.
