@@ -1436,3 +1436,83 @@ def test_default_that_changes_native_output_is_rejected(monkeypatch):
     _module, cls, reason = sampling_module._res4lyf_reviewed_noise_sampler(sampler)
     assert cls is None
     assert "get_sde_step defaults are not the reviewed native defaults" in reason
+
+
+def _native_av_sampler(rk_sampler_beta):
+    native = object.__new__(rk_sampler_beta.RK_NoiseSampler)
+    native.av_split, native.av_total = 2, 4
+    native.av_audio_noise_scale = 1.0
+    native.av_shift_video, native.av_shift_audio = 12.0, 8.0
+    return native
+
+
+@pytest.mark.parametrize(
+    "change",
+    ("unwrapped_staticmethod", "noncallable", "removed", "kind_flip", "extra_callable"),
+)
+def test_live_callable_inventory_and_binding_kinds_are_audited(change, monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    from comfyui_spectrum_h3 import sampling as sampling_module
+
+    cls = rk_sampler_beta.RK_NoiseSampler
+    native = _native_av_sampler(rk_sampler_beta)
+    native.scale_av_noise(torch.ones(1, 4), 0.8, 0.6)
+    original = vars(cls)["_av_renoise_var"]
+    assert isinstance(original, staticmethod)
+
+    if change == "unwrapped_staticmethod":
+        # Code, globals and defaults are unchanged; only the binding kind differs.
+        monkeypatch.setattr(cls, "_av_renoise_var", original.__func__)
+        expected = "_av_renoise_var is missing or not the reviewed staticmethod"
+    elif change == "noncallable":
+        monkeypatch.setattr(cls, "_av_renoise_var", None)
+        expected = "_av_renoise_var is missing or not the reviewed staticmethod"
+    elif change == "removed":
+        monkeypatch.delattr(cls, "linear_noise_init")
+        expected = "linear_noise_init is missing or not the reviewed function"
+    elif change == "kind_flip":
+        monkeypatch.setattr(cls, "get_sde_coeff", staticmethod(vars(cls)["get_sde_coeff"]))
+        expected = "get_sde_coeff is missing or not the reviewed function"
+    else:
+        monkeypatch.setattr(cls, "extra_helper", lambda self: None, raising=False)
+        expected = "extra_helper is an unreviewed callable attribute"
+
+    if change in {"unwrapped_staticmethod", "noncallable"}:
+        # The native AV noise-scaling branch now breaks.
+        with pytest.raises(TypeError):
+            native.scale_av_noise(torch.ones(1, 4), 0.8, 0.6)
+
+    sampler = SimpleNamespace(sampler_function=beta.sample_res_2m)
+    _module, reviewed, reason = sampling_module._res4lyf_reviewed_noise_sampler(sampler)
+    assert reviewed is None
+    assert expected in reason
+
+
+@pytest.mark.parametrize("change", ("unwrapped_staticmethod", "noncallable"))
+def test_descriptor_change_during_the_run_fails_closed(change, monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    denoise = _denoiser(*_manifold())
+    _, baseline = _spectrum_res4lyf(beta, "res_2s", denoise, _config(), monkeypatch)
+    target = baseline["modes"].index("forecast")
+    cls = rk_sampler_beta.RK_NoiseSampler
+    original = vars(cls)["_av_renoise_var"]
+
+    def mutate(index, actual, _bridge):
+        if index == target and not actual:
+            replacement = original.__func__ if change == "unwrapped_staticmethod" else None
+            monkeypatch.setattr(cls, "_av_renoise_var", replacement)
+
+    _, record = _spectrum_res4lyf(
+        beta,
+        "res_2s",
+        denoise,
+        _config(),
+        monkeypatch,
+        inside_call=mutate,
+    )
+
+    assert record["modes"][target] == "actual"
+    assert torch.equal(record["returned"][target], record["exact"][target])
+    assert "forecast" not in record["modes"][target:]
+    assert "methods changed" in (record["bridge"].invalid_reason or "")
+    assert record["runtime"].stats.disabled

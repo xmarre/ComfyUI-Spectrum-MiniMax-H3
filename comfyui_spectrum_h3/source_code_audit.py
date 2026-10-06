@@ -264,3 +264,118 @@ def matches_source_defaults(
         _same_default(live_keyword[name], spec, namespace, immutable_types)
         for name, spec in keyword
     )
+
+
+_DESCRIPTOR_KINDS = {
+    "staticmethod": "staticmethod",
+    "classmethod": "classmethod",
+    "property": "property",
+}
+
+
+@lru_cache(maxsize=32)
+def _reference_class_inventory(
+    path: str,
+    mtime_ns: int,
+    size: int,
+    class_name: str,
+) -> tuple[tuple[str, str], ...] | None:
+    """Return (name, binding kind) for every callable a class body defines."""
+    import ast
+
+    try:
+        data = Path(path).read_bytes()
+        tree = ast.parse(data, filename=path)
+    except (OSError, SyntaxError, ValueError):
+        return None
+    if len(data) != size:
+        return None
+    classes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    ]
+    if len(classes) != 1:
+        return None
+    inventory: dict[str, str] = {}
+    for index, node in enumerate(classes[0].body):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            decorators = node.decorator_list
+            if not decorators:
+                kind = "function"
+            elif (
+                len(decorators) == 1
+                and isinstance(decorators[0], ast.Name)
+                and decorators[0].id in _DESCRIPTOR_KINDS
+            ):
+                kind = _DESCRIPTOR_KINDS[decorators[0].id]
+            else:
+                kind = "unsupported"
+            # A later definition rebinds the name, exactly as at class creation.
+            inventory[node.name] = kind
+        elif isinstance(node, ast.Pass) or (
+            index == 0
+            and isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            continue
+        else:
+            inventory["<class-body statement>"] = "unsupported"
+    return tuple(sorted(inventory.items()))
+
+
+def _live_binding_kind(value: Any) -> str | None:
+    if isinstance(value, staticmethod):
+        return "staticmethod" if isinstance(value.__func__, types.FunctionType) else None
+    if isinstance(value, classmethod):
+        return "classmethod" if isinstance(value.__func__, types.FunctionType) else None
+    if isinstance(value, property):
+        return "property"
+    if isinstance(value, types.FunctionType):
+        return "function"
+    return None
+
+
+def class_callable_inventory_reason(
+    cls: type,
+    source_path: Path,
+    class_name: str,
+) -> str | None:
+    """Compare a live class's callables and binding kinds with its audited source.
+
+    Every callable the class body defines must still be present with the same
+    binding kind (instance function, staticmethod, classmethod or property), and
+    the live class may not carry callables or descriptors the source lacks.
+    """
+    try:
+        resolved = source_path.resolve()
+        stat = resolved.stat()
+    except (OSError, RuntimeError):
+        return f"{class_name} audited source is unavailable"
+    inventory = _reference_class_inventory(
+        str(resolved),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+        class_name,
+    )
+    if inventory is None:
+        return f"{class_name} audited source inventory is unavailable"
+    expected = dict(inventory)
+    unsupported = sorted(name for name, kind in expected.items() if kind == "unsupported")
+    if unsupported:
+        return f"{class_name} audited source declares unreviewable members: {unsupported}"
+    live = vars(cls)
+    for name, kind in inventory:
+        actual = _live_binding_kind(live.get(name))
+        if actual != kind:
+            return (
+                f"{class_name}.{name} is missing or not the reviewed {kind} "
+                f"(found {type(live.get(name)).__name__})"
+            )
+    for name, value in live.items():
+        if name in expected:
+            continue
+        if callable(value) or isinstance(value, (staticmethod, classmethod, property)):
+            return f"{class_name}.{name} is an unreviewed callable attribute"
+    return None

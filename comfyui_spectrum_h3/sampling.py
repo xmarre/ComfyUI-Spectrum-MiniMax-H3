@@ -3801,9 +3801,11 @@ def _res4lyf_live_noise_sampler_reason(cls: Any, module: Any) -> str | None:
     """Prove that every live RK_NoiseSampler method is the audited source code.
 
     The Git-blob audit covers the file on disk, not callables replaced after
-    import. Compile the audited file and require each live function on the class
-    to match its lexical counterpart and its written defaults, execute in the
-    audited module's globals, and carry no closure other than the class cell.
+    import. Parse and compile the audited file and require the live class to
+    carry exactly the source's callables with the same binding kinds, and each
+    live function to match its lexical counterpart and its written defaults,
+    execute in the audited module's globals, and carry no closure other than
+    the class cell.
     """
     path = getattr(module, "__file__", None)
     if (
@@ -3816,6 +3818,13 @@ def _res4lyf_live_noise_sampler_reason(cls: Any, module: Any) -> str | None:
     if cls.__bases__ != (object,):
         return "RES4LYF RK_NoiseSampler base classes are not the reviewed native bases"
     source_path = Path(path)
+    inventory_reason = source_code_audit.class_callable_inventory_reason(
+        cls,
+        source_path,
+        "RK_NoiseSampler",
+    )
+    if inventory_reason is not None:
+        return f"RES4LYF {inventory_reason}"
     module_globals = vars(module)
     for name, value in vars(cls).items():
         if isinstance(value, (staticmethod, classmethod)):
