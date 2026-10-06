@@ -142,6 +142,7 @@ RES4LYF_AUDITED_GIT_BLOBS = {
     "wrappers": frozenset({"193656836254064a37af2aeb8df26f74119561ec"}),
     "sampler": frozenset({"c095ba487ff9f90f7efc1b4656687e832135d56f"}),
     "coefficients": frozenset({"1c1ce60f687ab4b0611bffdad2b405086c0eb71d"}),
+    "phi": frozenset({"8016425febf6d0c300658e678991d52e25918bb0"}),
     "method": frozenset({"37651bc075a0aef7022cfb5be02a9a2a40ad0d8e"}),
     "noise_sampler": frozenset({"e86fea7b37794df6d537b9d199d6a39743a12afb"}),
     "guide": frozenset({"048b8f3ca3775f8379c040a28bda222b9e74e8fb"}),
@@ -1221,6 +1222,14 @@ def _res4lyf_sampler_contract(sampler: Any) -> tuple[bool, str | None]:
         not in RES4LYF_AUDITED_GIT_BLOBS["coefficients"]
     ):
         return False, "RES4LYF beta RK coefficient source is not a reviewed revision"
+    # Both the tableau builder and the RK method evaluate RES phi functions
+    # through the same Phi implementation; it is part of the numerical contract.
+    phi_class = getattr(coefficient_module, "Phi", None)
+    if phi_class is None or getattr(rk_method_module, "Phi", None) is not phi_class:
+        return False, "RES4LYF Phi implementation provenance is unavailable"
+    phi_module = inspect.getmodule(phi_class)
+    if phi_module is None or _module_blob_sha(phi_module) not in RES4LYF_AUDITED_GIT_BLOBS["phi"]:
+        return False, "RES4LYF beta phi-function source is not a reviewed revision"
 
     if type(sampler) is not comfy.samplers.KSAMPLER:
         return False, "RES4LYF sampler object is not native ComfyUI KSAMPLER"

@@ -14,6 +14,7 @@ RES4LYF_REVIEWED_SOURCES = {
     "wrappers": "beta/__init__.py",
     "sampler": "beta/rk_sampler_beta.py",
     "coefficients": "beta/rk_coefficients_beta.py",
+    "phi": "beta/phi_functions.py",
     "method": "beta/rk_method_beta.py",
     "noise_sampler": "beta/rk_noise_sampler_beta.py",
     "guide": "beta/rk_guide_func_beta.py",
@@ -57,5 +58,6 @@ def test_reviewed_fixture_exercises_committed_crlf_sources():
         "beta/rk_coefficients_beta.py",
         "beta/rk_method_beta.py",
         "beta/rk_noise_sampler_beta.py",
+        "beta/phi_functions.py",
     ):
         assert b"\r\n" in (root / relative_path).read_bytes()

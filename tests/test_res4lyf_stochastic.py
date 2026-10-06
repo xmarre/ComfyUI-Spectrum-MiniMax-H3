@@ -924,3 +924,28 @@ def test_dense_output_failure_retries_the_same_step_as_exact():
     assert runtime.stats.forecast_fallbacks == 1
     assert bridge.anchor_steps == (2,)
     runtime.end_run(run_id)
+
+
+@pytest.mark.parametrize("name", ("res_2m", "res_3s_ode"))
+def test_reviewed_res4lyf_contract_accepts_pinned_source_and_audits_phi(name, monkeypatch):
+    beta, _rk_sampler_beta = _res4lyf_runtime_fixture()
+    import comfy.samplers
+
+    from comfyui_spectrum_h3 import sampling as sampling_module
+
+    sampler = comfy.samplers.KSAMPLER(getattr(beta, f"sample_{name}"))
+
+    assert sampling_module._res4lyf_sampler_contract(sampler) == (True, None)
+
+    original_blob = sampling_module._module_blob_sha
+
+    def changed_phi(module):
+        if module.__name__.endswith(".beta.phi_functions"):
+            return "0" * 40
+        return original_blob(module)
+
+    monkeypatch.setattr(sampling_module, "_module_blob_sha", changed_phi)
+    supported, reason = sampling_module._res4lyf_sampler_contract(sampler)
+
+    assert not supported
+    assert "phi-function source" in reason
