@@ -52,7 +52,19 @@ def _swap(
     bridge.exit_swap(kind, landing=landing, result=result, target_sigma=torch.tensor(sigma))
 
 
+def _noop_swap(bridge: RES4LYFStochasticBridge) -> None:
+    """A verified no-op swap, as RES4LYF runs between consecutive model calls."""
+    landing = torch.zeros(1, 2)
+    _swap(bridge, "substep", landing, landing, 0.5, draws=0)
+
+
+def _between_calls(bridge: RES4LYFStochasticBridge) -> None:
+    if bridge._associated_step_id is not None:
+        _noop_swap(bridge)
+
+
 def _actual(bridge, value, sigma, step_id, x=None, run_id=1):
+    _between_calls(bridge)
     bridge.associate(
         torch.zeros_like(value) if x is None else x,
         torch.tensor([sigma]),
@@ -67,6 +79,7 @@ def _actual(bridge, value, sigma, step_id, x=None, run_id=1):
 
 
 def _forecast(bridge, raw, sigma, step_id, x=None, run_id=1):
+    _between_calls(bridge)
     bridge.associate(
         torch.zeros_like(raw) if x is None else x,
         torch.tensor([sigma]),
@@ -89,8 +102,9 @@ def test_noised_state_is_associated_once_with_the_exact_following_call():
     _swap(bridge, "step", landing, noised, 0.6)
     assert bridge.has_pending
 
+    x = noised.to(torch.float32)
     kind = bridge.associate(
-        noised.to(torch.float32),
+        x,
         torch.tensor([0.6, 0.6], dtype=torch.float32),
         run_id=1,
         step_id=4,
@@ -99,12 +113,45 @@ def test_noised_state_is_associated_once_with_the_exact_following_call():
     assert kind == "stochastic_step"
     assert not bridge.has_pending
     assert bridge.transitions_recorded == bridge.transitions_consumed == 1
-    # A retry of the same logical step reuses the association.
-    assert bridge.associate(torch.zeros(1), torch.tensor([0.6]), run_id=1, step_id=4) == kind
-    # The next call has no pending transition and therefore a deterministic input.
+    # A retry of the same call (same input object and sigma, no new swap)
+    # reuses the validated association.
+    assert bridge.associate(x, torch.tensor([0.6]), run_id=1, step_id=4) == kind
+    # After a verified no-op swap the next call has a deterministic input.
+    _noop_swap(bridge)
     assert bridge.associate(torch.zeros(1, 2), torch.tensor([0.5]), run_id=1, step_id=5) == (
         "deterministic"
     )
+
+
+def test_missing_swap_between_calls_is_not_deterministic():
+    bridge = _bridge()
+    assert bridge.associate(torch.zeros(1, 2), torch.tensor([0.9]), run_id=1, step_id=0) == (
+        "deterministic"
+    )
+
+    with pytest.raises(RES4LYFStochasticError, match="no RES4LYF noise swap"):
+        bridge.associate(torch.zeros(1, 2), torch.tensor([0.8]), run_id=1, step_id=1)
+    assert bridge.invalid_reason is not None
+
+
+@pytest.mark.parametrize("change", ("input", "sigma", "new_swap", "new_transition"))
+def test_reassociation_is_limited_to_an_unchanged_retry(change):
+    bridge = _bridge()
+    x = torch.zeros(1, 2)
+    bridge.associate(x, torch.tensor([0.9]), run_id=1, step_id=0)
+    sigma = 0.9
+    if change == "input":
+        x = x.clone()
+    elif change == "sigma":
+        sigma = 0.8
+    elif change == "new_swap":
+        _noop_swap(bridge)
+    else:
+        _swap(bridge, "substep", torch.zeros(1, 2), torch.ones(1, 2), 0.9)
+
+    with pytest.raises(RES4LYFStochasticError, match="associated again"):
+        bridge.associate(x, torch.tensor([sigma]), run_id=1, step_id=0)
+    assert bridge.invalid_reason is not None
 
 
 def test_in_place_edit_of_the_swap_result_is_detected():
@@ -562,6 +609,8 @@ def _spectrum_res4lyf(
     leaky_forecast=True,
     perturb_call=None,
     denoise_mask=None,
+    before_call=None,
+    inside_call=None,
 ):
     from comfyui_spectrum_h3 import sampling as sampling_module
     from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
@@ -577,7 +626,14 @@ def _spectrum_res4lyf(
 
     runtime = SpectrumH3Runtime(config)
     model_sampling = _flow_model_sampling()
-    record = {"modes": [], "kinds": [], "returned": {}, "raw": {}, "last_v": None}
+    record = {
+        "modes": [],
+        "kinds": [],
+        "returned": {},
+        "raw": {},
+        "exact": {},
+        "last_v": None,
+    }
 
     def fake_h3(x, timestep, model_options, _seed):
         options = model_options["transformer_options"]
@@ -591,6 +647,13 @@ def _spectrum_res4lyf(
         )
         sigma = timestep.reshape(-1)[0]
         exact = denoise(x, timestep)
+        record["exact"][len(record["modes"])] = exact
+        if inside_call is not None:
+            inside_call(
+                len(record["modes"]),
+                actual,
+                options[RES4LYF_STOCHASTIC_BRIDGE_KEY],
+            )
         if actual:
             runtime.observe_actual(
                 run_id,
@@ -620,6 +683,8 @@ def _spectrum_res4lyf(
             return fake_h3(x, timestep, model_options, seed)
 
     def guided_call(x, sigma, model_options, seed):
+        if before_call is not None:
+            before_call(len(record["modes"]))
         if perturb_call is not None and len(record["modes"]) == perturb_call:
             # Stand-in for an unreviewed outer PREDICT_NOISE wrapper that edits x.
             x = x + 1e-3
@@ -914,6 +979,7 @@ def test_dense_output_failure_retries_the_same_step_as_exact():
         predict_noise_wrapper(Executor(), torch.zeros(1, 2), torch.tensor([sigma]), options, 0)
         # Drop the warm-up anchors so the forecast has no exact anchor to use.
         bridge._anchors.clear()
+        _noop_swap(bridge)
     attempts.clear()
 
     result = predict_noise_wrapper(Executor(), torch.zeros(1, 2), torch.tensor([0.6]), options, 0)
@@ -949,3 +1015,164 @@ def test_reviewed_res4lyf_contract_accepts_pinned_source_and_audits_phi(name, mo
 
     assert not supported
     assert "phi-function source" in reason
+
+
+def test_tracking_failure_after_association_retries_the_forecast_exactly(monkeypatch):
+    beta, _rk_sampler_beta = _res4lyf_runtime_fixture()
+    denoise = _denoiser(*_manifold())
+    _, baseline = _spectrum_res4lyf(beta, "res_2m", denoise, _config(), monkeypatch)
+    target = baseline["modes"].index("forecast")
+    planned = []
+
+    def invalidate_inside_forecast(index, actual, bridge):
+        if index == target and not actual:
+            planned.append(index)
+            # Tracking fails after this call was associated as a forecast.
+            bridge.invalidate("probe: tracking failed after association")
+
+    _, record = _spectrum_res4lyf(
+        beta,
+        "res_2m",
+        denoise,
+        _config(),
+        monkeypatch,
+        inside_call=invalidate_inside_forecast,
+    )
+
+    assert planned == [target]
+    # The same call was retried exactly before RES4LYF received a result.
+    assert record["modes"][target] == "actual"
+    assert torch.equal(record["returned"][target], record["exact"][target])
+    assert "forecast" not in record["modes"][target:]
+    assert record["runtime"].stats.disabled
+    assert record["runtime"].stats.forecast_fallbacks == 1
+
+
+@pytest.mark.parametrize(
+    ("placement", "expected"),
+    (
+        ("foreign_module", "does not execute in its audited module"),
+        ("audited_globals", "is not the reviewed native implementation"),
+    ),
+)
+def test_replaced_noise_sampler_method_keeps_the_run_all_actual(
+    placement,
+    expected,
+    monkeypatch,
+):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    import inspect
+
+    import comfy.samplers
+
+    from comfyui_spectrum_h3 import sampling as sampling_module
+
+    native_class = rk_sampler_beta.RK_NoiseSampler
+    native_swap = native_class.swap_noise_step
+
+    def shifted_swap(self, *args, **kwargs):
+        return native_swap(self, *args, **kwargs) + 0.01
+
+    if placement == "audited_globals":
+        # Same globals as the audited module and no closure; only the code differs.
+        namespace: dict[str, object] = {}
+        exec(  # noqa: S102 - builds a deliberately altered test method
+            "def swap_noise_step(self, x_0, x_next, brownian_sigma=None,\n"
+            "                    brownian_sigma_next=None, mask=None):\n"
+            "    return x_next + 0.01\n",
+            namespace,
+        )
+        shifted_swap = types.FunctionType(
+            namespace["swap_noise_step"].__code__,
+            vars(inspect.getmodule(native_class)),
+            "swap_noise_step",
+            namespace["swap_noise_step"].__defaults__,
+        )
+    monkeypatch.setattr(native_class, "swap_noise_step", shifted_swap)
+    sampler = comfy.samplers.KSAMPLER(beta.sample_res_2m)
+
+    supported, reason = sampling_module._res4lyf_sampler_contract(sampler)
+    assert not supported
+    assert f"RK_NoiseSampler.swap_noise_step {expected}" in reason
+
+    denoise = _denoiser(*_manifold())
+    _, record = _spectrum_res4lyf(beta, "res_2m", denoise, _config(), monkeypatch)
+
+    assert set(record["modes"]) == {"actual"}
+    assert record.get("bridge") is None
+    assert "swap_noise_step" in (record["runtime"].stats.disable_reason or "")
+    assert rk_sampler_beta.RK_NoiseSampler is native_class
+
+
+def test_method_replaced_during_the_run_fails_closed(monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    denoise = _denoiser(*_manifold())
+    _, baseline = _spectrum_res4lyf(beta, "res_2s", denoise, _config(), monkeypatch)
+    replace_at = baseline["modes"].index("forecast")
+    native_class = rk_sampler_beta.RK_NoiseSampler
+    native_substep = native_class.swap_noise_substep
+
+    def replacement(self, *args, **kwargs):
+        return native_substep(self, *args, **kwargs)
+
+    def replace(index):
+        if index == replace_at:
+            monkeypatch.setattr(native_class, "swap_noise_substep", replacement)
+
+    _, record = _spectrum_res4lyf(
+        beta,
+        "res_2s",
+        denoise,
+        _config(),
+        monkeypatch,
+        before_call=replace,
+    )
+
+    assert "forecast" not in record["modes"][replace_at:]
+    assert "methods changed" in (record["bridge"].invalid_reason or "")
+    assert record["runtime"].stats.disabled
+
+
+def test_foreign_replacement_during_the_run_is_preserved(monkeypatch):
+    beta, rk_sampler_beta = _res4lyf_runtime_fixture()
+    native_class = rk_sampler_beta.RK_NoiseSampler
+    monkeypatch.setattr(rk_sampler_beta, "RK_NoiseSampler", native_class)
+    foreign = type("ForeignNoiseSampler", (native_class,), {})
+    overlap = []
+
+    def interfere(index):
+        if index == 3:
+            other = RES4LYFStochasticBridge(
+                run_id=99,
+                coordinate_fn=_coordinate,
+                debug=False,
+            )
+            with (
+                pytest.raises(RES4LYFStochasticError, match="already replaced"),
+                tracked_res4lyf_noise_sampler(
+                    rk_sampler_beta,
+                    native_class,
+                    other,
+                    object(),
+                ),
+            ):
+                pass
+            overlap.append(rk_sampler_beta.RK_NoiseSampler)
+            rk_sampler_beta.RK_NoiseSampler = foreign
+
+    denoise = _denoiser(*_manifold())
+    _spectrum_res4lyf(
+        beta,
+        "res_2m",
+        denoise,
+        _config(),
+        monkeypatch,
+        before_call=interfere,
+    )
+
+    # The overlapping install was refused while Spectrum's class was installed,
+    # and cleanup did not erase the replacement made by the other component.
+    assert len(overlap) == 1
+    assert overlap[0] is not native_class
+    assert issubclass(overlap[0], native_class)
+    assert rk_sampler_beta.RK_NoiseSampler is foreign

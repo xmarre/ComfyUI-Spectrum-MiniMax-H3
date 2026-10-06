@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -139,6 +140,14 @@ class RES4LYFStochasticBridge:
         self._pending: _Transition | None = None
         self._associated_step_id: int | None = None
         self._associated_kind: str | None = None
+        self._associated_input: Any = None
+        self._associated_sigma: float | None = None
+        # Noise swaps observed since the last associated model call. Every SDE
+        # model call after the first must be preceded by at least one swap.
+        self._swaps_since_call = 0
+        self._integrity_check: Callable[[], str | None] | None = None
+        self._closed = False
+        self._fail_closed_applied = False
         self._anchors: list[_Anchor] = []
         self.transitions_recorded = 0
         self.transitions_consumed = 0
@@ -170,6 +179,8 @@ class RES4LYFStochasticBridge:
 
     def bind_noise_sampler(self, noise_sampler: Any) -> bool:
         """Bind the single RES4LYF noise sampler created for this sampler call."""
+        if self._closed:
+            return False
         if self._bound_noise_sampler is not None:
             if self._bound_noise_sampler is not noise_sampler:
                 self.invalidate(
@@ -180,7 +191,26 @@ class RES4LYFStochasticBridge:
         return True
 
     def owns(self, noise_sampler: Any) -> bool:
-        return self._bound_noise_sampler is noise_sampler
+        return not self._closed and self._bound_noise_sampler is noise_sampler
+
+    def set_integrity_check(self, check: Callable[[], str | None] | None) -> None:
+        """Install a callable that reports a changed native contract, or None."""
+        self._integrity_check = check
+
+    def check_integrity(self) -> None:
+        check = self._integrity_check
+        if check is None or self._invalid_reason is not None:
+            return
+        reason = check()
+        if reason is not None:
+            self.invalidate(reason)
+
+    def mark_fail_closed(self) -> bool:
+        """Return True exactly once, when the run first fails closed."""
+        if self._fail_closed_applied:
+            return False
+        self._fail_closed_applied = True
+        return True
 
     def wrap_noise_generators(self, noise_sampler: Any) -> None:
         for attribute, channel in (("noise_sampler", "step"), ("noise_sampler2", "substep")):
@@ -235,6 +265,7 @@ class RES4LYFStochasticBridge:
         draws = self._active_draws
         self._active_swap = None
         self._active_draws = 0
+        self._swaps_since_call += 1
         if active != kind:
             self.invalidate("RES4LYF noise swap bookkeeping was reordered")
             return
@@ -304,10 +335,9 @@ class RES4LYFStochasticBridge:
                 f"stale RES4LYF stochastic bridge belongs to run {self.run_id}, "
                 f"current run is {run_id}"
             )
+        self.check_integrity()
         if self._invalid_reason is not None:
             raise RES4LYFStochasticError(self._invalid_reason)
-        if self._associated_step_id == int(step_id) and self._associated_kind is not None:
-            return self._associated_kind
         if self._bound_noise_sampler is None:
             self.invalidate("RES4LYF noise sampler was not created through the tracked bridge")
             raise RES4LYFStochasticError(self._invalid_reason or "unbound bridge")
@@ -320,10 +350,39 @@ class RES4LYFStochasticBridge:
             self.invalidate(str(exc))
             raise
 
+        if self._associated_step_id == int(step_id):
+            # Only a retry of the same validated call may reuse its association:
+            # the identical input object at the same sigma, with no noise swap or
+            # pending transition since it was validated.
+            if (
+                self._associated_kind is None
+                or x is not self._associated_input
+                or sigma != self._associated_sigma
+                or self._swaps_since_call
+                or self._pending is not None
+            ):
+                self.invalidate(
+                    f"H3 model call step {step_id} was associated again with a "
+                    "different input, sigma or RES4LYF noise transition"
+                )
+                raise RES4LYFStochasticError(self._invalid_reason or "re-association")
+            return self._associated_kind
+
+        if self._associated_step_id is not None and not self._swaps_since_call:
+            # RES4LYF runs at least one (possibly no-op) noise swap between
+            # consecutive SDE model calls. Without one, this call's stochastic
+            # state is unverified rather than deterministic.
+            self.invalidate(
+                "no RES4LYF noise swap was observed between consecutive H3 calls"
+            )
+            raise RES4LYFStochasticError(self._invalid_reason or "missing swap")
+
         pending = self._pending
         # Transfer ownership before validation so no exit leaves a stale state.
         self._pending = None
         if pending is None:
+            # Either the run's first call, or every swap since the previous call
+            # was a verified no-op.
             kind = "deterministic"
         else:
             noised = pending.noised
@@ -363,6 +422,9 @@ class RES4LYFStochasticBridge:
                 )
         self._associated_step_id = int(step_id)
         self._associated_kind = kind
+        self._associated_input = x
+        self._associated_sigma = sigma
+        self._swaps_since_call = 0
         return kind
 
     # ------------------------------------------------------------------
@@ -382,6 +444,13 @@ class RES4LYFStochasticBridge:
             )
         if not torch.is_tensor(result):
             raise RES4LYFStochasticError("RES4LYF model result is not a tensor")
+        self.check_integrity()
+        if self._invalid_reason is not None:
+            # Tracking failed after association (or during the model call): a
+            # forecast for this call must not reach RES4LYF's solver state.
+            if descriptor.mode == "forecast":
+                raise RES4LYFStochasticError(self._invalid_reason)
+            return result
         if self._associated_step_id != descriptor.step_id:
             raise RES4LYFStochasticError(
                 "RES4LYF model result arrived without its stochastic-state association"
@@ -521,6 +590,11 @@ class RES4LYFStochasticBridge:
         )
 
     def clear(self) -> None:
+        self._closed = True
+        self._integrity_check = None
+        self._associated_input = None
+        self._associated_sigma = None
+        self._swaps_since_call = 0
         self._pending = None
         self._active_swap = None
         self._active_draws = 0
@@ -594,6 +668,17 @@ def tracked_noise_sampler_class(
     return SpectrumTrackedRKNoiseSampler
 
 
+_INSTALL_LOCK = threading.Lock()
+
+
+def _class_callables(cls: type) -> dict[str, Any]:
+    return {
+        name: value
+        for name, value in vars(cls).items()
+        if callable(value) or isinstance(value, (staticmethod, classmethod, property))
+    }
+
+
 @contextlib.contextmanager
 def tracked_res4lyf_noise_sampler(
     rk_sampler_module: Any,
@@ -601,23 +686,44 @@ def tracked_res4lyf_noise_sampler(
     bridge: RES4LYFStochasticBridge,
     owner_guider: Any,
 ) -> Iterator[type]:
-    """Install the tracked noise sampler for exactly one RES4LYF sampler call."""
-    if getattr(rk_sampler_module, "RK_NoiseSampler", None) is not original_class:
-        raise RES4LYFStochasticError(
-            "RES4LYF RK_NoiseSampler is already replaced; nested or foreign "
-            "patching is outside the reviewed contract"
-        )
-    tracked = tracked_noise_sampler_class(original_class, bridge, owner_guider)
-    rk_sampler_module.RK_NoiseSampler = tracked
+    """Install the tracked noise sampler for exactly one RES4LYF sampler call.
+
+    Installation and restoration are serialized. Spectrum restores the audited
+    class only while its own tracked class is still installed, so a replacement
+    made by another component during the run is left in place. Any change to
+    the audited class's methods during the run makes later forecasts fail
+    closed through the bridge's integrity check.
+    """
+    with _INSTALL_LOCK:
+        if getattr(rk_sampler_module, "RK_NoiseSampler", None) is not original_class:
+            raise RES4LYFStochasticError(
+                "RES4LYF RK_NoiseSampler is already replaced; nested, overlapping or "
+                "foreign patching is outside the reviewed contract"
+            )
+        tracked = tracked_noise_sampler_class(original_class, bridge, owner_guider)
+        rk_sampler_module.RK_NoiseSampler = tracked
+    snapshot = _class_callables(original_class)
+
+    def integrity() -> str | None:
+        if _class_callables(original_class) != snapshot:
+            return "RES4LYF RK_NoiseSampler methods changed during the tracked run"
+        return None
+
+    bridge.set_integrity_check(integrity)
     try:
         yield tracked
     finally:
-        current = getattr(rk_sampler_module, "RK_NoiseSampler", None)
-        rk_sampler_module.RK_NoiseSampler = original_class
-        if current is not tracked:
+        bridge.set_integrity_check(None)
+        with _INSTALL_LOCK:
+            current = getattr(rk_sampler_module, "RK_NoiseSampler", None)
+            owned = current is tracked
+            if owned:
+                rk_sampler_module.RK_NoiseSampler = original_class
+        if not owned:
             LOG.warning(
-                "Spectrum H3 restored RES4LYF RK_NoiseSampler after it was replaced "
-                "during a tracked run"
+                "Spectrum H3 left RES4LYF RK_NoiseSampler as replaced by another "
+                "component during a tracked run; the tracked class is inert once "
+                "the run ends"
             )
 
 

@@ -7,10 +7,12 @@ import math
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 
+from . import source_code_audit
 from .core_bsa_compat import _module_blob_sha
 from .er_sde_ksampler_contract import (
     KSamplerSampleContract,
@@ -1188,6 +1190,12 @@ def _res4lyf_sampler_contract(sampler: Any) -> tuple[bool, str | None]:
         not in RES4LYF_AUDITED_GIT_BLOBS["noise_sampler"]
     ):
         return False, "RES4LYF beta noise/sigma preprocessing source is not reviewed"
+    live_reason = _res4lyf_live_noise_sampler_reason(
+        noise_sampler_class,
+        noise_sampler_module,
+    )
+    if live_reason is not None:
+        return False, live_reason
 
     latent_guide_class = getattr(rk_sampler_module, "LatentGuide", None)
     latent_guide_module = inspect.getmodule(latent_guide_class)
@@ -3279,6 +3287,33 @@ def outer_sample_wrapper(
         runtime.release_offline_archive()
 
 
+def _res4lyf_fail_closed(
+    runtime: SpectrumH3Runtime,
+    bridge: RES4LYFStochasticBridge,
+    run_id: int,
+    step_id: int,
+    *,
+    force_step_fallback: bool,
+) -> str:
+    """Disable forecasting for the rest of a run whose RES4LYF tracking failed.
+
+    ``fallback_current_step`` turns a not-yet-evaluated step into an exact call
+    and raises ``ForecastRetryActual`` when the step already used a forecast.
+    """
+    reason = f"RES4LYF stochastic-state contract failed: {bridge.invalid_reason}"
+    first = bridge.mark_fail_closed()
+    if first:
+        LOG.warning(
+            "Spectrum H3 RES4LYF stochastic bridge disabled forecasting for this run "
+            "step=%s reason=%s",
+            step_id,
+            bridge.invalid_reason,
+        )
+    if first or force_step_fallback:
+        runtime.fallback_current_step(run_id, step_id, reason)
+    return reason
+
+
 def res4lyf_associate_model_call(
     runtime: SpectrumH3Runtime,
     model_options: dict[str, Any] | None,
@@ -3292,29 +3327,28 @@ def res4lyf_associate_model_call(
         return decision
     run_id = int(decision["run_id"])
     step_id = int(decision["step_id"])
-    already_invalid = bridge.invalid_reason is not None
-    if already_invalid and bool(decision["actual"]):
-        # The run already failed closed; exact calls need no association.
+    if bridge.invalid_reason is None:
+        try:
+            bridge.associate(x, timestep, run_id=run_id, step_id=step_id)
+            return decision
+        except RES4LYFStochasticError as exc:
+            bridge.invalidate(str(exc))
+    actual = bool(decision["actual"])
+    # No H3 evaluation has happened yet for this step, so a planned forecast is
+    # converted to an exact call before execution.
+    reason = _res4lyf_fail_closed(
+        runtime,
+        bridge,
+        run_id,
+        step_id,
+        force_step_fallback=not actual,
+    )
+    if actual:
         return decision
-    try:
-        bridge.associate(x, timestep, run_id=run_id, step_id=step_id)
-        return decision
-    except RES4LYFStochasticError as exc:
-        reason = f"RES4LYF stochastic-state contract failed: {exc}"
-        # No H3 evaluation has happened yet for this step. Converting it to an
-        # exact call and disabling later forecasts keeps the native trajectory.
-        runtime.fallback_current_step(run_id, step_id, reason)
-        if not already_invalid:
-            LOG.warning(
-                "Spectrum H3 RES4LYF stochastic bridge forced exact H3 evaluation "
-                "and disabled forecasting for this run step=%s reason=%s",
-                step_id,
-                exc,
-            )
-        fallback_decision = dict(decision)
-        fallback_decision["actual"] = True
-        fallback_decision["reason"] = reason
-        return fallback_decision
+    fallback_decision = dict(decision)
+    fallback_decision["actual"] = True
+    fallback_decision["reason"] = reason
+    return fallback_decision
 
 
 def res4lyf_consume_model_result(
@@ -3337,24 +3371,31 @@ def res4lyf_consume_model_result(
         step_id=step_id,
         mode=runtime.current_step_mode(run_id, step_id),
     )
-    if bridge.invalid_reason is not None and descriptor.mode != "forecast":
-        # Forecasting already failed closed; exact results need no anchoring.
-        return result
-    try:
-        return bridge.consume(result, timestep, descriptor)
-    except RES4LYFStochasticError as exc:
-        if descriptor.mode == "forecast":
-            raise ForecastRetryActual(
-                f"RES4LYF solver-space dense output failed: {exc}"
-            ) from exc
-        bridge.invalidate(str(exc))
-        LOG.warning(
-            "Spectrum H3 RES4LYF dense-output anchor rejected on exact step=%s "
-            "reason=%s; later forecasts in this run fail closed",
-            step_id,
-            exc,
-        )
-        return result
+    bridge.check_integrity()
+    if bridge.invalid_reason is None:
+        try:
+            return bridge.consume(result, timestep, descriptor)
+        except RES4LYFStochasticError as exc:
+            if descriptor.mode == "forecast" and bridge.invalid_reason is None:
+                # Tracking is intact; only this dense output is unavailable.
+                raise ForecastRetryActual(
+                    f"RES4LYF solver-space dense output failed: {exc}"
+                ) from exc
+            bridge.invalidate(str(exc))
+    # Tracking failed after association or during the model call. A forecast
+    # must not reach RES4LYF: retry this same call exactly. An exact result is
+    # kept; either way later forecasts are disabled.
+    forecast = descriptor.mode == "forecast"
+    reason = _res4lyf_fail_closed(
+        runtime,
+        bridge,
+        run_id,
+        step_id,
+        force_step_fallback=forecast,
+    )
+    if forecast:
+        raise ForecastRetryActual(reason)
+    return result
 
 
 def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
@@ -3747,6 +3788,68 @@ def _res4lyf_stochastic_bridge(
     return bridge if isinstance(bridge, RES4LYFStochasticBridge) else None
 
 
+RES4LYF_NOISE_SAMPLER_REQUIRED_METHODS = (
+    "__init__",
+    "init_noise_samplers",
+    "swap_noise_step",
+    "swap_noise_substep",
+)
+
+
+def _res4lyf_live_noise_sampler_reason(cls: Any, module: Any) -> str | None:
+    """Prove that every live RK_NoiseSampler method is the audited source code.
+
+    The Git-blob audit covers the file on disk, not callables replaced after
+    import. Compile the audited file and require each live function on the class
+    to match its lexical counterpart, execute in the audited module's globals,
+    and carry no closure other than the class cell.
+    """
+    path = getattr(module, "__file__", None)
+    if (
+        not inspect.isclass(cls)
+        or module is None
+        or not path
+        or getattr(module, "RK_NoiseSampler", None) is not cls
+    ):
+        return "RES4LYF RK_NoiseSampler is not defined by its audited module"
+    if cls.__bases__ != (object,):
+        return "RES4LYF RK_NoiseSampler base classes are not the reviewed native bases"
+    source_path = Path(path)
+    module_globals = vars(module)
+    for name, value in vars(cls).items():
+        if isinstance(value, (staticmethod, classmethod)):
+            function = value.__func__
+        elif inspect.isfunction(value):
+            function = value
+        elif callable(value) or isinstance(value, property):
+            return f"RES4LYF RK_NoiseSampler.{name} is an unreviewed callable attribute"
+        else:
+            continue
+        if not inspect.isfunction(function) or function.__globals__ is not module_globals:
+            return (
+                f"RES4LYF RK_NoiseSampler.{name} does not execute in its audited module"
+            )
+        for freevar, cell in zip(
+            function.__code__.co_freevars,
+            function.__closure__ or (),
+            strict=True,
+        ):
+            if freevar != "__class__" or cell.cell_contents is not cls:
+                return f"RES4LYF RK_NoiseSampler.{name} carries an unreviewed closure"
+        if not source_code_audit.matches_nested_source_code(
+            function,
+            source_path,
+            ("RK_NoiseSampler", name),
+        ):
+            return (
+                f"RES4LYF RK_NoiseSampler.{name} is not the reviewed native implementation"
+            )
+    for name in RES4LYF_NOISE_SAMPLER_REQUIRED_METHODS:
+        if not inspect.isfunction(vars(cls).get(name)):
+            return f"RES4LYF RK_NoiseSampler.{name} is missing"
+    return None
+
+
 def _res4lyf_reviewed_noise_sampler(sampler: Any) -> tuple[Any, type | None, str | None]:
     """Return RES4LYF's beta sampler module and its audited noise-sampler class."""
     function = getattr(sampler, "sampler_function", None)
@@ -3763,13 +3866,12 @@ def _res4lyf_reviewed_noise_sampler(sampler: Any) -> tuple[Any, type | None, str
         not in RES4LYF_AUDITED_GIT_BLOBS["noise_sampler"]
     ):
         return rk_sampler_module, None, "RES4LYF RK_NoiseSampler source is not reviewed"
-    for method in ("init_noise_samplers", "swap_noise_step", "swap_noise_substep"):
-        if not inspect.isfunction(noise_sampler_class.__dict__.get(method)):
-            return (
-                rk_sampler_module,
-                None,
-                f"RES4LYF RK_NoiseSampler.{method} is not the reviewed native method",
-            )
+    live_reason = _res4lyf_live_noise_sampler_reason(
+        noise_sampler_class,
+        noise_sampler_module,
+    )
+    if live_reason is not None:
+        return rk_sampler_module, None, live_reason
     return rk_sampler_module, noise_sampler_class, None
 
 
