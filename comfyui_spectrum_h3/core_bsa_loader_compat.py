@@ -41,7 +41,7 @@ def _comfy_extras_dir() -> Path | None:
     the BSA file under a second name.
     """
     try:
-        import comfy.model_management as model_management
+        from comfy import model_management
 
         source = getattr(model_management, "__file__", None)
         if not isinstance(source, str):
@@ -264,6 +264,9 @@ def _runtime_alias_probe(
             expected_receipts=expected_receipts,
             source_blob=source_blob,
             current_override=options.get("optimized_attention_override"),
+            cold_successor_compatible=core_bsa_compat._cold_successor_compatible(
+                options, model, patch
+            ),
         ), None
     except torch.cuda.OutOfMemoryError:
         raise

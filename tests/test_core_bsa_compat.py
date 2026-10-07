@@ -164,15 +164,54 @@ def test_explicit_provider_contract_keeps_precedence(monkeypatch):
     assert safe
 
 
-def test_core_bsa_source_digest_does_not_gate_runtime(monkeypatch):
+@pytest.mark.parametrize("digest", ["unreviewed", None])
+def test_core_bsa_source_digest_does_not_gate_runtime(monkeypatch, digest):
     _nodes, model, _patch, options = _installation()
-    monkeypatch.setattr(core_bsa_compat, "_module_blob_sha", lambda _module: "unreviewed")
+    monkeypatch.setattr(core_bsa_compat, "_module_blob_sha", lambda _module: digest)
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
     assert reason is None and audit is not None and audit.safe
-    assert audit.source_blob == "unreviewed"
+    assert audit.source_blob == (digest or "runtime")
+    assert audit.cold_successor_compatible
     identity, safe = preflight(options, _layout(), model)
     assert identity[0] == core_bsa_compat.ADAPTER_KEY
     assert safe
+
+
+def test_changed_calibration_recipe_still_admits_bsa_without_cold_carry(monkeypatch):
+    nodes, model, _patch, options = _installation()
+    first, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and first is not None and first.cold_successor_compatible
+
+    original = nodes.h3_sparse_attention
+    # Same function owner and source digest, changed numerical implementation.
+    code = original.__code__.replace(co_consts=(*original.__code__.co_consts, "changed"))
+    monkeypatch.setattr(original, "__code__", code)
+    second, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and second is not None and second.safe
+    assert not second.cold_successor_compatible
+    assert first.identity != second.identity
+
+
+def test_replacement_code_change_invalidates_history_without_source_gate(monkeypatch):
+    _nodes, model, _patch, options = _installation()
+    first, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and first is not None
+    replacement = options["patches_replace"]["dit"][("double_block", 0)]
+    monkeypatch.setattr(replacement, "__code__", replacement.__code__.replace(
+        co_consts=(*replacement.__code__.co_consts, "changed")
+    ))
+    second, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and second is not None and second.safe
+    assert first.identity != second.identity
+
+
+def test_callable_default_change_invalidates_identity():
+    def function(scale=1.0):
+        return scale
+
+    original = core_bsa_compat._callable_identity(function)
+    function.__defaults__ = (2.0,)
+    assert original != core_bsa_compat._callable_identity(function)
 
 
 def test_missing_or_foreign_h3_replacement_fails_closed():

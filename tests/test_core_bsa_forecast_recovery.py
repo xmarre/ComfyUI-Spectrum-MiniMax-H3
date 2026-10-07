@@ -1,5 +1,6 @@
 from types import SimpleNamespace as N
 
+import pytest
 import torch
 
 from comfyui_spectrum_h3 import core_bsa_compat
@@ -181,6 +182,7 @@ def _audit(route, patch, owners, *, identity_tail="same"):
     return N(
         identity=identity,
         safe=True,
+        cold_successor_compatible=True,
         patch=patch,
         patch_generation=17,
         block_count=3,
@@ -254,3 +256,55 @@ def test_carry_is_not_used_for_actual_steps(monkeypatch):
     monkeypatch.setattr(core_bsa_compat, "accepts_actual", lambda *_args: True)
     _capture_transition_proof(runtime, 4, 2, cold, cold.expected_receipts)
     assert not _prove_forecast_carry(runtime, 4, 3, primed, primed.identity, True)
+
+
+@pytest.mark.parametrize("inference", [False, True])
+@pytest.mark.parametrize("component", [0, 1])
+def test_carry_rejects_in_place_calibration_mutation(monkeypatch, inference, component):
+    with torch.inference_mode(inference):
+        kmean = torch.zeros(1, 2, dtype=torch.float32)
+        vscale = torch.ones(1, 2, dtype=torch.float32)
+        patch = N(pooled={(2, 64, ("u",)): (kmean, vscale)})
+        cold = _audit("h3_chunked_sparse_cold", patch, ("missing",))
+        primed = _audit("h3_chunked_sparse_primed", patch, (11, 12))
+        runtime = N(
+            _backend_history=BackendHistory(cold.identity, cold.expected_receipts, True),
+            _step=N(mode="actual"), config=N(debug=False),
+        )
+        monkeypatch.setattr(core_bsa_compat, "accepts_actual", lambda *_args: True)
+        _capture_transition_proof(runtime, 4, 2, cold, cold.expected_receipts)
+        (kmean, vscale)[component].add_(1)
+        runtime._step.mode = "forecast"
+        assert not _prove_forecast_carry(runtime, 4, 3, primed, primed.identity, True)
+        assert runtime._backend_history.policy == cold.identity
+        assert runtime._core_bsa_cold_successor_proof is None
+
+
+@pytest.mark.parametrize("digest", ["different-source", "runtime"])
+def test_carry_is_independent_of_whole_file_source_digest(monkeypatch, digest):
+    kmean, vscale = torch.zeros(1, 2), torch.ones(1, 2)
+    patch = N(pooled={(2, 64, ("u",)): (kmean, vscale)})
+    cold = _audit("h3_chunked_sparse_cold", patch, ("missing",))
+    primed = _audit("h3_chunked_sparse_primed", patch, (11, 12))
+    cold.source_blob = primed.source_blob = digest
+    runtime = N(
+        _backend_history=BackendHistory(cold.identity, cold.expected_receipts, True),
+        _step=N(mode="actual"), config=N(debug=False),
+    )
+    monkeypatch.setattr(core_bsa_compat, "accepts_actual", lambda *_args: True)
+    _capture_transition_proof(runtime, 4, 2, cold, cold.expected_receipts)
+    runtime._step.mode = "forecast"
+    assert _prove_forecast_carry(runtime, 4, 3, primed, primed.identity, True)
+
+
+def test_changed_recipe_does_not_capture_transition_proof(monkeypatch):
+    patch = N(pooled={(2, 64, ("u",)): (torch.zeros(1, 2), torch.ones(1, 2))})
+    cold = _audit("h3_chunked_sparse_cold", patch, ("missing",))
+    cold.cold_successor_compatible = False
+    runtime = N(
+        _backend_history=BackendHistory(cold.identity, cold.expected_receipts, True),
+        _step=N(mode="actual"), config=N(debug=False),
+    )
+    monkeypatch.setattr(core_bsa_compat, "accepts_actual", lambda *_args: True)
+    _capture_transition_proof(runtime, 4, 2, cold, cold.expected_receipts)
+    assert runtime._core_bsa_cold_successor_proof is None

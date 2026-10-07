@@ -97,6 +97,7 @@ class CoreBSAAudit:
     source_blob: str
     current_override: Any
     failure: str | None = None
+    cold_successor_compatible: bool = False
 
 
 def has_core_bsa_callback(options: dict[str, Any]) -> bool:
@@ -245,6 +246,29 @@ def _callable_identity(function: Any) -> tuple[Any, ...]:
         str(getattr(base, "__module__", type(base).__module__)),
         str(getattr(base, "__qualname__", type(base).__qualname__)),
         _lifetime_generation(base),
+        _lifetime_generation(getattr(base, "__code__", None)),
+        _freeze(getattr(base, "__defaults__", None)),
+        _freeze(getattr(base, "__kwdefaults__", None)),
+    )
+
+
+def _bsa_helper_identity(function: Any) -> tuple[Any, ...]:
+    """Bind the live numerical helpers used by an installed BSA closure."""
+    globals_ = getattr(function, "__globals__", {})
+    kernel = globals_.get("ck")
+    return (
+        tuple(
+            (name, _callable_identity(globals_.get(name)))
+            for name in ("h3_eligible", "h3_sparse_attention")
+        ),
+        tuple(
+            (name, _freeze(globals_.get(name)))
+            for name in ("HEAD_DIM", "BLOCK_SIZE", "PRODUCER_CHUNK")
+        ),
+        tuple(
+            (name, _callable_identity(getattr(kernel, name, None)))
+            for name in ("sol_attn", "sol_attn_chunked", "sol_attn_is_available")
+        ),
     )
 
 
@@ -507,7 +531,11 @@ def _replacement_ownership(
         ):
             return None
         replacement_ids.append(_callable_identity(replacement))
-        attention_ids.append(_callable_identity(attention))
+        attention_ids.append((
+            _callable_identity(attention),
+            _bsa_helper_identity(attention),
+            _bsa_helper_identity(replacement),
+        ))
 
     if patch is None or _settings_identity(patch) is None:
         return None
@@ -537,7 +565,26 @@ def _replacement_ownership(
         ("h3_replacements", tuple(replacement_ids)),
         ("h3_attention", tuple(attention_ids)),
         ("bsa_override", _callable_identity(current)),
+        ("patch_methods", tuple(
+            (name, _callable_identity(getattr(patch, name, None)))
+            for name in ("dense_reason", "sinks")
+        )),
     )
+
+
+def _cold_successor_compatible(options: dict[str, Any], model: Any, patch: Any) -> bool:
+    """Check the calibration recipe without restricting ordinary BSA admission."""
+    from .core_bsa_calibration_compat import supports_cold_successor
+
+    dit = options["patches_replace"]["dit"]
+    for index in range(len(model.blocks)):
+        replacement = dit[("double_block", index)]
+        closure = _closure_values(replacement)
+        if closure is None or not supports_cold_successor(
+            replacement, closure.get("attention"), patch
+        ):
+            return False
+    return True
 
 
 def _pool_entry(
@@ -767,6 +814,7 @@ def probe(
             expected_receipts=expected_receipts,
             source_blob=source_blob,
             current_override=options.get("optimized_attention_override"),
+            cold_successor_compatible=_cold_successor_compatible(options, model, patch),
         ), None
     except torch.cuda.OutOfMemoryError:
         raise
