@@ -121,6 +121,7 @@ jobs:
             comfyui_spectrum_h3/bsa_transition_probe_compat.py \
             comfyui_spectrum_h3/bsa_transition_probe_manual.py \
             comfyui_spectrum_h3/core_bsa_compat.py \
+            comfyui_spectrum_h3/core_bsa_calibration_compat.py \
             comfyui_spectrum_h3/core_bsa_diagnostics.py \
             comfyui_spectrum_h3/core_bsa_flow_compat.py \
             comfyui_spectrum_h3/core_bsa_forecast_recovery.py \

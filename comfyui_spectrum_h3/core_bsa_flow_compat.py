@@ -1,34 +1,21 @@
-"""Source-gated Flow wrapper composition around ComfyUI core H3 BSA.
+"""Runtime-verified Flow wrapper composition around ComfyUI core H3 BSA.
 
 Flow-Aligned Regenerate legitimately wraps MiniMax-H3 ``double_block`` replacements.
 Core BSA can therefore be numerically active without remaining the top-level block
-replacement. This module recognizes only reviewed Flow wrapper code, unwraps it
-for BSA preflight, and verifies the actual route around the real outer wrapper
-chain without depending on inference-tensor version counters.
+replacement. Runtime wrapper structure and real execution receipts establish the
+backend identity, independently of whole-file source revisions.
 """
 from __future__ import annotations
 
 from pathlib import Path
 import sys
-from types import SimpleNamespace
+from types import SimpleNamespace, CodeType
 from typing import Any
 
 import torch
 
 from . import core_bsa_compat, source_code_audit
 
-AUDITED_FLOW_ATTENTION_GIT_BLOBS = frozenset(
-    {"c58c652f7b7d6030a2311f4805c3443615e432eb"}
-)
-AUDITED_FLOW_MIXED_GRID_GIT_BLOBS = frozenset(
-    {
-        "8fc0f753ff2cd21fae898a4dd3c9ab1025f98443",  # released v0.3.3
-        "66c59f26ad41154fcce7e1ce5250fa233a96dc3b",  # PR #26 canonical layout propagation
-    }
-)
-_FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS = frozenset(
-    {"66c59f26ad41154fcce7e1ce5250fa233a96dc3b"}
-)
 _FLOW_ATTENTION_TOPLEVEL = "h3_flow_regenerate.attention"
 _FLOW_ATTENTION_SUFFIX = ".h3_flow_regenerate.attention"
 _FLOW_MIXED_TOPLEVEL = "h3_flow_regenerate.mixed_grid"
@@ -63,7 +50,6 @@ def _loaded_source_module(
     suffix: str,
     parent: str,
     filename: str,
-    blobs: frozenset[str],
 ) -> tuple[Any, str] | None:
     module_name = getattr(base, "__module__", None)
     if not isinstance(module_name, str):
@@ -88,18 +74,14 @@ def _loaded_source_module(
         or source_path.parent.name != parent
     ):
         return None
-    blob = core_bsa_compat._module_blob_sha(module)
-    if blob not in blobs:
-        return None
-    return module, blob
+    return module, core_bsa_compat._module_blob_sha(module) or "runtime"
 
 
 def _source_matches(base: Any, module: Any, lexical_path: tuple[str, ...]) -> bool:
+    """Check live closure code against the installed source, not a revision hash."""
     source = getattr(module, "__file__", None)
     return isinstance(source, str) and source_code_audit.matches_nested_source_code(
-        base,
-        Path(source),
-        lexical_path,
+        base, Path(source), lexical_path,
     )
 
 
@@ -115,7 +97,6 @@ def _audited_layout_wrapper(
         suffix=_FLOW_ATTENTION_SUFFIX,
         parent="h3_flow_regenerate",
         filename="attention.py",
-        blobs=AUDITED_FLOW_ATTENTION_GIT_BLOBS,
     )
     if loaded is None:
         return None
@@ -230,6 +211,38 @@ def _expected_measure_contract(
     }
 
 
+def _mixed_layout_propagation(base: Any, module: Any) -> tuple[bool, Any] | None:
+    """Identify live mixed-layout forwarding without a source revision allowlist.
+
+    Modern Flow copies transformer options through its helper and publishes the
+    mixed layout. Older Flow retains the carrier layout. Probe the pure helper
+    with inert sentinels and bind its implementation to backend identity.
+    """
+    code = getattr(base, "__code__", None)
+    if not isinstance(code, CodeType):
+        return None
+    if "_mixed_transformer_options" not in code.co_names:
+        return (False, None) if "vdn_h3_external_sequence_v1" in code.co_consts else None
+    helper = getattr(base, "__globals__", {}).get("_mixed_transformer_options")
+    if not callable(helper) or helper is not getattr(module, "_mixed_transformer_options", None):
+        return None
+    marker = object()
+    original = {"probe": marker}
+    try:
+        forwarded = helper(original, marker)
+    except Exception:  # noqa: BLE001 - unproven forwarding remains actual-only
+        return None
+    if (
+        not isinstance(forwarded, dict)
+        or forwarded is original
+        or original != {"probe": marker}
+        or forwarded.get("probe") is not marker
+        or forwarded.get("minimax_h3_layout") is not marker
+    ):
+        return None
+    return True, core_bsa_compat._callable_identity(helper)
+
+
 def _audited_mixed_wrapper(
     wrapper: Any,
     index: int,
@@ -245,22 +258,21 @@ def _audited_mixed_wrapper(
         suffix=_FLOW_MIXED_SUFFIX,
         parent="h3_flow_regenerate",
         filename="mixed_grid.py",
-        blobs=AUDITED_FLOW_MIXED_GRID_GIT_BLOBS,
     )
     if loaded is None:
         return None
     module, blob = loaded
-    if not _source_matches(
-        base,
-        module,
-        ("mixed_diffusion_wrapper", "wrap", "call"),
-    ):
+    if not _source_matches(base, module, ("mixed_diffusion_wrapper", "wrap", "call")):
         return None
     if getattr(base, "__defaults__", None) is not None or getattr(base, "__kwdefaults__", None):
         return None
     closure = core_bsa_compat._closure_values(base)
     if closure is None or frozenset(closure) != _MIXED_CLOSURE_SCHEMA:
         return None
+    propagation = _mixed_layout_propagation(base, module)
+    if propagation is None:
+        return None
+    layout_propagated, layout_helper_identity = propagation
     if type(closure["layer"]) is not int or closure["layer"] != index:
         return None
     if closure["inner"] is not model:
@@ -352,6 +364,8 @@ def _audited_mixed_wrapper(
     )
     return previous, identity, {
         "source_blob": blob,
+        "layout_propagated": layout_propagated,
+        "layout_helper_identity": layout_helper_identity,
         "plan": plan,
         "plan_generation": plan_generation,
         "mixed_layout": mixed_layout,
@@ -444,18 +458,8 @@ def has_core_bsa_evidence(options: dict[str, Any]) -> bool:
 
 
 def _effective_mixed_layout(mixed: dict[str, Any], carrier_layout: Any) -> Any:
-    """Return the exact layout core BSA sees for the reviewed Flow source.
-
-    Released Flow v0.3.3 passes ``mixed_layout`` as the direct block argument but
-    leaves ``transformer_options['minimax_h3_layout']`` on the carrier layout.
-    Core BSA therefore sees a token/layout mismatch and uses zero conditioning
-    sinks. PR #26 fixes the producer-side contract and publishes ``mixed_layout``
-    through the canonical transformer metadata as well. The audit preserves both
-    numerical semantics instead of pretending the released and fixed sources are
-    equivalent.
-    """
-    source_blob = mixed.get("source_blob")
-    if source_blob in _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS:
+    """Use the layout actually published by the live Flow forwarding helper."""
+    if mixed["layout_propagated"]:
         layout = mixed.get("mixed_layout")
         normalized = core_bsa_compat._normalize_layout(layout)
         if normalized is None or normalized[0] != int(mixed["mixed_seq"]):
@@ -525,6 +529,8 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
                     or item["plan"] is not mixed["plan"]
                     or item["mixed_layout"] is not mixed["mixed_layout"]
                     or item["source_blob"] != mixed["source_blob"]
+                    or item["layout_propagated"] != mixed["layout_propagated"]
+                    or item["layout_helper_identity"] != mixed["layout_helper_identity"]
                     or item["carrier_identity"] != mixed["carrier_identity"]
                     or item["cached"] is not mixed["cached"]
                     or item["metrics"] is not mixed["metrics"]
@@ -558,8 +564,8 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
             outer_seq_lens = (carrier_seq, *(mixed["mixed_seq"] for _ in blocks[1:]))
             flow_mode = (
                 "mixed_grid_layout_propagated_v1"
-                if mixed["source_blob"] in _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS
-                else "mixed_grid_v0.3.3"
+                if mixed["layout_propagated"]
+                else "mixed_grid_carrier_layout"
             )
 
         flow_identity = (
@@ -578,7 +584,11 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
                 ),
             ),
         )
-        audit.identity = (*audit.identity, ("outer_block_wrappers", flow_identity))
+        audit.identity = (
+            *audit.identity,
+            ("flow_layout_helper", None if mixed is None else mixed["layout_helper_identity"]),
+            ("outer_block_wrappers", flow_identity),
+        )
         audit.flow_wrapper_specs = tuple(wrapper_specs)
         audit.flow_outer_replacements = tuple(
             dit[("double_block", index)] for index in range(len(blocks))
@@ -592,7 +602,7 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
         audit.flow_mixed = mixed is not None
         audit.flow_mixed_layout_propagated = bool(
             mixed is not None
-            and mixed["source_blob"] in _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS
+            and mixed["layout_propagated"]
         )
         audit.flow_identity = flow_identity
         audit.flow_model = model
@@ -799,7 +809,7 @@ def instrument_actual_options(
             return prepared
         if (
             mixed is not None
-            and bool(mixed["source_blob"] in _FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS)
+            and bool(mixed["layout_propagated"])
             != bool(getattr(audit, "flow_mixed_layout_propagated", False))
         ):
             audit.failure = "flow_mixed_layout_mode_changed"

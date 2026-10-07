@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -52,9 +53,6 @@ def _runtime_loaded_bsa(monkeypatch):
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"core BSA fixture unavailable: {exc}")
     source = Path(canonical.__file__).resolve()
-    if core_bsa_compat._module_blob_sha(canonical) not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS:
-        pytest.skip("ComfyUI fixture is not the reviewed core BSA source")
-
     # Mirror ComfyUI nodes.load_custom_node for builtin extra-node files: the
     # sys.modules key is the source path stem, not comfy_extras.<module>.
     alias_name = str(source.with_suffix(""))
@@ -120,6 +118,9 @@ def test_runtime_path_loaded_core_bsa_is_recognized(monkeypatch):
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
     assert reason is None and audit is not None and audit.safe
     assert audit.patch is patch
+    if os.environ.get("SPECTRUM_REQUIRE_REVIEWED_BSA_FIXTURE") == "1":
+        # The mandatory fixture supplies the validated calibration recipe.
+        assert audit.cold_successor_compatible
     assert all(spec[0] == "h3_dense" for spec in audit.route_specs)
 
 
@@ -131,11 +132,6 @@ def test_runtime_path_loaded_bsa_under_reviewed_flow_wrapper(monkeypatch):
         from h3_flow_regenerate.metrics import H3FlowMetrics
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"reviewed Flow fixture unavailable: {exc}")
-    if (
-        core_bsa_compat._module_blob_sha(attention)
-        not in core_bsa_flow_compat.AUDITED_FLOW_ATTENTION_GIT_BLOBS
-    ):
-        pytest.skip("Flow attention fixture is not the reviewed source")
 
     key = ("double_block", 0)
     previous = options["patches_replace"]["dit"][key]
