@@ -117,6 +117,7 @@ def test_runtime_path_loaded_core_bsa_is_recognized(monkeypatch):
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
     assert reason is None and audit is not None and audit.safe
     assert audit.patch is patch
+    assert audit.cold_successor_compatible
     assert all(spec[0] == "h3_dense" for spec in audit.route_specs)
 
 

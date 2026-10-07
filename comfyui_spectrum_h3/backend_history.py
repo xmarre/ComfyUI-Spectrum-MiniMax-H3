@@ -112,7 +112,7 @@ def _debug_core_bsa_preflight(
         flow_mode = getattr(audit, "flow_mixed", None)
         LOG.warning(
             "Spectrum H3 core-BSA preflight run_id=%s step=%s result=audited safe=%s "
-            "seq_len=%s routes=%s flow_mixed=%s failure=%s",
+            "seq_len=%s routes=%s flow_mixed=%s failure=%s cold_carry_compatible=%s",
             run_id,
             step_id,
             bool(safe),
@@ -120,6 +120,7 @@ def _debug_core_bsa_preflight(
             routes,
             flow_mode,
             audit.failure,
+            bool(getattr(audit, "cold_successor_compatible", False)),
         )
         return
     if (

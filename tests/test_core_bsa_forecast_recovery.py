@@ -308,3 +308,40 @@ def test_changed_recipe_does_not_capture_transition_proof(monkeypatch):
     monkeypatch.setattr(core_bsa_compat, "accepts_actual", lambda *_args: True)
     _capture_transition_proof(runtime, 4, 2, cold, cold.expected_receipts)
     assert runtime._core_bsa_cold_successor_proof is None
+
+
+def test_unqualified_transition_refreshes_history_then_resumes_forecasts():
+    runtime = _runtime()
+    run_id = _start(runtime, 5)
+    _complete(runtime, 1.0, policy="sparse-cold")
+    _decision, mode = _complete(runtime, 0.8, policy="sparse-primed")
+    assert mode == "actual"
+    _decision, mode = _complete(runtime, 0.6, policy="sparse-primed")
+    assert mode == "forecast"
+    runtime.end_run(run_id)
+
+
+@pytest.mark.parametrize("allocation", ["snapshot", "comparison"])
+def test_optional_carry_allocation_oom_preserves_accepted_actual(monkeypatch, allocation):
+    patch = N(pooled={(2, 64, ("u",)): (torch.zeros(1, 2), torch.ones(1, 2))})
+    cold = _audit("h3_chunked_sparse_cold", patch, ("missing",))
+    primed = _audit("h3_chunked_sparse_primed", patch, (11, 12))
+    runtime = N(
+        _backend_history=BackendHistory(cold.identity, cold.expected_receipts, True),
+        _step=N(mode="actual"), config=N(debug=False),
+    )
+    monkeypatch.setattr(core_bsa_compat, "accepts_actual", lambda *_args: True)
+
+    def oom(*_args, **_kwargs):
+        raise torch.cuda.OutOfMemoryError("optional calibration allocation")
+
+    if allocation == "snapshot":
+        monkeypatch.setattr(torch.Tensor, "clone", oom)
+    _capture_transition_proof(runtime, 4, 2, cold, cold.expected_receipts)
+    if allocation == "comparison":
+        monkeypatch.setattr(torch, "stack", oom)
+        runtime._step.mode = "forecast"
+        assert not _prove_forecast_carry(runtime, 4, 3, primed, primed.identity, True)
+    assert runtime._core_bsa_cold_successor_proof is None
+    assert runtime._backend_history.policy == cold.identity
+    assert runtime._backend_history.forecast_safe

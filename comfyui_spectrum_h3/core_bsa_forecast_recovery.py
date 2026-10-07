@@ -99,7 +99,12 @@ def _capture_transition_proof(runtime, run_id: int, step_id: int, audit, receipt
         )
         if entry[0] != "present":
             return
-        owners.append((entry[1], entry[2], entry[1].detach().clone(), entry[2].detach().clone()))
+        try:
+            owners.append((entry[1], entry[2], entry[1].detach().clone(), entry[2].detach().clone()))
+        except torch.cuda.OutOfMemoryError:
+            # The accepted actual is still valid; this optional optimization must
+            # not abort sampling when there is no room for calibration snapshots.
+            return
 
     runtime._core_bsa_cold_successor_proof = _ColdSuccessorProof(
         run_id=int(run_id),
@@ -172,10 +177,21 @@ def _prove_forecast_carry(runtime, run_id: int, step_id: int, audit, identity, s
         for tensor, saved in zip(entry[1:3], owners[2:4]):
             # Inference tensors have no version counter. Compare bytes, including
             # NaN payloads, and synchronize only once per device below.
-            match = (tensor.contiguous().view(torch.uint8) == saved.contiguous().view(torch.uint8)).all()
+            if tensor.device != saved.device:
+                _clear_transition_proof(runtime)
+                return False
+            try:
+                match = (tensor.contiguous().view(torch.uint8) == saved.contiguous().view(torch.uint8)).all()
+            except torch.cuda.OutOfMemoryError:
+                _clear_transition_proof(runtime)
+                return False
             byte_checks.setdefault(tensor.device, []).append(match)
 
-    if any(not bool(torch.stack(checks).all().item()) for checks in byte_checks.values()):
+    try:
+        unchanged = all(bool(torch.stack(checks).all().item()) for checks in byte_checks.values())
+    except torch.cuda.OutOfMemoryError:
+        unchanged = False
+    if not unchanged:
         _clear_transition_proof(runtime)
         return False
 

@@ -1,4 +1,6 @@
 import hashlib
+import inspect
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -184,7 +186,11 @@ def test_changed_calibration_recipe_still_admits_bsa_without_cold_carry(monkeypa
 
     original = nodes.h3_sparse_attention
     # Same function owner and source digest, changed numerical implementation.
-    code = original.__code__.replace(co_consts=(*original.__code__.co_consts, "changed"))
+    source = inspect.getsource(original).replace(
+        "return attn.out_proj(out)", "return attn.out_proj(out) * (2 if first else 1)"
+    )
+    root = compile("from __future__ import annotations\nimport comfy_kitchen as ck\nimport torch\nimport comfy.model_management\nimport comfy.model_prefetch\n" + source, "<changed-calibration>", "exec", dont_inherit=True)
+    code = next(item for item in root.co_consts if getattr(item, "co_name", None) == "h3_sparse_attention")
     monkeypatch.setattr(original, "__code__", code)
     second, reason = core_bsa_compat.probe(options, _layout(), model)
     assert reason is None and second is not None and second.safe
@@ -197,9 +203,14 @@ def test_replacement_code_change_invalidates_history_without_source_gate(monkeyp
     first, reason = core_bsa_compat.probe(options, _layout(), model)
     assert reason is None and first is not None
     replacement = options["patches_replace"]["dit"][("double_block", 0)]
-    monkeypatch.setattr(replacement, "__code__", replacement.__code__.replace(
-        co_consts=(*replacement.__code__.co_consts, "changed")
-    ))
+    source = textwrap.dedent(inspect.getsource(_nodes.make_h3_block_patch)).replace(
+        'return extra["original_block"](args)',
+        'return {**extra["original_block"](args), "img": args["img"] * 2}',
+    )
+    root = compile("from __future__ import annotations\n" + source, "<changed-block>", "exec", dont_inherit=True)
+    factory_code = next(item for item in root.co_consts if getattr(item, "co_name", None) == "make_h3_block_patch")
+    code = next(item for item in factory_code.co_consts if getattr(item, "co_name", None) == "block_patch")
+    monkeypatch.setattr(replacement, "__code__", code)
     second, reason = core_bsa_compat.probe(options, _layout(), model)
     assert reason is None and second is not None and second.safe
     assert first.identity != second.identity
@@ -212,6 +223,18 @@ def test_callable_default_change_invalidates_identity():
     original = core_bsa_compat._callable_identity(function)
     function.__defaults__ = (2.0,)
     assert original != core_bsa_compat._callable_identity(function)
+
+
+def test_calibration_code_semantics_supports_pre_311_code_shape():
+    from comfyui_spectrum_h3 import source_code_audit
+
+    root = compile("def f(): return 1", "<code-shape>", "exec")
+    code = next(item for item in root.co_consts if getattr(item, "co_name", None) == "f")
+    legacy = SimpleNamespace(**{
+        name: getattr(code, name)
+        for name in dir(code) if name.startswith("co_") and name not in {"co_qualname", "co_lnotab"}
+    })
+    assert source_code_audit._code_semantics(legacy) == source_code_audit._code_semantics(code)
 
 
 def test_missing_or_foreign_h3_replacement_fails_closed():

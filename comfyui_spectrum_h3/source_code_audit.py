@@ -33,7 +33,7 @@ def _constant_semantics(value: Any) -> Any:
 def _code_semantics(code: types.CodeType) -> tuple[Any, ...]:
     return (
         code.co_name,
-        code.co_qualname,
+        getattr(code, "co_qualname", code.co_name),
         code.co_argcount,
         getattr(code, "co_posonlyargcount", 0),
         code.co_kwonlyargcount,
