@@ -65,11 +65,6 @@ def _audited_nodes():
         import comfy_extras.nodes_sparse_attention as nodes
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"core BSA fixture unavailable: {exc}")
-    if (
-        core_bsa_compat._module_blob_sha(nodes)
-        not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS
-    ):
-        pytest.skip("ComfyUI fixture is not the reviewed core BSA source")
     return nodes
 
 

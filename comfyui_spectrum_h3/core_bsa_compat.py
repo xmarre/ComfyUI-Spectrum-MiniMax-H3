@@ -1,9 +1,10 @@
-"""Fail-closed Spectrum compatibility audit for ComfyUI core BlockSparseAttention.
+"""Runtime compatibility tracking for ComfyUI core BlockSparseAttention.
 
-This adapter deliberately recognizes only reviewed upstream implementations.  It
-does not modify ComfyUI or ask core BSA to publish Spectrum-specific metadata.
-Instead, Spectrum proves ownership/configuration before a model call and wraps
-only the copied MiniMax-H3 block replacements for actual-call verification.
+Core BSA does not publish Spectrum's generic backend-history provider contract, so
+Spectrum derives its numerical identity from the live patch chain. Source
+revision and callable-ownership allowlists are not acceptance gates: normal
+ComfyUI updates must not silently disable forecasting. Structural invariants,
+route metadata, pool state, and actual-call receipts still guard history reuse.
 """
 from __future__ import annotations
 
@@ -25,9 +26,8 @@ ADAPTER_KEY = "spectrum_core_bsa_v1"
 ADAPTER_VERSION = 1
 PRIVATE_AUDIT_KEY = "_spectrum_core_bsa_audit_v1"
 
-# Comfy-Org/ComfyUI comfy_extras/nodes_sparse_attention.py as reviewed at
-# be92396834f9b6e3e361cfe30e7eed693137a448 (unchanged from its parent).
-# Any source change is actual-only until the new implementation is audited.
+# Historical v0.2.28 fixture digest retained for regression diagnostics only.
+# It is not consulted by the runtime acceptance path.
 AUDITED_BSA_GIT_BLOBS = frozenset(
     {"006d1eb352f946a7c85595edf75d3cda9ac79194"}
 )
@@ -173,15 +173,13 @@ def _module_blob_sha(module: Any) -> str | None:
 
 
 def _load_audited_module() -> tuple[Any | None, str | None]:
+    """Load core BSA by runtime API shape; the source digest is identity only."""
     try:
         module = importlib.import_module("comfy_extras.nodes_sparse_attention")
     except torch.cuda.OutOfMemoryError:
         raise
     except Exception:  # noqa: BLE001 - unavailable/old ComfyUI stays actual-only
         return None, "module_unavailable"
-    blob = _module_blob_sha(module)
-    if blob not in AUDITED_BSA_GIT_BLOBS:
-        return None, "source_unreviewed"
     required = (
         "SparseAttnPatch",
         "make_attention_override",
@@ -193,13 +191,17 @@ def _load_audited_module() -> tuple[Any | None, str | None]:
     )
     if any(not hasattr(module, name) for name in required):
         return None, "source_shape_changed"
-    if (
-        int(module.HEAD_DIM) != 128
-        or int(module.BLOCK_SIZE) != 64
-        or int(module.PRODUCER_CHUNK) != 4096
-    ):
+    try:
+        constants_ok = (
+            int(module.HEAD_DIM) == 128
+            and int(module.BLOCK_SIZE) == 64
+            and int(module.PRODUCER_CHUNK) == 4096
+        )
+    except (TypeError, ValueError):
+        constants_ok = False
+    if not constants_ok:
         return None, "source_constants_changed"
-    return module, blob
+    return module, _module_blob_sha(module) or "runtime"
 
 
 def _nested_code(function: Any, name: str) -> types.CodeType | None:
@@ -461,16 +463,11 @@ def _conditioning_sinks(
 
 
 def _replacement_ownership(
-    module: Any, model: Any, options: dict[str, Any]
+    _module: Any, model: Any, options: dict[str, Any]
 ) -> tuple[Any, tuple[Any, ...]] | None:
-    block_patch_code = _nested_code(module.make_h3_block_patch, "block_patch")
-    attention_code = _nested_code(module.make_h3_block_patch, "attention")
-    override_code = _nested_code(module.make_attention_override, "override")
-    if block_patch_code is None or attention_code is None or override_code is None:
-        return None
-
+    """Resolve the active BSA chain structurally without source/callable allowlists."""
     blocks = getattr(model, "blocks", None)
-    if blocks is None:
+    if not isinstance(blocks, (tuple, list, torch.nn.ModuleList)) or not blocks:
         return None
     replacements = options.get("patches_replace", {})
     if not isinstance(replacements, dict):
@@ -481,15 +478,16 @@ def _replacement_ownership(
 
     patch = None
     replacement_ids = []
+    attention_ids = []
     for index, block in enumerate(blocks):
         replacement = dit.get(("double_block", index))
-        if getattr(replacement, "__code__", None) is not block_patch_code:
+        if not callable(replacement):
             return None
         closure = _closure_values(replacement)
         if closure is None:
             return None
         owner = closure.get("patch")
-        if type(owner) is not module.SparseAttnPatch:
+        if owner is None:
             return None
         if patch is None:
             patch = owner
@@ -498,7 +496,7 @@ def _replacement_ownership(
         if closure.get("block") is not block or closure.get("block_index") != index:
             return None
         attention = closure.get("attention")
-        if getattr(attention, "__code__", None) is not attention_code:
+        if not callable(attention):
             return None
         attention_closure = _closure_values(attention)
         if (
@@ -509,11 +507,13 @@ def _replacement_ownership(
         ):
             return None
         replacement_ids.append(_callable_identity(replacement))
+        attention_ids.append(_callable_identity(attention))
 
-    if patch is None:
+    if patch is None or _settings_identity(patch) is None:
         return None
+
     current = options.get("optimized_attention_override")
-    if getattr(current, "__code__", None) is not override_code:
+    if not callable(current):
         return None
     closure = _closure_values(current)
     if closure is None or closure.get("patch") is not patch:
@@ -521,16 +521,21 @@ def _replacement_ownership(
     installed = getattr(patch, "installed", None)
     if not isinstance(installed, set) or current not in installed:
         return None
+
     previous = closure.get("previous")
-    if getattr(previous, "__code__", None) is override_code:
-        return None
-    previous_closure = _closure_values(previous) if previous is not None else None
-    if previous_closure is not None and type(previous_closure.get("patch")) is module.SparseAttnPatch:
+    previous_closure = _closure_values(previous) if callable(previous) else None
+    previous_patch = (
+        previous_closure.get("patch")
+        if isinstance(previous_closure, dict)
+        else None
+    )
+    if previous_patch is not None and _settings_identity(previous_patch) is not None:
         return None
 
     return patch, (
         ("inherited_attention", _attention_owner_identity(previous)),
         ("h3_replacements", tuple(replacement_ids)),
+        ("h3_attention", tuple(attention_ids)),
         ("bsa_override", _callable_identity(current)),
     )
 
@@ -666,10 +671,10 @@ def probe(
         if module is None or source_blob is None:
             return None, source_blob or "module_unavailable"
 
-        ownership = _replacement_ownership(module, model, options)
-        if ownership is None:
-            return None, "ownership_unproven"
-        patch, ownership_identity = ownership
+        runtime_chain = _replacement_ownership(module, model, options)
+        if runtime_chain is None:
+            return None, "runtime_structure_unrecognized"
+        patch, ownership_identity = runtime_chain
         patch_generation = _lifetime_generation(patch)
 
         normalized_layout = _normalize_layout(layout)

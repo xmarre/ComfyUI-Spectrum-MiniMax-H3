@@ -74,9 +74,9 @@ def _preflight(options, layout, model):
         return tuple(identities), safe, None
 
     # Core ComfyUI BSA does not publish the generic provider contract. Spectrum
-    # owns narrowly source-gated compatibility audits for the exact reviewed BSA,
-    # Untwist preprocessor and Flow block-wrapper composition. Any unknown source
-    # or ownership remains actual-only.
+    # derives the live BSA patch-chain identity structurally, while reviewed
+    # Untwist/Flow adapters add their own composition metadata. Unknown or
+    # malformed runtime structure remains actual-only.
     from . import core_bsa_flow_compat, core_bsa_preprocess_compat
 
     if core_bsa_flow_compat.has_core_bsa_evidence(options):
@@ -128,11 +128,11 @@ def _debug_core_bsa_preflight(
         and identity[0] == "core_bsa_unreported"
     ):
         detail = None
-        if identity[1] == "ownership_unproven":
+        if identity[1] == "runtime_structure_unrecognized":
             try:
                 from . import core_bsa_diagnostics
 
-                detail = core_bsa_diagnostics.ownership_diagnostic(
+                detail = core_bsa_diagnostics.runtime_structure_diagnostic(
                     options,
                     layout,
                     model,

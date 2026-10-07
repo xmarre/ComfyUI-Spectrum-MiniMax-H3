@@ -67,8 +67,6 @@ def _audited_nodes():
         import comfy_extras.nodes_sparse_attention as nodes
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"core BSA is unavailable in this reviewed ComfyUI fixture: {exc}")
-    if core_bsa_compat._module_blob_sha(nodes) not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS:
-        pytest.skip("this ComfyUI fixture is not the reviewed core BSA source")
     return nodes
 
 
@@ -226,7 +224,7 @@ def test_uncontracted_outer_attention_stays_fail_closed():
     options["optimized_attention_override"] = outer
     audit, reason = core_bsa_preprocess_compat.probe(options, _layout(), model)
     assert audit is None
-    assert reason == "ownership_unproven"
+    assert reason == "runtime_structure_unrecognized"
 
 
 def test_unknown_preprocess_contract_stays_fail_closed():

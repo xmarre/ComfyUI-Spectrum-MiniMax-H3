@@ -52,9 +52,6 @@ def _runtime_loaded_bsa(monkeypatch):
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"core BSA fixture unavailable: {exc}")
     source = Path(canonical.__file__).resolve()
-    if core_bsa_compat._module_blob_sha(canonical) not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS:
-        pytest.skip("ComfyUI fixture is not the reviewed core BSA source")
-
     # Mirror ComfyUI nodes.load_custom_node for builtin extra-node files: the
     # sys.modules key is the source path stem, not comfy_extras.<module>.
     alias_name = str(source.with_suffix(""))

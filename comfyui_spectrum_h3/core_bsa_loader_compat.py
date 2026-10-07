@@ -1,17 +1,9 @@
-"""Resolve reviewed core BSA callables under ComfyUI's real builtin-node loader.
+"""Resolve core BSA callables under ComfyUI's real builtin-node loader.
 
-ComfyUI loads builtin ``comfy_extras/nodes_*.py`` files through ``load_custom_node``
-using the file path stem as ``sys.modules`` key. Therefore the live core-BSA
-closures can belong to an absolute-path module instead of the canonical dotted
-``comfy_extras.nodes_sparse_attention`` import. Importing the canonical module
-then creates a second module instance whose function/class identities cannot prove
-the already-installed live patch.
-
-This compatibility layer preserves the existing canonical audit and adds one
-strict fallback for that real loader alias. The fallback accepts only the current
-ComfyUI checkout's reviewed ``comfy_extras/nodes_sparse_attention.py`` source,
-independently proves nested callable semantics from that on-disk source, and then
-runs the existing ownership/route audit against the exact live module instance.
+ComfyUI can load ``comfy_extras/nodes_*.py`` through a path-derived module name,
+so live BSA closures may not use the canonical dotted module name. This adapter
+recognizes that active core file by location and runtime API shape. Source hashes
+and callable-provenance allowlists are deliberately not acceptance gates.
 """
 from __future__ import annotations
 
@@ -22,7 +14,7 @@ from typing import Any
 
 import torch
 
-from . import core_bsa_compat, source_code_audit
+from . import core_bsa_compat
 
 _BSA_FILE = "nodes_sparse_attention.py"
 _BSA_PARENT = "comfy_extras"
@@ -61,17 +53,6 @@ def _comfy_extras_dir() -> Path | None:
     return extras
 
 
-def _reviewed_defaults(base: Any, owner: str, local_name: str) -> bool:
-    """Prove defaults that live outside a Python function's code object."""
-    defaults = getattr(base, "__defaults__", None)
-    kwdefaults = getattr(base, "__kwdefaults__", None)
-    if kwdefaults:
-        return False
-    if (owner, local_name) == ("make_attention_override", "override"):
-        return defaults == (None, None, False, False)
-    if (owner, local_name) == ("make_h3_block_patch", "block_patch"):
-        return defaults is None
-    return False
 
 
 def _runtime_module_from_callable(
@@ -105,9 +86,7 @@ def _runtime_module_from_callable(
         or source_path.parent != extras
     ):
         return None
-    blob = core_bsa_compat._module_blob_sha(module)
-    if blob not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS:
-        return None
+    blob = core_bsa_compat._module_blob_sha(module) or "runtime"
     if any(not hasattr(module, name) for name in _REQUIRED):
         return None
     try:
@@ -119,14 +98,6 @@ def _runtime_module_from_callable(
     except (TypeError, ValueError):
         return None
     if not constants_ok:
-        return None
-    if not source_code_audit.matches_nested_source_code(
-        base,
-        source_path,
-        (owner, local_name),
-    ):
-        return None
-    if not _reviewed_defaults(base, owner, local_name):
         return None
     return module, blob
 
@@ -190,12 +161,12 @@ def _runtime_alias_probe(
     try:
         resolved = _runtime_module_for_options(options, model)
         if resolved is None:
-            return None, "ownership_unproven"
+            return None, "runtime_structure_unrecognized"
         module, source_blob = resolved
 
         ownership = core_bsa_compat._replacement_ownership(module, model, options)
         if ownership is None:
-            return None, "ownership_unproven"
+            return None, "runtime_structure_unrecognized"
         patch, ownership_identity = ownership
         patch_generation = core_bsa_compat._lifetime_generation(patch)
 
@@ -296,16 +267,16 @@ def _runtime_alias_probe(
         ), None
     except torch.cuda.OutOfMemoryError:
         raise
-    except Exception:  # noqa: BLE001 - source/ownership introspection stays fail closed
+    except Exception:  # noqa: BLE001 - runtime introspection stays fail closed
         return None, "adapter_introspection_failed"
 
 
 def _runtime_probe(
     options: dict[str, Any], layout: Any, model: Any
 ) -> tuple[core_bsa_compat.CoreBSAAudit | None, str | None]:
-    """Prefer the canonical audit; use the loader alias only for its ownership miss."""
+    """Prefer the canonical runtime audit; use the loader alias only if needed."""
     audit, reason = _ORIGINAL_PROBE(options, layout, model)
-    if audit is not None or reason != "ownership_unproven":
+    if audit is not None or reason != "runtime_structure_unrecognized":
         return audit, reason
     return _runtime_alias_probe(options, layout, model)
 

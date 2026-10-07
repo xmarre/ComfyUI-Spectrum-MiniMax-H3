@@ -36,8 +36,6 @@ def _audited_nodes():
         import comfy_extras.nodes_sparse_attention as nodes
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"core BSA is unavailable in this reviewed ComfyUI fixture: {exc}")
-    if core_bsa_compat._module_blob_sha(nodes) not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS:
-        pytest.skip("this ComfyUI fixture is not the reviewed core BSA source")
     return nodes
 
 
@@ -148,7 +146,7 @@ def test_structural_bsa_evidence_fails_closed_after_override_replacement():
     options["optimized_attention_override"] = lambda *args, **kwargs: None
     assert core_bsa_compat.has_core_bsa_evidence(options)
     identity, safe = preflight(options, _layout(), model)
-    assert identity == ("core_bsa_unreported", "ownership_unproven")
+    assert identity == ("core_bsa_unreported", "runtime_structure_unrecognized")
     assert not safe
 
 
@@ -166,15 +164,15 @@ def test_explicit_provider_contract_keeps_precedence(monkeypatch):
     assert safe
 
 
-def test_unreviewed_core_bsa_source_fails_closed(monkeypatch):
+def test_core_bsa_source_digest_does_not_gate_runtime(monkeypatch):
     _nodes, model, _patch, options = _installation()
     monkeypatch.setattr(core_bsa_compat, "_module_blob_sha", lambda _module: "unreviewed")
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
-    assert audit is None
-    assert reason == "source_unreviewed"
+    assert reason is None and audit is not None and audit.safe
+    assert audit.source_blob == "unreviewed"
     identity, safe = preflight(options, _layout(), model)
-    assert identity == ("core_bsa_unreported", "source_unreviewed")
-    assert not safe
+    assert identity[0] == core_bsa_compat.ADAPTER_KEY
+    assert safe
 
 
 def test_missing_or_foreign_h3_replacement_fails_closed():
@@ -184,10 +182,10 @@ def test_missing_or_foreign_h3_replacement_fails_closed():
     ](args)
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
     assert audit is None
-    assert reason == "ownership_unproven"
+    assert reason == "runtime_structure_unrecognized"
 
 
-def test_stacked_bsa_ownership_fails_closed():
+def test_stacked_bsa_runtime_chain_stays_unrecognized():
     nodes, model, first_patch, first_options = _installation()
     first_override = first_options["optimized_attention_override"]
     second_patch = nodes.SparseAttnPatch(
@@ -217,7 +215,7 @@ def test_stacked_bsa_ownership_fails_closed():
     assert first_patch is not second_patch
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
     assert audit is None
-    assert reason == "ownership_unproven"
+    assert reason == "runtime_structure_unrecognized"
 
 
 def test_inherited_attention_owner_change_changes_policy_identity():
