@@ -7,8 +7,8 @@ sit below reviewed Flow block wrappers. The auditor therefore proves both
 wrapper layers before accepting backend history.
 
 This module does not accept arbitrary preprocess contracts. It recognizes only
-the reviewed Untwist source and requires Untwist's Spectrum runtime descriptor,
-then temporarily exposes the underlying BSA override to the source-gated
+the installed Untwist runtime shape and Spectrum runtime descriptor,
+then temporarily exposes the underlying BSA override to the structural
 BSA/Flow audit. Unknown preprocessors remain actual-only.
 """
 from __future__ import annotations
@@ -19,11 +19,7 @@ from typing import Any
 
 import torch
 
-from . import core_bsa_compat, core_bsa_flow_compat, source_code_audit
-
-AUDITED_UNTWIST_GIT_BLOBS = frozenset(
-    {"49a6eeda841a9dffe52974dceb3bce78bf02f25d"}
-)
+from . import core_bsa_compat, core_bsa_flow_compat
 _UNTWIST_TOPLEVEL_MODULE = "flux_untwist.patches"
 _UNTWIST_MODULE_SUFFIX = ".flux_untwist.patches"
 _UNTWIST_FACTORY = "make_minimax_h3_attention_override"
@@ -74,16 +70,7 @@ def _audited_untwist_preprocess(transform: Any) -> tuple[Any, ...] | None:
     module = _loaded_untwist_module(base)
     if module is None:
         return None
-    blob = core_bsa_compat._module_blob_sha(module)
-    if blob not in AUDITED_UNTWIST_GIT_BLOBS:
-        return None
-    source = getattr(module, "__file__", None)
-    if not isinstance(source, str) or not source_code_audit.matches_nested_source_code(
-        base,
-        Path(source),
-        (_UNTWIST_FACTORY, "preprocess"),
-    ):
-        return None
+    blob = core_bsa_compat._module_blob_sha(module) or "runtime"
     if getattr(base, "__defaults__", None) is not None:
         return None
     if getattr(base, "__kwdefaults__", None):
@@ -91,7 +78,8 @@ def _audited_untwist_preprocess(transform: Any) -> tuple[Any, ...] | None:
     closure = core_bsa_compat._closure_values(base)
     if closure != {}:
         return None
-    return ("untwist_h3_attention_preprocess_v1", blob)
+    return ("untwist_h3_attention_preprocess_v1", blob,
+            core_bsa_compat._lifetime_generation(base.__code__))
 
 
 def _untwist_runtime_identity(options: dict[str, Any]) -> tuple[Any, ...] | None:
@@ -141,11 +129,11 @@ def _unwrap_reviewed_untwist(
     ):
         return current, None, None
     if current is None:
-        return None, None, "ownership_unproven"
+        return None, None, "runtime_structure_unrecognized"
 
     contract = getattr(current, "attention_preprocess_v1", _MISSING)
     if not isinstance(contract, tuple) or len(contract) != 2:
-        return None, None, "ownership_unproven"
+        return None, None, "runtime_structure_unrecognized"
     transform, previous = contract
     preprocess_identity = _audited_untwist_preprocess(transform)
     if preprocess_identity is None:
@@ -156,7 +144,7 @@ def _unwrap_reviewed_untwist(
     if not core_bsa_compat._looks_like_core_bsa_callable(
         previous, "make_attention_override", "override"
     ):
-        return None, None, "ownership_unproven"
+        return None, None, "runtime_structure_unrecognized"
     return previous, (preprocess_identity, runtime_identity), None
 
 
@@ -260,7 +248,7 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
     if audit is None:
         return None, reason
 
-    # Underlying BSA/Flow ownership and numerical route are now proven. Add only
+    # Underlying BSA/Flow runtime structure and numerical route are recognized. Add only
     # the stable reviewed Untwist owner, then restore the real call-time provider
     # so receipt instrumentation still rejects a mid-forward owner change.
     audit.identity = (*audit.identity, ("outer_preprocess", preprocess_identity))

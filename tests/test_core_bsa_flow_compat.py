@@ -65,11 +65,6 @@ def _audited_nodes():
         import comfy_extras.nodes_sparse_attention as nodes
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"core BSA fixture unavailable: {exc}")
-    if (
-        core_bsa_compat._module_blob_sha(nodes)
-        not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS
-    ):
-        pytest.skip("ComfyUI fixture is not the reviewed core BSA source")
     return nodes
 
 
@@ -78,16 +73,6 @@ def _flow_modules():
         from h3_flow_regenerate import attention, mixed_grid
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"reviewed Flow fixture unavailable: {exc}")
-    if (
-        core_bsa_compat._module_blob_sha(attention)
-        not in core_bsa_flow_compat.AUDITED_FLOW_ATTENTION_GIT_BLOBS
-    ):
-        pytest.skip("Flow attention fixture is not the reviewed source")
-    if (
-        core_bsa_compat._module_blob_sha(mixed_grid)
-        not in core_bsa_flow_compat.AUDITED_FLOW_MIXED_GRID_GIT_BLOBS
-    ):
-        pytest.skip("Flow mixed-grid fixture is not the reviewed source")
     return attention, mixed_grid
 
 
@@ -293,9 +278,6 @@ def test_unknown_outer_block_wrapper_stays_fail_closed():
 
 def test_reviewed_mixed_grid_wrapper_uses_propagated_layout_and_exact_kv_sinks(monkeypatch):
     _attention, mixed_module = _flow_modules()
-    mixed_blob = core_bsa_compat._module_blob_sha(mixed_module)
-    if mixed_blob not in core_bsa_flow_compat._FLOW_MIXED_LAYOUT_PROPAGATED_BLOBS:
-        pytest.skip("Flow fixture predates canonical Mixed-Grid layout propagation")
 
     model, _patch, _override, options = _installation(sigma=0.5)
     monkeypatch.setattr(
@@ -353,7 +335,7 @@ def test_released_v033_effective_layout_preserves_its_zero_sink_semantics():
     assert normalized_mixed is not None
     effective = core_bsa_flow_compat._effective_mixed_layout(
         {
-            "source_blob": "8fc0f753ff2cd21fae898a4dd3c9ab1025f98443",
+            "layout_propagated": False,
             "mixed_seq": 140,
             "mixed_identity": normalized_mixed[1],
             "mixed_layout": mixed,
@@ -433,11 +415,6 @@ def test_untwist_plus_flow_wrapper_reaches_core_bsa_audit():
         from flux_untwist import patches as untwist_patches
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"reviewed Untwist fixture unavailable: {exc}")
-    if (
-        core_bsa_compat._module_blob_sha(untwist_patches)
-        not in core_bsa_preprocess_compat.AUDITED_UNTWIST_GIT_BLOBS
-    ):
-        pytest.skip("Untwist fixture is not the reviewed source")
     outer = untwist_patches.make_minimax_h3_attention_override(bsa_override)
     options["optimized_attention_override"] = outer
     options["minimax_h3_untwist_rope"] = {"enabled": True, "progress": 0.5}
@@ -455,3 +432,29 @@ def test_untwist_plus_flow_wrapper_reaches_core_bsa_audit():
     assert reason is None and audit is not None and audit.safe
     assert audit.current_override is outer
     assert hasattr(audit, "flow_wrapper_specs")
+
+def test_flow_revision_does_not_suppress_forecasts(monkeypatch):
+    model, _patch, _override, options = _installation()
+    options, _wrapper = _wrap_layout(options)
+    monkeypatch.setattr(core_bsa_compat, "_module_blob_sha", lambda _module: "unlisted")
+    audit, reason = core_bsa_flow_compat.probe(options, _layout(), model)
+    assert reason is None and audit is not None and audit.safe
+
+
+def test_mixed_revision_does_not_suppress_forecasts(monkeypatch):
+    model, _patch, _override, options = _installation()
+    options, carrier, _mixed = _wrap_mixed(options, model)
+    monkeypatch.setattr(core_bsa_compat, "_module_blob_sha", lambda _module: "unlisted")
+    audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
+    assert reason is None and audit is not None and audit.safe
+    assert audit.flow_mixed_layout_propagated is True
+    assert audit.seq_len == 140
+
+
+def test_invalid_mixed_layout_forwarding_remains_actual_only(monkeypatch):
+    model, _patch, _override, options = _installation(count=1)
+    options, carrier, _mixed = _wrap_mixed(options, model)
+    _attention, module = _flow_modules()
+    monkeypatch.setattr(module, "_mixed_transformer_options", lambda opts, layout: opts)
+    audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
+    assert audit is None and reason == "flow_wrapper_unreviewed"
