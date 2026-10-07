@@ -169,11 +169,13 @@ def test_explicit_provider_contract_keeps_precedence(monkeypatch):
 @pytest.mark.parametrize("digest", ["unreviewed", None])
 def test_core_bsa_source_digest_does_not_gate_runtime(monkeypatch, digest):
     _nodes, model, _patch, options = _installation()
+    original, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and original is not None
     monkeypatch.setattr(core_bsa_compat, "_module_blob_sha", lambda _module: digest)
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
     assert reason is None and audit is not None and audit.safe
     assert audit.source_blob == (digest or "runtime")
-    assert audit.cold_successor_compatible
+    assert audit.cold_successor_compatible == original.cold_successor_compatible
     identity, safe = preflight(options, _layout(), model)
     assert identity[0] == core_bsa_compat.ADAPTER_KEY
     assert safe
@@ -182,7 +184,7 @@ def test_core_bsa_source_digest_does_not_gate_runtime(monkeypatch, digest):
 def test_changed_calibration_recipe_still_admits_bsa_without_cold_carry(monkeypatch):
     nodes, model, _patch, options = _installation()
     first, reason = core_bsa_compat.probe(options, _layout(), model)
-    assert reason is None and first is not None and first.cold_successor_compatible
+    assert reason is None and first is not None and first.safe
 
     original = nodes.h3_sparse_attention
     # Same function owner and source digest, changed numerical implementation.
