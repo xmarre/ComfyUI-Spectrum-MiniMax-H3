@@ -19,7 +19,7 @@ from typing import Any
 
 import torch
 
-from . import core_bsa_compat, core_bsa_flow_compat
+from . import core_bsa_compat, core_bsa_flow_compat, source_code_audit
 _UNTWIST_TOPLEVEL_MODULE = "flux_untwist.patches"
 _UNTWIST_MODULE_SUFFIX = ".flux_untwist.patches"
 _UNTWIST_FACTORY = "make_minimax_h3_attention_override"
@@ -63,7 +63,7 @@ def _loaded_untwist_module(base: Any) -> Any | None:
 
 
 def _audited_untwist_preprocess(transform: Any) -> tuple[Any, ...] | None:
-    """Return a stable identity only for the exact reviewed Untwist preprocessor."""
+    """Recognize installed Untwist code and bind its execution identity."""
     base = getattr(transform, "__func__", transform)
     if getattr(base, "__qualname__", None) != _UNTWIST_PREPROCESS_QUALNAME:
         return None
@@ -71,6 +71,11 @@ def _audited_untwist_preprocess(transform: Any) -> tuple[Any, ...] | None:
     if module is None:
         return None
     blob = core_bsa_compat._module_blob_sha(module) or "runtime"
+    source = getattr(module, "__file__", None)
+    if not isinstance(source, str) or not source_code_audit.matches_nested_source_code(
+        base, Path(source), (_UNTWIST_FACTORY, "preprocess"),
+    ):
+        return None
     if getattr(base, "__defaults__", None) is not None:
         return None
     if getattr(base, "__kwdefaults__", None):

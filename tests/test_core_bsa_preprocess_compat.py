@@ -75,11 +75,6 @@ def _untwist_factory():
         from flux_untwist import patches
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"reviewed Untwist fixture is unavailable: {exc}")
-    if (
-        core_bsa_compat._module_blob_sha(patches)
-        not in core_bsa_preprocess_compat.AUDITED_UNTWIST_GIT_BLOBS
-    ):
-        pytest.skip("this Untwist fixture is not the reviewed v0.2.4 source")
     return patches.make_minimax_h3_attention_override
 
 

@@ -278,6 +278,9 @@ def test_unknown_outer_block_wrapper_stays_fail_closed():
 
 def test_reviewed_mixed_grid_wrapper_uses_propagated_layout_and_exact_kv_sinks(monkeypatch):
     _attention, mixed_module = _flow_modules()
+    code = core_bsa_compat._nested_code(mixed_module.mixed_diffusion_wrapper, "call")
+    if code is None or "_mixed_transformer_options" not in code.co_names:
+        pytest.skip("installed Flow uses the legacy carrier-layout path")
 
     model, _patch, _override, options = _installation(sigma=0.5)
     monkeypatch.setattr(
@@ -447,7 +450,11 @@ def test_mixed_revision_does_not_suppress_forecasts(monkeypatch):
     monkeypatch.setattr(core_bsa_compat, "_module_blob_sha", lambda _module: "unlisted")
     audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
     assert reason is None and audit is not None and audit.safe
-    assert audit.flow_mixed_layout_propagated is True
+    code = core_bsa_compat._nested_code(_flow_modules()[1].mixed_diffusion_wrapper, "call")
+    assert code is not None
+    assert audit.flow_mixed_layout_propagated is (
+        "_mixed_transformer_options" in code.co_names
+    )
     assert audit.seq_len == 140
 
 
@@ -455,6 +462,8 @@ def test_invalid_mixed_layout_forwarding_remains_actual_only(monkeypatch):
     model, _patch, _override, options = _installation(count=1)
     options, carrier, _mixed = _wrap_mixed(options, model)
     _attention, module = _flow_modules()
+    if not hasattr(module, "_mixed_transformer_options"):
+        pytest.skip("installed Flow uses the legacy carrier-layout path")
     monkeypatch.setattr(module, "_mixed_transformer_options", lambda opts, layout: opts)
     audit, reason = core_bsa_flow_compat.probe(options, carrier, model)
     assert audit is None and reason == "flow_wrapper_unreviewed"

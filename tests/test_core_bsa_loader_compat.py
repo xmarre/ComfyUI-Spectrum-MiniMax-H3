@@ -132,11 +132,6 @@ def test_runtime_path_loaded_bsa_under_reviewed_flow_wrapper(monkeypatch):
         from h3_flow_regenerate.metrics import H3FlowMetrics
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"reviewed Flow fixture unavailable: {exc}")
-    if (
-        core_bsa_compat._module_blob_sha(attention)
-        not in core_bsa_flow_compat.AUDITED_FLOW_ATTENTION_GIT_BLOBS
-    ):
-        pytest.skip("Flow attention fixture is not the reviewed source")
 
     key = ("double_block", 0)
     previous = options["patches_replace"]["dit"][key]

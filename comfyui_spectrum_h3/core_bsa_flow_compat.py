@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from . import core_bsa_compat
+from . import core_bsa_compat, source_code_audit
 
 _FLOW_ATTENTION_TOPLEVEL = "h3_flow_regenerate.attention"
 _FLOW_ATTENTION_SUFFIX = ".h3_flow_regenerate.attention"
@@ -77,6 +77,14 @@ def _loaded_source_module(
     return module, core_bsa_compat._module_blob_sha(module) or "runtime"
 
 
+def _source_matches(base: Any, module: Any, lexical_path: tuple[str, ...]) -> bool:
+    """Check live closure code against the installed source, not a revision hash."""
+    source = getattr(module, "__file__", None)
+    return isinstance(source, str) and source_code_audit.matches_nested_source_code(
+        base, Path(source), lexical_path,
+    )
+
+
 def _audited_layout_wrapper(
     wrapper: Any, index: int
 ) -> tuple[Any, tuple[Any, ...]] | None:
@@ -93,6 +101,8 @@ def _audited_layout_wrapper(
     if loaded is None:
         return None
     module, blob = loaded
+    if not _source_matches(base, module, ("make_layout_block_wrapper", "wrapper")):
+        return None
     if getattr(base, "__defaults__", None) is not None or getattr(base, "__kwdefaults__", None):
         return None
     closure = core_bsa_compat._closure_values(base)
@@ -252,6 +262,8 @@ def _audited_mixed_wrapper(
     if loaded is None:
         return None
     module, blob = loaded
+    if not _source_matches(base, module, ("mixed_diffusion_wrapper", "wrap", "call")):
+        return None
     if getattr(base, "__defaults__", None) is not None or getattr(base, "__kwdefaults__", None):
         return None
     closure = core_bsa_compat._closure_values(base)

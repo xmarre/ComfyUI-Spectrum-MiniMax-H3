@@ -92,6 +92,10 @@ def _flow_layout_review_diagnostic(wrapper: Any, index: int) -> str:
         return f"layout:parent={source_path.parent.name!r}"
 
     blob = core_bsa_compat._module_blob_sha(module)
+    if not core_bsa_flow_compat._source_matches(
+        base, module, ("make_layout_block_wrapper", "wrapper"),
+    ):
+        return f"layout:runtime_code_mismatch path={source_path}"
     if getattr(base, "__defaults__", None) is not None:
         return f"layout:defaults={getattr(base, '__defaults__', None)!r}"
     if getattr(base, "__kwdefaults__", None):
