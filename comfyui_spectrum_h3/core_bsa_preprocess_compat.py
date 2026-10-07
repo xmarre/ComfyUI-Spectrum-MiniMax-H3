@@ -141,11 +141,11 @@ def _unwrap_reviewed_untwist(
     ):
         return current, None, None
     if current is None:
-        return None, None, "ownership_unproven"
+        return None, None, "runtime_structure_unrecognized"
 
     contract = getattr(current, "attention_preprocess_v1", _MISSING)
     if not isinstance(contract, tuple) or len(contract) != 2:
-        return None, None, "ownership_unproven"
+        return None, None, "runtime_structure_unrecognized"
     transform, previous = contract
     preprocess_identity = _audited_untwist_preprocess(transform)
     if preprocess_identity is None:
@@ -156,7 +156,7 @@ def _unwrap_reviewed_untwist(
     if not core_bsa_compat._looks_like_core_bsa_callable(
         previous, "make_attention_override", "override"
     ):
-        return None, None, "ownership_unproven"
+        return None, None, "runtime_structure_unrecognized"
     return previous, (preprocess_identity, runtime_identity), None
 
 
@@ -260,7 +260,7 @@ def probe(options: dict[str, Any], layout: Any, model: Any):
     if audit is None:
         return None, reason
 
-    # Underlying BSA/Flow ownership and numerical route are now proven. Add only
+    # Underlying BSA/Flow runtime structure and numerical route are recognized. Add only
     # the stable reviewed Untwist owner, then restore the real call-time provider
     # so receipt instrumentation still rejects a mid-forward owner change.
     audit.identity = (*audit.identity, ("outer_preprocess", preprocess_identity))

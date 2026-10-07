@@ -435,6 +435,12 @@ A F A F A F A F A F A F A F A F A F A A
 
 That is 11 actual evaluations and 9 forecasts. Fallbacks, model-aware scheduling, replay, RES tail rules, force-actual conditions and saved workflow settings can change the exact schedule.
 
+## Core BlockSparseAttention compatibility
+
+Spectrum recognizes Core ComfyUI BSA from its live H3 block/attention chain, settings, layout, conditioning UUIDs and actual-call receipts. A changed or unavailable whole-file source digest does not disable forecasting. Live function code, defaults and numerical helper bindings contribute to history identity.
+
+The optional cold-to-primed history carry checks the active calibration recipe and exact post-cold tensor owners and bytes. A changed recipe takes an actual primed evaluation before rebuilding forecast history. Subsequent forecasting requires accepted receipts and stable route/calibration ownership. Debug preflight logs report `cold_carry_compatible`. Untwist and Flow retain their separate composition contracts.
+
 ## Model-aware modes
 
 `model_aware_mode` controls additional scheduling/correction logic:

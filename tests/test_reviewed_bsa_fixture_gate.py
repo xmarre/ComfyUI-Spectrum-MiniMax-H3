@@ -13,19 +13,18 @@ def _required() -> bool:
     return os.environ.get("SPECTRUM_REQUIRE_REVIEWED_BSA_FIXTURE") == "1"
 
 
-def test_required_reviewed_bsa_untwist_and_flow_fixtures_are_real():
+def test_required_core_bsa_runtime_and_reviewed_untwist_flow_fixtures_are_real():
     if not _required():
-        pytest.skip("reviewed BSA/Untwist/Flow fixture gate is enabled only for the pinned CI lane")
+        pytest.skip("BSA/Untwist/Flow fixture gate is enabled only for the pinned CI lane")
 
     try:
         import comfy_extras.nodes_sparse_attention as nodes
     except Exception as exc:  # noqa: BLE001
         pytest.fail(f"required reviewed core BSA fixture could not import: {exc}")
 
-    bsa_blob = core_bsa_compat._module_blob_sha(nodes)
-    assert bsa_blob in core_bsa_compat.AUDITED_BSA_GIT_BLOBS, (
-        f"required reviewed core BSA fixture digest mismatch: {bsa_blob}"
-    )
+    module, source_id = core_bsa_compat._load_audited_module()
+    assert module is nodes
+    assert isinstance(source_id, str) and source_id
 
     try:
         from flux_untwist import patches
