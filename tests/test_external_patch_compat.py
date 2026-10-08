@@ -823,6 +823,8 @@ def test_predict_noise_wrapper_transaction_parity_tripwire():
         'retry_decision["actual"] = True',
         "runtime.finalize_step(",
         "runtime.abort_step(",
+        "res4lyf_associate_model_call(",
+        "res4lyf_consume_model_result(",
     )
     for token in transaction_tokens:
         assert compat_source.count(token) == base_source.count(token), token
