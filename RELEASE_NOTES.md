@@ -1,3 +1,34 @@
+# Spectrum MiniMax H3 v0.2.29
+
+v0.2.29 restores Spectrum forecasting with compatible ComfyUI Core BlockSparseAttention, Flow and Untwist runtime revisions without relying on fixed whole-file source hashes. It also strengthens numerical-history identity and preserves the narrow cold-to-primed calibration carry contract.
+
+## Runtime compatibility across source revisions
+
+- Recognize the installed Core BSA H3 replacement and attention closures by their block/index ownership, shared patch, configured routes, layout, conditioning identity and actual-call receipts.
+- Treat whole-file source digests as diagnostic and identity information rather than an allowlist that disables ordinary forecasts whenever upstream changes unrelated source.
+- Track live function code, defaults, numerical helper bindings, calibration ownership and execution identity, so relevant runtime changes invalidate incompatible forecast history.
+- Recognize Flow's attention and mixed-grid wrappers and Untwist preprocessing using the installed runtime structure rather than pinned source revisions.
+- Detect whether the installed Flow forwarding helper propagates mixed layout, retaining the legacy carrier-layout behavior when appropriate.
+- Keep missing, ambiguous or stacked replacement chains, unknown wrapper structures, invalid routes and rejected actual-call receipts on the safe actual-evaluation path.
+
+## Cold-to-primed safety
+
+- Limit the optional adjacent cold-to-primed history carry to an active calibration/dispatch recipe whose live code semantics match an immutable reference compiled for the running Python version.
+- Require the exact post-cold calibration tensor owners and bytewise contents, including inference-mode tensors with no version counters, before carrying history across the transition.
+- When calibration logic or tensor state differs, execute the primed call normally and rebuild safe history from accepted actual calls; do not globally disable forecasting for a compatible BSA revision.
+- Treat optional proof snapshot/comparison CUDA allocation failures as failed carry proofs without discarding the accepted actual evaluation. Debug preflight includes `cold_carry_compatible`.
+
+## Verification and release scope
+
+- The PR #121 implementation passed all ten hosted compatibility test jobs, including live-code/source integrity coverage.
+- Focused tests against ComfyUI 0.38.0, comfy-kitchen 0.2.35 and comfy-aimdo 0.5.5 passed (124 focused checks); combined PR #117/#121 compatibility testing reported 178 passed and 2 CUDA skips. Both tested ComfyUI Patcher overlay orders produced the same resulting file tree.
+- PR #121 is independent of the still-unreleased RES4LYF sampler work in PR #117; no RES4LYF sampler features are included here.
+- GPU-side decoded H3 audio/video equivalence, broad upstream-source compatibility and the CUDA cost of calibration byte comparisons are not established by the hosted CPU test matrix. A user-reported successful production run is qualitative validation, not a benchmark or compatibility guarantee.
+
+Existing sampler equations, forecast schedules, PECE/SEEDS/SA-Solver policies and non-BSA fallback behavior are not intentionally changed.
+
+---
+
 # Spectrum MiniMax H3 v0.2.28
 
 v0.2.28 fixes reviewed-source auditing on Windows checkouts whose Git text conversion materializes Python files with CRLF line endings.

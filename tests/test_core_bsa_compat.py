@@ -1,4 +1,6 @@
 import hashlib
+import inspect
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -36,8 +38,6 @@ def _audited_nodes():
         import comfy_extras.nodes_sparse_attention as nodes
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"core BSA is unavailable in this reviewed ComfyUI fixture: {exc}")
-    if core_bsa_compat._module_blob_sha(nodes) not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS:
-        pytest.skip("this ComfyUI fixture is not the reviewed core BSA source")
     return nodes
 
 
@@ -148,7 +148,7 @@ def test_structural_bsa_evidence_fails_closed_after_override_replacement():
     options["optimized_attention_override"] = lambda *args, **kwargs: None
     assert core_bsa_compat.has_core_bsa_evidence(options)
     identity, safe = preflight(options, _layout(), model)
-    assert identity == ("core_bsa_unreported", "ownership_unproven")
+    assert identity == ("core_bsa_unreported", "runtime_structure_unrecognized")
     assert not safe
 
 
@@ -166,15 +166,77 @@ def test_explicit_provider_contract_keeps_precedence(monkeypatch):
     assert safe
 
 
-def test_unreviewed_core_bsa_source_fails_closed(monkeypatch):
+@pytest.mark.parametrize("digest", ["unreviewed", None])
+def test_core_bsa_source_digest_does_not_gate_runtime(monkeypatch, digest):
     _nodes, model, _patch, options = _installation()
-    monkeypatch.setattr(core_bsa_compat, "_module_blob_sha", lambda _module: "unreviewed")
+    original, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and original is not None
+    monkeypatch.setattr(core_bsa_compat, "_module_blob_sha", lambda _module: digest)
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
-    assert audit is None
-    assert reason == "source_unreviewed"
+    assert reason is None and audit is not None and audit.safe
+    assert audit.source_blob == (digest or "runtime")
+    assert audit.cold_successor_compatible == original.cold_successor_compatible
     identity, safe = preflight(options, _layout(), model)
-    assert identity == ("core_bsa_unreported", "source_unreviewed")
-    assert not safe
+    assert identity[0] == core_bsa_compat.ADAPTER_KEY
+    assert safe
+
+
+def test_changed_calibration_recipe_still_admits_bsa_without_cold_carry(monkeypatch):
+    nodes, model, _patch, options = _installation()
+    first, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and first is not None and first.safe
+
+    original = nodes.h3_sparse_attention
+    # Same function owner and source digest, changed numerical implementation.
+    source = inspect.getsource(original).replace(
+        "return attn.out_proj(out)", "return attn.out_proj(out) * (2 if first else 1)"
+    )
+    root = compile("from __future__ import annotations\nimport comfy_kitchen as ck\nimport torch\nimport comfy.model_management\nimport comfy.model_prefetch\n" + source, "<changed-calibration>", "exec", dont_inherit=True)
+    code = next(item for item in root.co_consts if getattr(item, "co_name", None) == "h3_sparse_attention")
+    monkeypatch.setattr(original, "__code__", code)
+    second, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and second is not None and second.safe
+    assert not second.cold_successor_compatible
+    assert first.identity != second.identity
+
+
+def test_replacement_code_change_invalidates_history_without_source_gate(monkeypatch):
+    _nodes, model, _patch, options = _installation()
+    first, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and first is not None
+    replacement = options["patches_replace"]["dit"][("double_block", 0)]
+    source = textwrap.dedent(inspect.getsource(_nodes.make_h3_block_patch)).replace(
+        'return extra["original_block"](args)',
+        'return {**extra["original_block"](args), "img": args["img"] * 2}',
+    )
+    root = compile("from __future__ import annotations\n" + source, "<changed-block>", "exec", dont_inherit=True)
+    factory_code = next(item for item in root.co_consts if getattr(item, "co_name", None) == "make_h3_block_patch")
+    code = next(item for item in factory_code.co_consts if getattr(item, "co_name", None) == "block_patch")
+    monkeypatch.setattr(replacement, "__code__", code)
+    second, reason = core_bsa_compat.probe(options, _layout(), model)
+    assert reason is None and second is not None and second.safe
+    assert first.identity != second.identity
+
+
+def test_callable_default_change_invalidates_identity():
+    def function(scale=1.0):
+        return scale
+
+    original = core_bsa_compat._callable_identity(function)
+    function.__defaults__ = (2.0,)
+    assert original != core_bsa_compat._callable_identity(function)
+
+
+def test_calibration_code_semantics_supports_pre_311_code_shape():
+    from comfyui_spectrum_h3 import source_code_audit
+
+    root = compile("def f(): return 1", "<code-shape>", "exec")
+    code = next(item for item in root.co_consts if getattr(item, "co_name", None) == "f")
+    legacy = SimpleNamespace(**{
+        name: getattr(code, name)
+        for name in dir(code) if name.startswith("co_") and name not in {"co_qualname", "co_lnotab"}
+    })
+    assert source_code_audit._code_semantics(legacy) == source_code_audit._code_semantics(code)
 
 
 def test_missing_or_foreign_h3_replacement_fails_closed():
@@ -184,10 +246,10 @@ def test_missing_or_foreign_h3_replacement_fails_closed():
     ](args)
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
     assert audit is None
-    assert reason == "ownership_unproven"
+    assert reason == "runtime_structure_unrecognized"
 
 
-def test_stacked_bsa_ownership_fails_closed():
+def test_stacked_bsa_runtime_chain_stays_unrecognized():
     nodes, model, first_patch, first_options = _installation()
     first_override = first_options["optimized_attention_override"]
     second_patch = nodes.SparseAttnPatch(
@@ -217,7 +279,7 @@ def test_stacked_bsa_ownership_fails_closed():
     assert first_patch is not second_patch
     audit, reason = core_bsa_compat.probe(options, _layout(), model)
     assert audit is None
-    assert reason == "ownership_unproven"
+    assert reason == "runtime_structure_unrecognized"
 
 
 def test_inherited_attention_owner_change_changes_policy_identity():

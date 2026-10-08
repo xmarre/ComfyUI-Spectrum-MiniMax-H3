@@ -67,8 +67,6 @@ def _audited_nodes():
         import comfy_extras.nodes_sparse_attention as nodes
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"core BSA is unavailable in this reviewed ComfyUI fixture: {exc}")
-    if core_bsa_compat._module_blob_sha(nodes) not in core_bsa_compat.AUDITED_BSA_GIT_BLOBS:
-        pytest.skip("this ComfyUI fixture is not the reviewed core BSA source")
     return nodes
 
 
@@ -77,11 +75,6 @@ def _untwist_factory():
         from flux_untwist import patches
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"reviewed Untwist fixture is unavailable: {exc}")
-    if (
-        core_bsa_compat._module_blob_sha(patches)
-        not in core_bsa_preprocess_compat.AUDITED_UNTWIST_GIT_BLOBS
-    ):
-        pytest.skip("this Untwist fixture is not the reviewed v0.2.4 source")
     return patches.make_minimax_h3_attention_override
 
 
@@ -226,7 +219,7 @@ def test_uncontracted_outer_attention_stays_fail_closed():
     options["optimized_attention_override"] = outer
     audit, reason = core_bsa_preprocess_compat.probe(options, _layout(), model)
     assert audit is None
-    assert reason == "ownership_unproven"
+    assert reason == "runtime_structure_unrecognized"
 
 
 def test_unknown_preprocess_contract_stays_fail_closed():

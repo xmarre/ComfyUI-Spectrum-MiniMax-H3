@@ -1,4 +1,4 @@
-"""Source-gated recovery of Spectrum forecasts across core-BSA cold->primed transitions.
+"""Calibration-contract recovery across core-BSA cold->primed transitions.
 
 CUDA diagnostics proved that ComfyUI core BlockSparseAttention's cold sparse call
 creates the exact calibration tensor owners consumed by the adjacent primed call.
@@ -20,6 +20,8 @@ from functools import wraps
 import logging
 from typing import Any
 
+import torch
+
 from .backend_history import BackendHistory
 
 LOG = logging.getLogger(__name__)
@@ -40,7 +42,7 @@ class _ColdSuccessorProof:
     seq_len: int
     uuids: tuple[Any, ...]
     sparse_blocks: tuple[int, ...]
-    owners: tuple[tuple[Any, Any], ...]
+    owners: tuple[tuple[Any, Any, Any, Any], ...]
 
 
 def _semantic_identity(identity: Any) -> Any:
@@ -70,6 +72,7 @@ def _capture_transition_proof(runtime, run_id: int, step_id: int, audit, receipt
     if (
         audit is None
         or not audit.safe
+        or not getattr(audit, "cold_successor_compatible", False)
         or not core_bsa_compat.accepts_actual(audit, receipts)
         or runtime._backend_history.policy != audit.identity
         or not runtime._backend_history.forecast_safe
@@ -96,7 +99,12 @@ def _capture_transition_proof(runtime, run_id: int, step_id: int, audit, receipt
         )
         if entry[0] != "present":
             return
-        owners.append((entry[1], entry[2]))
+        try:
+            owners.append((entry[1], entry[2], entry[1].detach().clone(), entry[2].detach().clone()))
+        except torch.cuda.OutOfMemoryError:
+            # The accepted actual is still valid; this optional optimization must
+            # not abort sampling when there is no room for calibration snapshots.
+            return
 
     runtime._core_bsa_cold_successor_proof = _ColdSuccessorProof(
         run_id=int(run_id),
@@ -129,6 +137,7 @@ def _prove_forecast_carry(runtime, run_id: int, step_id: int, audit, identity, s
     if (
         audit is None
         or not audit.safe
+        or not getattr(audit, "cold_successor_compatible", False)
         or audit.patch is not proof.patch
         or int(audit.patch_generation) != proof.patch_generation
         or str(audit.source_blob) != proof.source_blob
@@ -151,6 +160,7 @@ def _prove_forecast_carry(runtime, run_id: int, step_id: int, audit, identity, s
         _clear_transition_proof(runtime)
         return False
 
+    byte_checks = {}
     for index, owners in zip(sparse, proof.owners):
         entry = core_bsa_compat._pool_entry(
             audit.patch,
@@ -164,6 +174,26 @@ def _prove_forecast_carry(runtime, run_id: int, step_id: int, audit, identity, s
         ):
             _clear_transition_proof(runtime)
             return False
+        for tensor, saved in zip(entry[1:3], owners[2:4]):
+            # Inference tensors have no version counter. Compare bytes, including
+            # NaN payloads, and synchronize only once per device below.
+            if tensor.device != saved.device:
+                _clear_transition_proof(runtime)
+                return False
+            try:
+                match = (tensor.contiguous().view(torch.uint8) == saved.contiguous().view(torch.uint8)).all()
+            except torch.cuda.OutOfMemoryError:
+                _clear_transition_proof(runtime)
+                return False
+            byte_checks.setdefault(tensor.device, []).append(match)
+
+    try:
+        unchanged = all(bool(torch.stack(checks).all().item()) for checks in byte_checks.values())
+    except torch.cuda.OutOfMemoryError:
+        unchanged = False
+    if not unchanged:
+        _clear_transition_proof(runtime)
+        return False
 
     old = runtime._backend_history
     if old.policy is None or old.receipt is None or not old.forecast_safe:
@@ -183,7 +213,7 @@ def _prove_forecast_carry(runtime, run_id: int, step_id: int, audit, identity, s
     if runtime.config.debug:
         LOG.warning(
             "Spectrum H3 core-BSA history carry run_id=%s step=%s "
-            "transition=cold->primed proof=adjacent_exact_calibration_tensor_owners",
+            "transition=cold->primed proof=adjacent_exact_calibration_state",
             run_id,
             step_id,
         )
