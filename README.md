@@ -14,6 +14,13 @@ Spectrum is an **approximate accelerator**. Forecasted steps change the denoisin
 
 ## Recent releases
 
+### v0.2.29 — Core BSA/Flow/Untwist runtime compatibility
+
+- Removes frozen whole-file source revision gates for ordinary Core BSA, Flow and Untwist forecasting while retaining live chain ownership, route checks and accepted actual-call receipts.
+- Binds live numerical code, defaults, helper implementations and calibration state to forecast history; only a validated matching calibration recipe and byte-identical tensors qualify cold-to-primed carry.
+- Unknown or changed behavior remains actual-only until proven, rather than silently accepting incompatible history. PR #117's RES4LYF sampler extension is not part of this release.
+
+
 Full release details are kept in [RELEASE_NOTES.md](RELEASE_NOTES.md) and the GitHub release pages.
 
 ### v0.2.23 — Active SA-Solver PECE + RefDelta multi-backend composition
@@ -434,6 +441,12 @@ A F A F A F A F A F A F A F A F A F A A
 ```
 
 That is 11 actual evaluations and 9 forecasts. Fallbacks, model-aware scheduling, replay, RES tail rules, force-actual conditions and saved workflow settings can change the exact schedule.
+
+## Core BlockSparseAttention compatibility
+
+Spectrum recognizes Core ComfyUI BSA from its live H3 block/attention chain, settings, layout, conditioning UUIDs and actual-call receipts. A changed or unavailable whole-file source digest does not disable forecasting. Live function code, defaults and numerical helper bindings contribute to history identity.
+
+The optional cold-to-primed history carry checks the active calibration recipe and exact post-cold tensor owners and bytes. A changed recipe takes an actual primed evaluation before rebuilding forecast history. Subsequent forecasting requires accepted receipts and stable route/calibration ownership. Debug preflight logs report `cold_carry_compatible`. Untwist and Flow use live wrapper structure rather than source-hash allowlists. Mixed-grid layout propagation is detected from the installed forwarding helper, preserving legacy carrier-layout semantics. Unknown wrapper structures and invalid receipts remain actual-only.
 
 ## Model-aware modes
 

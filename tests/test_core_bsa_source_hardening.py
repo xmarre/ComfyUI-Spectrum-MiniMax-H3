@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from comfyui_spectrum_h3 import core_bsa_compat, core_bsa_preprocess_compat
+from comfyui_spectrum_h3 import core_bsa_preprocess_compat
 
 
 def _audited_untwist_module():
@@ -10,11 +10,6 @@ def _audited_untwist_module():
         from flux_untwist import patches
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"reviewed Untwist fixture unavailable: {exc}")
-    if (
-        core_bsa_compat._module_blob_sha(patches)
-        not in core_bsa_preprocess_compat.AUDITED_UNTWIST_GIT_BLOBS
-    ):
-        pytest.skip("Untwist fixture is not the reviewed source")
     return patches
 
 
