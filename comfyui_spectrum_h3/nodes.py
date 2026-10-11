@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 
 from .config import SpectrumH3Config
-from .minimax_h3 import install_h3_wrapper, require_native_minimax_h3
+from .keyless_compat import (
+    require_spectrum_minimax_h3 as require_native_minimax_h3,
+)
+from .minimax_h3 import install_h3_wrapper
 from .objective_media_nodes import (
     NODE_CLASS_MAPPINGS as OBJECTIVE_NODE_CLASS_MAPPINGS,
 )
