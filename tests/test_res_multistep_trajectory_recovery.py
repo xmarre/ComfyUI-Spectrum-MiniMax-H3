@@ -38,6 +38,7 @@ def _native_res_multistep():
             next_sigma,
             torch.zeros_like(next_sigma),
         ),
+        "to_d": lambda x, sigma, denoised: (x - denoised) / sigma,
     }
     exec(compile(module, str(path), "exec"), namespace)  # noqa: S102
     return namespace["res_multistep"]
