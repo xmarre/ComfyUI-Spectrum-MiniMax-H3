@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -400,7 +402,15 @@ def test_node_clones_runtime_and_only_all_actual_disables_replay():
 def test_report_comparison_checks_same_state_and_rejects_mismatched_schedule(
     tmp_path, monkeypatch
 ):
-    from tools.analyze_res_investigation import compare_reports
+    analyzer_path = (
+        Path(__file__).resolve().parents[1] / "tools/analyze_res_investigation.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "spectrum_res_analyzer", analyzer_path
+    )
+    analyzer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(analyzer)
+    compare_reports = analyzer.compare_reports
 
     paths = ModuleType("folder_paths")
     paths.get_output_directory = lambda: str(tmp_path)
