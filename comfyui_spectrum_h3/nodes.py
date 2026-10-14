@@ -12,6 +12,7 @@ from .objective_media_nodes import (
 )
 from .runtime import SpectrumH3Runtime
 from .sampling import install_sampler_wrappers
+from .res_investigation import SpectrumRESInvestigation
 
 LOG = logging.getLogger(__name__)
 
@@ -399,10 +400,12 @@ class SpectrumApplyMiniMaxH3:
 
 NODE_CLASS_MAPPINGS = {
     "SpectrumApplyMiniMaxH3": SpectrumApplyMiniMaxH3,
+    "SpectrumRESInvestigation": SpectrumRESInvestigation,
     **OBJECTIVE_NODE_CLASS_MAPPINGS,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SpectrumApplyMiniMaxH3": "Spectrum Apply MiniMax H3",
+    "SpectrumRESInvestigation": "Spectrum RES Investigation",
     **OBJECTIVE_NODE_DISPLAY_NAME_MAPPINGS,
 }
 

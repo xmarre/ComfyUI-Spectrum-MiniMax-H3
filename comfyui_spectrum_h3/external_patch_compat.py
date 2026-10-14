@@ -1139,9 +1139,11 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
                 )
             return result
 
+    from .res_investigation import maybe_replace, record
     try:
         try:
             result = execute_attempt(decision)
+            result = maybe_replace(runtime, decision, result, execute_attempt)
             _log_effective_step(runtime, decision)
             runtime.log_offline_transition(
                 "actual_executor_return" if decision["actual"] else "forecast_executor_return",
@@ -1150,6 +1152,7 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
             )
             result = consume_er_sde_increment(result, decision)
             runtime.finalize_step(decision["run_id"], decision["step_id"])
+            record(runtime, decision, x, result)
             return result
         except sampling.ForecastRetryActual as retry:
             runtime.prepare_actual_retry(
@@ -1175,6 +1178,7 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
             )
             result = consume_er_sde_increment(result, retry_decision)
             runtime.finalize_step(decision["run_id"], decision["step_id"])
+            record(runtime, retry_decision, x, result)
             return result
     except BaseException:
         if runtime.active_step_id == decision["step_id"]:

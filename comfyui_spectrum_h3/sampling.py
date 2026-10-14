@@ -2550,7 +2550,14 @@ def outer_sample_wrapper(
                 not (stochastic_seeds or stochastic_sa or active_pece),
             )
         started = time.perf_counter()
+        result = None
+        succeeded = False
         try:
+            from .res_investigation import begin as begin_res_investigation
+            begin_res_investigation(
+                runtime, getattr(guider, "model_options", {}) or {},
+                run_sigmas, sampler, phase, seed, latent_shapes, run_mask is not None,
+            )
             result = executor(
                 run_noise,
                 run_latent,
@@ -2562,6 +2569,7 @@ def outer_sample_wrapper(
                 seed,
                 latent_shapes=latent_shapes,
             )
+            succeeded = True
             runtime.log_offline_transition(
                 "first_pass_executor_return" if phase == "offline_first_pass" else "executor_return",
                 phase=phase,
@@ -2570,6 +2578,8 @@ def outer_sample_wrapper(
             )
             return result
         finally:
+            from .res_investigation import finish as finish_res_investigation
+            finish_res_investigation(runtime, result, succeeded)
             if runtime.config.debug:
                 LOG.warning(
                     "Spectrum H3 run summary phase=%s wall_s=%.3f %s",
@@ -2914,9 +2924,11 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 )
             return result
 
+    from .res_investigation import maybe_replace, record
     try:
         try:
             result = execute_attempt(decision)
+            result = maybe_replace(runtime, decision, result, execute_attempt)
             runtime.log_offline_transition(
                 "actual_executor_return" if decision["actual"] else "forecast_executor_return",
                 run_id=decision["run_id"],
@@ -2924,6 +2936,7 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
             )
             result = consume_er_sde_increment(result, decision)
             runtime.finalize_step(decision["run_id"], decision["step_id"])
+            record(runtime, decision, x, result)
             return result
         except ForecastRetryActual as retry:
             runtime.prepare_actual_retry(
@@ -2948,6 +2961,7 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
             )
             result = consume_er_sde_increment(result, retry_decision)
             runtime.finalize_step(decision["run_id"], decision["step_id"])
+            record(runtime, retry_decision, x, result)
             return result
     except BaseException:
         if runtime.active_step_id == decision["step_id"]:
