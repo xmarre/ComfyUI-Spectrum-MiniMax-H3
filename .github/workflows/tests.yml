@@ -148,6 +148,7 @@ jobs:
             comfyui_spectrum_h3/nodes.py \
             comfyui_spectrum_h3/postrun_safety.py \
             comfyui_spectrum_h3/runtime.py \
+            comfyui_spectrum_h3/res_investigation.py \
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
             tests/test_backend_history.py \
@@ -187,11 +188,14 @@ jobs:
             tests/test_postrun_safety.py \
             tests/test_refdelta_interop.py \
             tests/test_runtime.py \
+            tests/test_res_investigation.py \
+            tests/test_res_multistep_trajectory_recovery.py \
             tests/test_sampler_contract.py \
             tests/test_sampling.py \
             tests/test_tiled_diffusion_ksampler_contract.py \
             tests/conftest.py \
             tools/analyze_generic_correction.py \
+            tools/analyze_res_investigation.py \
             --ignore N999,I001,C408,UP035
           python -m compileall -q comfyui_spectrum_h3 tests tools
 

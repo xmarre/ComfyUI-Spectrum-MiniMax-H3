@@ -262,6 +262,8 @@ Forecasting is fail-closed and allowlisted for reviewed sampler contracts.
 
 RES keeps the one-exact-evaluation post-forecast refresh because native RES carries `old_denoised` into the following second-order update. That recurrence safeguard is independent of the final tail. RES no longer raises `tail_actual_steps` internally: the configured final tail remains authoritative, while Continuum prefixes, warmup, external-patch transitions, fallbacks, and other force-actual conditions continue to apply independently.
 
+The refresh limits forecast history lifetime; it does not rewind the latent state or guarantee trajectory recovery. The optional [native RES GPU investigation](docs/RES_GPU_INVESTIGATION.md) measures same-state denoised error and a selected-forecast actual replacement.
+
 Unknown or changed sampler contracts fall back to native execution rather than guessing.
 
 ### RefDelta sampler-family composition
@@ -616,6 +618,8 @@ No speculative `torch.cuda.empty_cache()` or forced device synchronization is pe
 | `selective_rollback_correction` | `false` | Experimental deterministic-Euler rollback path; single-pass only. |
 
 ## Research / objective media nodes
+
+`Spectrum RES Investigation` under `Spectrum/MiniMax H3/Research` traces native deterministic RES or replaces one selected forecast with an exact model evaluation. It saves numerical reports and latent checkpoints only when added to a workflow. See the [GPU test protocol](docs/RES_GPU_INVESTIGATION.md) for modes, output files, and capture/replay interpretation.
 
 The package also contains research-only nodes under `sampling/spectrum/research` for bounded R/A/B decoded-media evaluation and reset/staging helpers. They do nothing unless explicitly added to a workflow.
 
