@@ -12,52 +12,88 @@ from comfyui_spectrum_h3 import res_investigation as investigation
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.runtime import ForecastRetryActual, SpectrumH3Runtime
 from comfyui_spectrum_h3.sampling import (
-    ACTUAL_KEY, BINDING_KEY, RUN_ID_KEY, STEP_ID_KEY, SpectrumH3Binding,
+    ACTUAL_KEY,
+    BINDING_KEY,
+    RUN_ID_KEY,
+    STEP_ID_KEY,
+    SpectrumH3Binding,
     predict_noise_wrapper,
+    outer_sample_wrapper,
 )
 from test_res_multistep_trajectory_recovery import _native_res_multistep
 
 
-@pytest.mark.parametrize("sigmas", [
-    torch.linspace(1, 0, 26, dtype=torch.float64),
-    torch.tensor([1.0, .8, .51, .17, .02, 0], dtype=torch.float32),
-    torch.tensor([1.0, .7, .5, .2], dtype=torch.float64),
-])
+@pytest.mark.parametrize(
+    "sigmas",
+    [
+        torch.linspace(1, 0, 26, dtype=torch.float64),
+        torch.tensor([1.0, 0.8, 0.51, 0.17, 0.02, 0], dtype=torch.float32),
+        torch.tensor([1.0, 0.7, 0.5, 0.2], dtype=torch.float64),
+    ],
+)
 def test_coefficients_match_installed_native_updates(sigmas):
     native = _native_res_multistep()
     coefficients = investigation.res_coefficients(sigmas)
     inputs, denoised = [], []
     model_sampling = SimpleNamespace(noise_scale=1)
+
     def model(x, sigma, **kwargs):
         inputs.append(x.clone())
-        y = .3 * x + .1 * x.square()
+        y = 0.3 * x + 0.1 * x.square()
         denoised.append(y)
         return y
-    model.inner_model = SimpleNamespace(model_patcher=SimpleNamespace(
-        get_model_object=lambda name: model_sampling))
-    output = native(model, torch.ones(1, dtype=sigmas.dtype), sigmas, eta=0, cfg_pp=False,
-                    s_noise=0, disable=True, noise_sampler=lambda a, b: torch.zeros(1))
+
+    model.inner_model = SimpleNamespace(
+        model_patcher=SimpleNamespace(get_model_object=lambda name: model_sampling)
+    )
+    output = native(
+        model,
+        torch.ones(1, dtype=sigmas.dtype),
+        sigmas,
+        eta=0,
+        cfg_pp=False,
+        s_noise=0,
+        disable=True,
+        noise_sampler=lambda a, b: torch.zeros(1),
+    )
     for i, row in enumerate(coefficients):
-        expected = inputs[i] * row["state_coefficient"] + denoised[i] * row["current_denoised_coefficient"]
+        expected = (
+            inputs[i] * row["state_coefficient"]
+            + denoised[i] * row["current_denoised_coefficient"]
+        )
         if i:
             expected += denoised[i - 1] * row["previous_denoised_coefficient"]
         target = inputs[i + 1] if i + 1 < len(inputs) else output
         torch.testing.assert_close(target, expected)
 
 
-@pytest.mark.parametrize("sigmas", [
-    [1, .5, .5, 0], [1, 0, 0], [1, float("nan"), 0], [0, -1], [1, 2, 0],
-])
+@pytest.mark.parametrize(
+    "sigmas",
+    [
+        [1, 0.5, 0.5, 0],
+        [1, 0, 0],
+        [1, float("nan"), 0],
+        [0, -1],
+        [1, 2, 0],
+    ],
+)
 def test_invalid_schedule_is_explicit(sigmas):
     with pytest.raises(ValueError, match="RES investigation"):
         investigation.res_coefficients(torch.tensor(sigmas, dtype=torch.float32))
 
 
 def _runtime():
-    runtime = SpectrumH3Runtime(SpectrumH3Config(
-        offline_smoothing_replay=False, flex_window=0, window_size=2, debug=False))
-    run_id = runtime.start_run(torch.tensor([1., .7, .4, 0]), "sample_res_multistep",
-                               supported_sampler=True, min_actual_steps_after_forecast=1)
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            offline_smoothing_replay=False, flex_window=0, window_size=2, debug=False
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.7, 0.4, 0]),
+        "sample_res_multistep",
+        supported_sampler=True,
+        min_actual_steps_after_forecast=1,
+    )
     return runtime, run_id
 
 
@@ -67,13 +103,17 @@ def _probe(runtime, mode="replace_selected", phase="single_pass"):
     probe.settings = {"mode": mode, "selected_step": 1, "label": "test"}
     probe.phase = phase
     probe.latent_shapes = [(1, 1, 1, 1, 2), (1, 1, 1, 2)]
-    probe.coefficients = investigation.res_coefficients(torch.tensor([1., .7, .4, 0]))
+    probe.coefficients = investigation.res_coefficients(
+        torch.tensor([1.0, 0.7, 0.4, 0])
+    )
     probe.checkpoints = {}
     probe.rows = []
     probe.started = 0
     probe.replacements = 0
+    probe.discarded_forecast_model_calls = 0
     probe.selected_status = "not_reached"
     probe.pending_error = None
+    probe.selected_input = None
     probe.report = {"steps": probe.rows}
     runtime._res_investigation = probe
     return probe
@@ -81,7 +121,9 @@ def _probe(runtime, mode="replace_selected", phase="single_pass"):
 
 class _Executor:
     def __init__(self, runtime, fail_forecast=False, fail_actual=False):
-        self.class_obj = SimpleNamespace(model_options={BINDING_KEY: SpectrumH3Binding(runtime)})
+        self.class_obj = SimpleNamespace(
+            model_options={BINDING_KEY: SpectrumH3Binding(runtime)}
+        )
         self.runtime = runtime
         self.fail_forecast = fail_forecast
         self.fail_actual = fail_actual
@@ -90,19 +132,24 @@ class _Executor:
     def __call__(self, x, timestep, options, seed):
         t = options["transformer_options"]
         call_id, actual = self.runtime.begin_model_call(
-            t[RUN_ID_KEY], t[STEP_ID_KEY], topology=("fixed",), labels=("positive",),
-            expected_shape=(1, 4, 1))
+            t[RUN_ID_KEY],
+            t[STEP_ID_KEY],
+            topology=(("target_audio_rows", 2), ("target_video_rows", 2)),
+            labels=("positive",),
+            expected_shape=(1, 4, 1),
+        )
         self.modes.append(actual)
         if actual:
             if self.fail_actual and t[STEP_ID_KEY] == 1:
                 raise RuntimeError("actual failed")
-            feature = (0.3 * x.reshape(1, 4, 1) + .1 * x.reshape(1, 4, 1).square())
+            feature = 0.3 * x.reshape(1, 4, 1) + 0.1 * x.reshape(1, 4, 1).square()
             self.runtime.observe_actual(t[RUN_ID_KEY], t[STEP_ID_KEY], call_id, feature)
             return feature.reshape_as(x)
         if self.fail_forecast:
             raise ForecastRetryActual("synthetic retry")
-        predicted = self.runtime.predict(t[RUN_ID_KEY], t[STEP_ID_KEY], call_id,
-                                         device=x.device, dtype=x.dtype)
+        predicted = self.runtime.predict(
+            t[RUN_ID_KEY], t[STEP_ID_KEY], call_id, device=x.device, dtype=x.dtype
+        )
         assert not t[ACTUAL_KEY]
         return predicted.reshape_as(x)
 
@@ -113,9 +160,9 @@ def test_selected_replacement_commits_only_exact_history_and_counts_once(phase):
     probe = _probe(runtime, phase=phase)
     executor = _Executor(runtime)
     x = torch.ones(1, 1, 4)
-    predict_noise_wrapper(executor, x, torch.tensor([1.]), {}, 7)
-    result = predict_noise_wrapper(executor, x + 1, torch.tensor([.7]), {}, 7)
-    expected = .3 * (x + 1) + .1 * (x + 1).square()
+    predict_noise_wrapper(executor, x, torch.tensor([1.0]), {}, 7)
+    result = predict_noise_wrapper(executor, x + 1, torch.tensor([0.7]), {}, 7)
+    expected = 0.3 * (x + 1) + 0.1 * (x + 1).square()
     torch.testing.assert_close(result, expected)
     assert executor.modes == [True, False, True]
     assert runtime.stats.actual_steps == 2 and runtime.stats.forecast_steps == 0
@@ -126,7 +173,7 @@ def test_selected_replacement_commits_only_exact_history_and_counts_once(phase):
     assert set(probe.rows[1]["same_state_forecast_error"]) == {"video", "audio"}
     assert probe.rows[1]["same_state_forecast_error"]["video"]["rmse"] > 0
     # The final actual refresh must see an actual anchor, never the forecast.
-    predict_noise_wrapper(executor, x, torch.tensor([.4]), {}, 7)
+    predict_noise_wrapper(executor, x, torch.tensor([0.4]), {}, 7)
     assert len(probe.rows) == 3
     runtime.end_run(run_id)
 
@@ -136,11 +183,16 @@ def test_trace_has_no_extra_executor_calls_or_output_change():
         runtime, run_id = _runtime()
         probe = _probe(runtime, mode="trace") if probed else None
         executor = _Executor(runtime)
-        outputs = [predict_noise_wrapper(executor, torch.ones(1, 1, 4), torch.tensor([s]), {}, 7)
-                   for s in [1., .7, .4]]
+        outputs = [
+            predict_noise_wrapper(
+                executor, torch.ones(1, 1, 4), torch.tensor([s]), {}, 7
+            )
+            for s in [1.0, 0.7, 0.4]
+        ]
         summary = runtime.debug_summary()
         runtime.end_run(run_id)
         return outputs, executor.modes, summary, probe
+
     plain, modes, summary, _ = run(False)
     traced, traced_modes, traced_summary, probe = run(True)
     for a, b in zip(plain, traced, strict=True):
@@ -153,7 +205,7 @@ def test_trace_has_no_extra_executor_calls_or_output_change():
 def test_failed_forecast_uses_existing_retry_without_unbound_hook():
     runtime, run_id = _runtime()
     executor = _Executor(runtime, fail_forecast=True)
-    for s in [1., .7]:
+    for s in [1.0, 0.7]:
         predict_noise_wrapper(executor, torch.ones(1, 1, 4), torch.tensor([s]), {}, 7)
     assert executor.modes == [True, False, True]
     runtime.end_run(run_id)
@@ -163,11 +215,63 @@ def test_failed_intervention_aborts_active_step():
     runtime, run_id = _runtime()
     _probe(runtime)
     executor = _Executor(runtime, fail_actual=True)
-    predict_noise_wrapper(executor, torch.ones(1, 1, 4), torch.tensor([1.]), {}, 7)
+    predict_noise_wrapper(executor, torch.ones(1, 1, 4), torch.tensor([1.0]), {}, 7)
     with pytest.raises(RuntimeError, match="actual failed"):
-        predict_noise_wrapper(executor, torch.ones(1, 1, 4), torch.tensor([.7]), {}, 7)
+        predict_noise_wrapper(executor, torch.ones(1, 1, 4), torch.tensor([0.7]), {}, 7)
     assert runtime.active_step_id is None
     runtime.end_run(run_id)
+
+
+@pytest.mark.parametrize("mutate_actual", [False, True])
+def test_input_mutation_cannot_be_reported_as_same_state_error(mutate_actual):
+    runtime, run_id = _runtime()
+    probe = _probe(runtime)
+
+    class MutatingExecutor(_Executor):
+        def __call__(self, x, timestep, options, seed):
+            result = super().__call__(x, timestep, options, seed)
+            t = options["transformer_options"]
+            if t[STEP_ID_KEY] == 1 and t[ACTUAL_KEY] == mutate_actual:
+                x.add_(1)
+            return result
+
+    executor = MutatingExecutor(runtime)
+    x = torch.ones(1, 1, 4)
+    predict_noise_wrapper(executor, x, torch.tensor([1.0]), {}, 7)
+    with pytest.raises(RuntimeError, match="input was mutated"):
+        predict_noise_wrapper(executor, x, torch.tensor([0.7]), {}, 7)
+    assert runtime.active_step_id is None and probe.replacements == 0
+    runtime.end_run(run_id)
+
+
+def test_diagnostic_cancellation_still_ends_outer_runtime(monkeypatch):
+    runtime = SpectrumH3Runtime(SpectrumH3Config(offline_smoothing_replay=False))
+    guider = SimpleNamespace(model_options={BINDING_KEY: SpectrumH3Binding(runtime)})
+
+    def sample_euler():
+        pass
+
+    sampler = SimpleNamespace(sampler_function=sample_euler)
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            return torch.ones(1)
+
+    def cancel(*args):
+        raise KeyboardInterrupt("cancelled diagnostic")
+
+    monkeypatch.setattr(investigation, "finish", cancel)
+    with pytest.raises(KeyboardInterrupt, match="cancelled diagnostic"):
+        outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            sampler,
+            torch.tensor([1.0, 0.5, 0]),
+        )
+    assert runtime.active_run_id is None
 
 
 def test_checkpoint_roundtrip_and_failure_cleanup(tmp_path, monkeypatch):
@@ -177,7 +281,7 @@ def test_checkpoint_roundtrip_and_failure_cleanup(tmp_path, monkeypatch):
     runtime, run_id = _runtime()
     probe = _probe(runtime)
     executor = _Executor(runtime)
-    for s in [1., .7]:
+    for s in [1.0, 0.7]:
         predict_noise_wrapper(executor, torch.ones(1, 1, 4), torch.tensor([s]), {}, 7)
     investigation.finish(runtime, torch.ones(1, 1, 4), True)
     reports = list(tmp_path.rglob("*.json"))
@@ -185,7 +289,12 @@ def test_checkpoint_roundtrip_and_failure_cleanup(tmp_path, monkeypatch):
     report = json.loads(reports[0].read_text())
     assert report["completed"] and report["replacement_count"] == 1
     tensors = load_file(str(reports[0].with_name(report["tensor_file"])))
-    assert {"selected_forecast", "selected_exact", "final_audio", "final_video"} <= tensors.keys()
+    assert {
+        "selected_forecast",
+        "selected_exact",
+        "final_audio",
+        "final_video",
+    } <= tensors.keys()
     assert not probe.checkpoints and runtime._res_investigation is None
     # A failed report write also releases retained CPU tensors.
     probe = _probe(runtime)
@@ -198,23 +307,143 @@ def test_checkpoint_roundtrip_and_failure_cleanup(tmp_path, monkeypatch):
 
 def test_native_all_actual_trace_is_bitwise_equal_to_untouched_native_res():
     native = _native_res_multistep()
-    sigmas = torch.tensor([1., .7, .4, 0])
+    sigmas = torch.tensor([1.0, 0.7, 0.4, 0])
     initial = torch.ones(1, 1, 4)
-    runtime = SpectrumH3Runtime(SpectrumH3Config(force_actual=True, offline_smoothing_replay=False))
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(force_actual=True, offline_smoothing_replay=False)
+    )
     run_id = runtime.start_run(sigmas, "sample_res_multistep", supported_sampler=True)
     _probe(runtime, mode="trace")
     executor = _Executor(runtime)
     model_sampling = SimpleNamespace(noise_scale=1)
-    inner = SimpleNamespace(model_patcher=SimpleNamespace(get_model_object=lambda name: model_sampling))
+    inner = SimpleNamespace(
+        model_patcher=SimpleNamespace(get_model_object=lambda name: model_sampling)
+    )
+
     def wrapped(x, sigma, **kwargs):
         return predict_noise_wrapper(executor, x, sigma, {}, 7)
+
     wrapped.inner_model = inner
+
     def untouched(x, sigma, **kwargs):
-        return .3 * x + .1 * x.square()
+        return 0.3 * x + 0.1 * x.square()
+
     untouched.inner_model = inner
-    kwargs = {"eta": 0, "cfg_pp": False, "s_noise": 0, "disable": True,
-              "noise_sampler": lambda a, b: torch.zeros_like(initial)}
+    kwargs = {
+        "eta": 0,
+        "cfg_pp": False,
+        "s_noise": 0,
+        "disable": True,
+        "noise_sampler": lambda a, b: torch.zeros_like(initial),
+    }
     baseline = native(untouched, initial.clone(), sigmas, **kwargs)
     traced = native(wrapped, initial.clone(), sigmas, **kwargs)
     assert torch.equal(baseline, traced)
     runtime.end_run(run_id)
+
+
+def test_real_offline_capture_admits_intervention_anchor_and_replay_only_observes():
+    sigmas = torch.tensor([1.0, 0.7, 0.4, 0])
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(offline_smoothing_replay=True, flex_window=0)
+    )
+    runtime.begin_offline_capture(total_steps=3, sampler_name="sample_res_multistep")
+    run_id = runtime.start_run(sigmas, "sample_res_multistep", supported_sampler=True)
+    probe = _probe(runtime, phase="offline_first_pass")
+    executor = _Executor(runtime)
+    for s in sigmas[:-1]:
+        predict_noise_wrapper(executor, torch.ones(1, 1, 4), s.reshape(1), {}, 7)
+    assert probe.replacements == 1
+    assert runtime.offline_archive.steps[1].actual
+    assert [anchor.step_id for anchor in runtime.offline_archive.anchors] == [0, 1, 2]
+    runtime.end_run(run_id)
+    assert runtime.complete_offline_capture(), runtime.offline_archive.failure_reason
+    runtime.begin_offline_replay()
+    run_id = runtime.start_run(sigmas, "sample_res_multistep", supported_sampler=True)
+    probe = _probe(runtime, phase="offline_replay")
+    executor = _Executor(runtime)
+    for s in sigmas[:-1]:
+        predict_noise_wrapper(executor, torch.ones(1, 1, 4), s.reshape(1), {}, 7)
+    assert probe.replacements == 0
+    assert probe.selected_status == "replay_observation_only"
+    assert executor.modes == [False, False, False]
+    assert runtime.stats.offline_replay_steps == 3
+    runtime.end_run(run_id)
+    runtime.release_offline_archive()
+
+
+def test_node_clones_runtime_and_only_all_actual_disables_replay():
+    from comfyui_spectrum_h3.sampling import _binding_from_model_options
+
+    config = SpectrumH3Config(offline_smoothing_replay=True)
+
+    class Model:
+        def __init__(self, options):
+            self.model_options = options
+
+        def clone(self):
+            return Model(dict(self.model_options))
+
+    source = Model({BINDING_KEY: SpectrumH3Binding(SpectrumH3Runtime(config))})
+    node = investigation.SpectrumRESInvestigation()
+    (traced,) = node.apply(source, "trace", 23, "trace")
+    (replaced,) = node.apply(source, "replace_selected", 23, "replace")
+    (actual,) = node.apply(source, "all_actual", 23, "actual")
+    assert investigation.SETTINGS_KEY not in source.model_options
+    assert _binding_from_model_options(traced.model_options).runtime.config == config
+    assert _binding_from_model_options(replaced.model_options).runtime.config == config
+    exact = _binding_from_model_options(actual.model_options).runtime.config
+    assert exact.force_actual and not exact.offline_smoothing_replay
+    assert _binding_from_model_options(source.model_options).runtime.config == config
+
+
+def test_report_comparison_checks_same_state_and_rejects_mismatched_schedule(
+    tmp_path, monkeypatch
+):
+    from tools.analyze_res_investigation import compare_reports
+
+    paths = ModuleType("folder_paths")
+    paths.get_output_directory = lambda: str(tmp_path)
+    monkeypatch.setitem(sys.modules, "folder_paths", paths)
+    report_paths = []
+    for mode in ("trace", "replace_selected"):
+        runtime, run_id = _runtime()
+        probe = _probe(runtime, mode=mode)
+        probe.report.update(
+            {
+                "schema": "spectrum_h3_res_investigation_v1",
+                "settings": probe.settings,
+                "phase": "single_pass",
+                "seed": 7,
+                "sigmas": [1.0, 0.7, 0.4, 0],
+                "sigma_dtype": "torch.float32",
+                "latent_shapes": probe.latent_shapes,
+                "native_source_sha256": "same",
+                "masked": False,
+                "config": {},
+            }
+        )
+        executor = _Executor(runtime)
+        for s in [1.0, 0.7, 0.4]:
+            result = predict_noise_wrapper(
+                executor,
+                torch.ones(1, 1, 4) * (2 if s == 0.7 else 1),
+                torch.tensor([s]),
+                {},
+                7,
+            )
+        investigation.finish(runtime, result, True)
+        report_paths.append(
+            next(p for p in tmp_path.rglob("*.json") if p not in report_paths)
+        )
+        runtime.end_run(run_id)
+    comparison = compare_reports(*report_paths)
+    assert comparison["identical_prefix_through_selected_input"]
+    assert comparison["candidate_selected_status"] == "replaced_with_actual"
+    assert comparison["checkpoints"]["step_001_input"]["video"]["bitwise_equal"]
+    assert not comparison["checkpoints"]["step_001_denoised"]["video"]["bitwise_equal"]
+    report = json.loads(report_paths[1].read_text())
+    report["sigmas"][1] = 0.8
+    report_paths[1].write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="differ in sigmas"):
+        compare_reports(*report_paths)

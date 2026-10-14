@@ -1139,11 +1139,12 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
                 )
             return result
 
-    from .res_investigation import maybe_replace, record
+    from .res_investigation import before_attempt, maybe_replace, record
     try:
         try:
+            before_attempt(runtime, decision, x)
             result = execute_attempt(decision)
-            result = maybe_replace(runtime, decision, result, execute_attempt)
+            result = maybe_replace(runtime, decision, x, result, execute_attempt)
             _log_effective_step(runtime, decision)
             runtime.log_offline_transition(
                 "actual_executor_return" if decision["actual"] else "forecast_executor_return",

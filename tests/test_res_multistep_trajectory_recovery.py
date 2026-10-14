@@ -86,7 +86,7 @@ def test_native_res_final_exact_evaluation_does_not_erase_penultimate_error():
         return model, output
 
     baseline, baseline_output = run(None)
-    earlier_error, earlier_output = run(22)
+    _earlier_error, earlier_output = run(22)
     penultimate_error, penultimate_output = run(23)
 
     # The injected error is the sole difference before the changed RES update.
