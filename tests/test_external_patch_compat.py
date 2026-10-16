@@ -865,3 +865,36 @@ def test_transition_forced_actual_is_visible_to_er_sde_descriptor_immediately():
     assert decision["actual"] is True
     runtime.abort_step(run_id, decision["step_id"])
     runtime.end_run(run_id)
+
+
+@pytest.mark.parametrize("base_hit", [False, True])
+def test_external_build_timing_excludes_base_lookup(monkeypatch, base_hit):
+    base = _profile_for(None).profile
+    clock = [100.0]
+    base = replace(base, build_seconds=8.0)
+
+    def lookup(_patcher):
+        clock[0] += 10.0
+        return model_aware.ProfileLookup(base, base_hit, 10.0)
+
+    original = compat._runtime_structural_perturbation
+
+    def adjustment(parsed):
+        clock[0] += 2.0
+        return original(parsed)
+
+    monkeypatch.setattr(compat, "_ORIGINAL_PROFILE_LOOKUP", lookup)
+    monkeypatch.setattr(compat.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(compat, "_runtime_structural_perturbation", adjustment)
+    patcher = _Patcher(_Inner(), model_options={
+        compat.EXTERNAL_PATCH_CONTRACTS_KEY: [contract()]
+    })
+    first = compat.get_model_forecastability_profile_with_external_patches(patcher)
+    assert not first.cache_hit
+    assert first.lookup_seconds == 12.0
+    assert first.profile.build_seconds == (2.0 if base_hit else 10.0)
+    assert first.profile.build_seconds <= first.lookup_seconds
+    second = compat.get_model_forecastability_profile_with_external_patches(patcher)
+    assert second.cache_hit
+    assert second.profile is first.profile
+    assert second.lookup_seconds == 10.0

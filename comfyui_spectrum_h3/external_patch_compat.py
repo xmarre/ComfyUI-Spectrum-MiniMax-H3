@@ -419,6 +419,9 @@ def get_model_forecastability_profile_with_external_patches(model_patcher: Any) 
     assert _ORIGINAL_PROFILE_LOOKUP is not None
     started = time.perf_counter()
     base_lookup = _ORIGINAL_PROFILE_LOOKUP(model_patcher)
+    # The base lookup is inclusive of its build. Only time the external
+    # adjustment here, otherwise a cold base build is counted twice.
+    adjustment_started = time.perf_counter()
     from . import minimax_h3
     from . import model_aware
 
@@ -443,7 +446,7 @@ def get_model_forecastability_profile_with_external_patches(model_patcher: Any) 
             base_lookup,
             parsed,
             cache_key=effective_key,
-            adjustment_started=started,
+            adjustment_started=adjustment_started,
         )
         _PROFILE_CACHE[effective_key] = profile
         _PROFILE_CACHE.move_to_end(effective_key)
@@ -1139,12 +1142,15 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
                 )
             return result
 
+    from .res_investigation import before_attempt, maybe_replace, record
     try:
         try:
             decision = sampling.res4lyf_associate_model_call(
                 runtime, model_options, x, timestep, decision
             )
+            before_attempt(runtime, decision, x)
             result = execute_attempt(decision)
+            result = maybe_replace(runtime, decision, x, result, execute_attempt)
             _log_effective_step(runtime, decision)
             runtime.log_offline_transition(
                 "actual_executor_return" if decision["actual"] else "forecast_executor_return",
@@ -1156,6 +1162,7 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
                 runtime, model_options, x, timestep, result, decision
             )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
+            record(runtime, decision, x, result)
             return result
         except sampling.ForecastRetryActual as retry:
             runtime.prepare_actual_retry(
@@ -1184,6 +1191,7 @@ def _predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None)
                 runtime, model_options, x, timestep, result, retry_decision
             )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
+            record(runtime, retry_decision, x, result)
             return result
     except BaseException:
         if runtime.active_step_id == decision["step_id"]:

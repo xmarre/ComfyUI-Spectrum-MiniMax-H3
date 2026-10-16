@@ -2992,7 +2992,14 @@ def outer_sample_wrapper(
                 not (stochastic_seeds or stochastic_sa or active_pece or res4lyf_active),
             )
         started = time.perf_counter()
+        result = None
+        succeeded = False
         try:
+            from .res_investigation import begin as begin_res_investigation
+            begin_res_investigation(
+                runtime, getattr(guider, "model_options", {}) or {},
+                run_sigmas, sampler, phase, seed, latent_shapes, run_mask is not None,
+            )
             result = executor(
                 run_noise,
                 run_latent,
@@ -3010,16 +3017,21 @@ def outer_sample_wrapper(
                 run_id=run_id,
                 elapsed_s=f"{time.perf_counter() - started:.6f}",
             )
+            succeeded = True
             return result
         finally:
-            if runtime.config.debug:
-                LOG.warning(
-                    "Spectrum H3 run summary phase=%s wall_s=%.3f %s",
-                    phase,
-                    time.perf_counter() - started,
-                    runtime.debug_summary(),
-                )
-            runtime.end_run(run_id)
+            try:
+                from .res_investigation import finish as finish_res_investigation
+                finish_res_investigation(runtime, result, succeeded)
+                if runtime.config.debug:
+                    LOG.warning(
+                        "Spectrum H3 run summary phase=%s wall_s=%.3f %s",
+                        phase,
+                        time.perf_counter() - started,
+                        runtime.debug_summary(),
+                    )
+            finally:
+                runtime.end_run(run_id)
             if runtime.config.debug:
                 LOG.warning(
                     "Spectrum H3 run teardown phase=%s run_id=%s", phase, run_id
@@ -3488,12 +3500,15 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 )
             return result
 
+    from .res_investigation import before_attempt, maybe_replace, record
     try:
         try:
             decision = res4lyf_associate_model_call(
                 runtime, model_options, x, timestep, decision
             )
+            before_attempt(runtime, decision, x)
             result = execute_attempt(decision)
+            result = maybe_replace(runtime, decision, x, result, execute_attempt)
             runtime.log_offline_transition(
                 "actual_executor_return" if decision["actual"] else "forecast_executor_return",
                 run_id=decision["run_id"],
@@ -3504,6 +3519,7 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 runtime, model_options, x, timestep, result, decision
             )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
+            record(runtime, decision, x, result)
             return result
         except ForecastRetryActual as retry:
             runtime.prepare_actual_retry(
@@ -3531,6 +3547,7 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
                 runtime, model_options, x, timestep, result, retry_decision
             )
             runtime.finalize_step(decision["run_id"], decision["step_id"])
+            record(runtime, retry_decision, x, result)
             return result
     except BaseException:
         if runtime.active_step_id == decision["step_id"]:
