@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -21,7 +22,31 @@ LOG = logging.getLogger(__name__)
 
 _STATE_BASIS_CHUNK_BYTES = 16 * 1024 * 1024
 _SANITIZE_CHUNK_BYTES = 16 * 1024 * 1024
-_FORECAST_HEAD_CHUNK_BYTES = 16 * 1024 * 1024
+
+
+def _forecast_head_chunk_budget_from_env(raw_value: str | None) -> int:
+    """Bound streamed FinalLayer chunks without changing the default workload."""
+    default = 16 * 1024 * 1024
+    if not raw_value:
+        return default
+    try:
+        mib = int(raw_value)
+    except (TypeError, ValueError):
+        mib = None
+    if mib not in (16, 32, 64, 128):
+        LOG.warning(
+            "Spectrum H3: invalid SPECTRUM_H3_FORECAST_HEAD_CHUNK_MIB=%r; "
+            "using the safe 16 MiB default", raw_value,
+        )
+        return default
+    return mib * 1024 * 1024
+
+
+# Loaded only at process startup. Caller-provided numbers never modify per-run
+# solver state and this setting applies only to audited streamed FinalLayers.
+_FORECAST_HEAD_CHUNK_BYTES = _forecast_head_chunk_budget_from_env(
+    os.environ.get("SPECTRUM_H3_FORECAST_HEAD_CHUNK_MIB")
+)
 _H3_OPTIMIZATIONS_FINAL_LAYER_MODULE = "h3_optimizations.memory.final_layer"
 
 
