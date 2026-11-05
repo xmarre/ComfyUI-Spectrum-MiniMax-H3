@@ -187,22 +187,32 @@ def _apply_exact_state_input_embedding_(
     return target
 
 
-def _resolve_layout(inner: Any, context: torch.Tensor, video_x: torch.Tensor, audio_x: torch.Tensor, payload: dict[str, Any]):
+def _callable_accepts_keyword(callable_obj, name):
+    """True when callable_obj takes `name` as a keyword (explicitly or via **kwargs)."""
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in parameters:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+
+def _resolve_layout(inner, context, video_x, audio_x, payload):
     module = _native_module(inner)
     latent_t, latent_h, latent_w = _padded_shape(tuple(video_x.shape), tuple(inner.patch_size))
     signature = (int(context.shape[1]), latent_t, latent_h, latent_w, int(audio_x.shape[-1]))
     layout = payload.get("layout")
     if layout is None or tuple(getattr(layout, "signature", ())) != signature:
-        layout = module.PackedLayout(
-            signature[0],
-            signature[1],
-            signature[2],
-            signature[3],
-            signature[4],
-            keyframes=payload.get("keyframes"),
-            refs=payload.get("refs"),
-            frame_count=payload.get("frame_count"),
-        )
+        layout_kwargs = {
+            "keyframes": payload.get("keyframes"),
+            "refs": payload.get("refs"),
+        }
+        # Only some cores take frame_count; passing it to one that does not
+        # raises TypeError the first time a layout has to be rebuilt here.
+        if _callable_accepts_keyword(module.PackedLayout.__init__, "frame_count"):
+            layout_kwargs["frame_count"] = payload.get("frame_count")
+        layout = module.PackedLayout(*signature, **layout_kwargs)
     return layout
 
 
