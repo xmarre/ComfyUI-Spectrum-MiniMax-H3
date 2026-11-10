@@ -41,6 +41,11 @@ jobs:
             comfy_kitchen_version: "0.2.33"
             comfy_aimdo_version: "0.5.3"
             fixture_required: true
+          # MiniMax-H3-Image upstream switched FinalLayer from shifts to PDD grids.
+          - comfy_ref: ede4e5fe8d15445c6fcd6828d70b202c22f9502c
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.41"
+            comfy_aimdo_version: "0.6.0"
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
