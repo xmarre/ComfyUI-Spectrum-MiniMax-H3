@@ -1,3 +1,36 @@
+# Spectrum MiniMax H3 v0.2.30
+
+v0.2.30 restores Spectrum's native MiniMax H3 forecast-output compatibility with recent ComfyUI revisions. This release contains the three post-v0.2.29 changes (#126, #127, #129); the underlying forecaster, sampling equations and forecast scheduling are unchanged.
+
+## Native packed-layout compatibility (PR #126)
+
+- ComfyUI's `PackedLayout` constructor changed: newer revisions no longer accept `frame_count`, whereas older supported versions still expose it.
+- On a missing or stale cached layout, Spectrum now passes `frame_count` only when the native constructor accepts it. Matching cached layouts are reused unchanged.
+- Regression tests in PR #127 cover both constructor contracts, rebuilds after geometry changes, and native packed-position parity.
+
+## Native PDD projection compatibility (PR #129; issue #128)
+
+- ComfyUI added a new `FinalLayer.forward(..., sigma, sample_sigmas, grids)` interface. Previously supported cores use either `(..., sigma, sample_sigmas, shifts)` or the original four-argument interface.
+- Spectrum now recognizes those three specific native interfaces. For the `grids` interface it calls the installed ComfyUI `pdd_grid` function with the native head count and current video/audio flow shifts, then reuses the resulting grids within each forecast projection.
+- PDD head selection, weighted projection and native row-wise modulation remain owned by ComfyUI's FinalLayer. Unknown and ambiguous native PDD contracts remain errors instead of silently dropping required schedule metadata.
+- The regression suite compares native monolithic and Spectrum slab-streamed projections with scalar and per-token selectors, including multi-head PDD; this release adds six-head coverage.
+
+## Tests and release safety
+
+- PR #127 also corrects six existing nested `pytest.approx` assertions that previously raised `TypeError` on the compatibility matrix; pair-by-pair comparison preserves length, order and numerical tolerance.
+- The CI matrix includes historical MiniMax H3 cores, the upstream PDD-grid change from ComfyUI PR #17655 and a pinned newer ComfyUI revision. GitHub Actions validates the native head fixtures and all regular CPU tests.
+- Registry publication is gated behind a successful post-merge `main` test run and GitHub release creation. Manual registry republishing remains available for operational recovery.
+
+## Scope and limits
+
+- These tests establish source/constructor compatibility and native CPU numerical equivalence. They **do not** establish successful GPU generation, quality parity, throughput, or interoperability with every third-party optimizer on the reporter's stack.
+- H3-Optimizations versions still exposing only `shifts` in a patched FinalLayer do not themselves implement ComfyUI's new `grids` interface. Compatibility of those specific combinations must be established separately before enabling those patches; this release does not claim to update third-party code.
+- The release targets MiniMax H3 **audio-video** models. New MiniMax-H3-Image support in upstream ComfyUI is not a Spectrum feature of this release.
+
+No changes to sampler equations, replay semantics, external-patch safety policy, or forecast scheduling are intended.
+
+---
+
 # Spectrum MiniMax H3 v0.2.29
 
 v0.2.29 restores Spectrum forecasting with compatible ComfyUI Core BlockSparseAttention, Flow and Untwist runtime revisions without relying on fixed whole-file source hashes. It also strengthens numerical-history identity and preserves the narrow cold-to-primed calibration carry contract.

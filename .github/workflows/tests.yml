@@ -46,6 +46,11 @@ jobs:
             python_version: "3.12"
             comfy_kitchen_version: "0.2.41"
             comfy_aimdo_version: "0.6.0"
+          # Current MiniMax H3 core after the image-model PDD-grid API change.
+          - comfy_ref: 989d93d0d968e704c589ce0146bb18c77f6b50cc
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.41"
+            comfy_aimdo_version: "0.6.0"
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
