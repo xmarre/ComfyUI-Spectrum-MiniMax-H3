@@ -85,3 +85,35 @@ def test_resolve_layout_reuses_matching_cached_layout(monkeypatch):
     )
 
     assert result is cached
+
+
+def test_resolve_layout_matches_native_comfyui_on_stale_cache(monkeypatch):
+    try:
+        from comfy.ldm.minimax import model as native
+    except Exception as exc:
+        pytest.skip(f"native ComfyUI MiniMax H3 is unavailable: {exc}")
+
+    monkeypatch.setattr(minimax_h3, "_native_module", lambda _inner: native)
+    inner = SimpleNamespace(patch_size=(1, 2, 2))
+    context = SimpleNamespace(shape=(1, 5, 8))
+    video = SimpleNamespace(shape=(1, 8, 1, 4, 4))
+    audio = SimpleNamespace(shape=(1, 2, 2, 3))
+    payload = {
+        "layout": SimpleNamespace(signature=(5, 2, 4, 4, 3)),
+        "frame_count": 1,
+    }
+
+    rebuilt = minimax_h3._resolve_layout(inner, context, video, audio, payload)
+    expected_kwargs = {"keyframes": None, "refs": None}
+    import inspect
+
+    if "frame_count" in inspect.signature(native.PackedLayout.__init__).parameters:
+        expected_kwargs["frame_count"] = 1
+    expected = native.PackedLayout(5, 1, 4, 4, 3, **expected_kwargs)
+
+    assert rebuilt.signature == expected.signature
+    assert rebuilt.segments == expected.segments
+    assert rebuilt.seq_len == expected.seq_len
+    import torch
+
+    torch.testing.assert_close(rebuilt.position_ids, expected.position_ids, rtol=0, atol=0)
