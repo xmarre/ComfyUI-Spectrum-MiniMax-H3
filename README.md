@@ -14,6 +14,13 @@ Spectrum is an **approximate accelerator**. Forecasted steps change the denoisin
 
 ## Recent releases
 
+### v0.2.30 — Native layout and PDD output-head compatibility
+
+- Supports both historical `PackedLayout` constructors (with `frame_count`) and newer cores that omit it.
+- Supports the three reviewed native MiniMax H3 `FinalLayer` interfaces, including the new explicit PDD `grids` path introduced by ComfyUI PR #17655; grid values are generated using the installed native implementation.
+- Adds native one-/three-/six-head PDD projection tests, CPU-streamed parity checks, and expanded pinned ComfyUI CI coverage. Comfy Registry publishing now follows successful post-merge CI.
+- **Validation scope:** native CPU/source equivalence only; GPU video output and third-party FinalLayer optimizer combinations are not verified by this test matrix.
+
 ### v0.2.29 — Core BSA/Flow/Untwist runtime compatibility
 
 - Removes frozen whole-file source revision gates for ordinary Core BSA, Flow and Untwist forecasting while retaining live chain ownership, route checks and accepted actual-call receipts.

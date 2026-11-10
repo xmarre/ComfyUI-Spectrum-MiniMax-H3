@@ -83,7 +83,22 @@ jobs:
             HEAD
           (cd dist && sha256sum "${archive}" > SHA256SUMS)
 
+      # workflow_run may finish after a newer commit has reached main.
+      # Never tag or publish a superseded revision as the latest release.
+      - name: Verify tested revision is still current main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          current_main="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+          if [[ "${TESTED_SHA}" != "${current_main}" ]]; then
+            echo "Refusing to release stale tested commit ${TESTED_SHA}; main is ${current_main}." >&2
+            exit 1
+          fi
+
       - name: Publish or refresh GitHub release
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -144,3 +159,35 @@ jobs:
             --target "${RELEASE_SHA}" \
             --title "Spectrum MiniMax H3 ${TAG}" \
             --notes-file CURRENT_RELEASE_NOTES.md
+          echo "created=true" >> "${GITHUB_OUTPUT}"
+
+      # The external publish-node action performs an unpinned second checkout.
+      # Run its reviewed comfy-cli publication steps against our verified HEAD instead.
+      - name: Set up Python for registry publication
+        if: ${{ steps.release.outputs.created == 'true' && github.repository_owner == 'xmarre' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install registry publisher without publication credentials
+        if: ${{ steps.release.outputs.created == 'true' && github.repository_owner == 'xmarre' }}
+        shell: bash
+        run: python -m pip install comfy-cli
+
+      - name: Publish tested revision to Comfy registry
+        if: ${{ steps.release.outputs.created == 'true' && github.repository_owner == 'xmarre' }}
+        env:
+          REGISTRY_ACCESS_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "${TESTED_SHA}" ]]; then
+            echo "Refusing to publish a checkout other than the tested commit." >&2
+            exit 1
+          fi
+          if [[ -z "${REGISTRY_ACCESS_TOKEN}" ]]; then
+            echo "REGISTRY_ACCESS_TOKEN is not configured." >&2
+            exit 1
+          fi
+          comfy --skip-prompt --no-enable-telemetry env
+          comfy node publish --token "${REGISTRY_ACCESS_TOKEN}"
