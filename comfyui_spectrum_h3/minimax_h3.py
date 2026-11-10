@@ -268,6 +268,9 @@ class _OutputState:
     shift_a: float
     original_video_shape: tuple[int, int, int]
     padded_video_shape: tuple[int, int, int]
+    # Only the new native PDD-grid contract uses this; cache per model call so
+    # CPU-streamed slabs do not rebuild the same native grids for every slab.
+    pdd_grids: tuple[list[float], list[float]] | None = None
 
 
 def _prepare_output_state(
@@ -665,25 +668,26 @@ def _execute_actual(
     return result
 
 
-def _final_layer_uses_pdd_contract(module: Any) -> bool:
-    """Detect the native Core FinalLayer contract without probing by execution."""
+def _final_layer_pdd_contract(module: Any) -> str | None:
+    """Identify a reviewed native FinalLayer interface without executing it."""
     final_layer_type = getattr(module, "FinalLayer", None)
     forward = getattr(final_layer_type, "forward", None)
     if forward is None:
-        return False
+        return None
     try:
         parameters = inspect.signature(forward).parameters
     except (TypeError, ValueError) as exc:
         raise RuntimeError("unable to inspect native MiniMax H3 FinalLayer.forward contract") from exc
-    pdd_parameters = ("sigma", "sample_sigmas", "shifts")
-    present = tuple(name in parameters for name in pdd_parameters)
-    if all(present):
-        return True
-    if any(present):
+    present = {name for name in ("sigma", "sample_sigmas", "shifts", "grids") if name in parameters}
+    if present == {"sigma", "sample_sigmas", "shifts"}:
+        return "shifts"
+    if present == {"sigma", "sample_sigmas", "grids"}:
+        return "grids"
+    if present:
         raise RuntimeError(
-            "native MiniMax H3 FinalLayer exposes an incomplete PDD projection contract"
+            "native MiniMax H3 FinalLayer exposes an incomplete or ambiguous PDD projection contract"
         )
-    return False
+    return None
 
 
 def _final_layer_project(
@@ -697,15 +701,32 @@ def _final_layer_project(
     forward_override: Any | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     forward = forward_override if forward_override is not None else inner.final_layer
-    if _final_layer_uses_pdd_contract(module):
+    pdd_contract = _final_layer_pdd_contract(module)
+    if pdd_contract is not None:
+        kwargs = {
+            "sigma": state.sigma_v,
+            "sample_sigmas": state.sample_sigmas,
+        }
+        if pdd_contract == "shifts":
+            kwargs["shifts"] = (state.shift_v, state.shift_a)
+        else:
+            # Match native MiniMaxH3Model._forward: build each stream's grid
+            # using the *loaded* FinalLayer head count and native pdd_grid.
+            if state.pdd_grids is None:
+                grid = getattr(module, "pdd_grid", None)
+                if not callable(grid):
+                    raise RuntimeError("native MiniMax H3 grid-based PDD contract is missing pdd_grid")
+                steps = int(inner.final_layer.pdd_steps)
+                if steps < 1:
+                    raise ValueError("native MiniMax H3 PDD head count must be positive")
+                state.pdd_grids = (grid(steps, state.shift_v), grid(steps, state.shift_a))
+            kwargs["grids"] = state.pdd_grids
         return forward(
             compact,
             state.t_emb,
             video_segment,
             audio_segment,
-            sigma=state.sigma_v,
-            sample_sigmas=state.sample_sigmas,
-            shifts=(state.shift_v, state.shift_a),
+            **kwargs,
         )
     return forward(
         compact,
