@@ -120,7 +120,7 @@ def test_grid_contract_requires_native_grid_builder():
         )
 
 
-@pytest.mark.parametrize("pdd_steps", [1, 3])
+@pytest.mark.parametrize("pdd_steps", [1, 3, 6])
 @pytest.mark.parametrize("per_token", [False, True])
 def test_native_gridded_pdd_matches_monolithic_and_streamed(monkeypatch, pdd_steps, per_token):
     try:
