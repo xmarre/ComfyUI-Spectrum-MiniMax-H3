@@ -1,13 +1,8 @@
 name: Publish to Comfy registry
 
+# Manual retry only. New versions are published after successful tests by release.yml.
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - "pyproject.toml"
 
 permissions:
   issues: write
