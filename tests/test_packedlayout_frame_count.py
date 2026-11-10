@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from comfyui_spectrum_h3 import minimax_h3
 
@@ -105,7 +107,6 @@ def test_resolve_layout_matches_native_comfyui_on_stale_cache(monkeypatch):
 
     rebuilt = minimax_h3._resolve_layout(inner, context, video, audio, payload)
     expected_kwargs = {"keyframes": None, "refs": None}
-    import inspect
 
     if "frame_count" in inspect.signature(native.PackedLayout.__init__).parameters:
         expected_kwargs["frame_count"] = 1
@@ -114,6 +115,4 @@ def test_resolve_layout_matches_native_comfyui_on_stale_cache(monkeypatch):
     assert rebuilt.signature == expected.signature
     assert rebuilt.segments == expected.segments
     assert rebuilt.seq_len == expected.seq_len
-    import torch
-
     torch.testing.assert_close(rebuilt.position_ids, expected.position_ids, rtol=0, atol=0)
