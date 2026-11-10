@@ -1587,6 +1587,10 @@ class SpectrumH3Runtime:
             )
         return self._disable_forecasting(reason)
 
+    def current_step_mode(self, run_id: int, step_id: int) -> str:
+        """Return the active step's execution mode after any fallback or retry."""
+        return self._require_step(run_id, step_id).mode
+
     def describe_current_er_sde_step(
         self,
         run_id: int,
