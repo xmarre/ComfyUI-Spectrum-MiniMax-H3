@@ -46,6 +46,12 @@ class _CountingFinalLayer(torch.nn.Module):
         self.inner = inner
         self.calls = 0
 
+    @property
+    def pdd_steps(self):
+        # New native MiniMaxH3Model._forward reads this before projecting.
+        # The counting fixture must preserve the wrapped layer's contract.
+        return self.inner.pdd_steps
+
     def forward(self, *args, **kwargs):
         self.calls += 1
         return self.inner(*args, **kwargs)
