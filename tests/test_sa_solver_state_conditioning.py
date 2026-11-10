@@ -26,6 +26,13 @@ from comfyui_spectrum_h3.sampling import (
 )
 
 
+def _assert_noise_args_close(observed, expected):
+    """Compare ordered (sigma, sigma_next) pairs with pytest-version-safe tolerance."""
+    assert len(observed) == len(expected)
+    for observed_pair, expected_pair in zip(observed, expected, strict=True):
+        assert observed_pair == pytest.approx(expected_pair)
+
+
 def _sampler(function_name: str, options: dict | None = None):
     def sampler_function():
         return None
@@ -408,7 +415,7 @@ def test_isolated_sa_adapter_is_exact_native_parity_when_every_call_is_actual():
     isolated = _run_isolated(["actual"] * 4)
 
     assert torch.allclose(isolated.result, native.result, atol=0.0, rtol=0.0)
-    assert isolated.noise_args == pytest.approx(native.noise_args)
+    _assert_noise_args_close(isolated.noise_args, native.noise_args)
     assert isolated.tau_args == pytest.approx(native.tau_args)
     assert len(isolated.noise_draws) == len(native.noise_draws)
     for candidate, expected in zip(
@@ -446,7 +453,7 @@ def test_active_pece_adapter_is_exact_native_parity_when_every_phase_is_actual()
     isolated = _run_isolated(["actual"] * 7, use_pece=True)
 
     torch.testing.assert_close(isolated.result, native.result, rtol=0, atol=0)
-    assert isolated.noise_args == pytest.approx(native.noise_args)
+    _assert_noise_args_close(isolated.noise_args, native.noise_args)
     assert isolated.tau_args == pytest.approx(native.tau_args)
     assert len(isolated.noise_draws) == len(native.noise_draws)
     for candidate, expected in zip(
@@ -518,7 +525,7 @@ def test_active_pece_all_actual_parity_across_order_and_stochasticity(
     )
 
     torch.testing.assert_close(isolated.result, native.result, rtol=0, atol=0)
-    assert isolated.noise_args == pytest.approx(native.noise_args)
+    _assert_noise_args_close(isolated.noise_args, native.noise_args)
     assert isolated.tau_args == pytest.approx(native.tau_args)
 
 
@@ -579,7 +586,7 @@ def test_active_pece_all_actual_parity_preserves_model_noise_scale():
     )
 
     torch.testing.assert_close(isolated.result, native.result, rtol=0, atol=0)
-    assert isolated.noise_args == pytest.approx(native.noise_args)
+    _assert_noise_args_close(isolated.noise_args, native.noise_args)
     assert isolated.tau_args == pytest.approx(native.tau_args)
 
 
@@ -594,7 +601,7 @@ def test_active_pece_all_actual_parity_without_terminal_zero():
     )
 
     torch.testing.assert_close(isolated.result, native.result, rtol=0, atol=0)
-    assert isolated.noise_args == pytest.approx(native.noise_args)
+    _assert_noise_args_close(isolated.noise_args, native.noise_args)
     assert isolated.tau_args == pytest.approx(native.tau_args)
 
 
@@ -822,7 +829,7 @@ def test_active_pece_forecast_preserves_native_tau_and_noise_call_order():
     )
 
     assert accelerated.tau_args == pytest.approx(native.tau_args)
-    assert accelerated.noise_args == pytest.approx(native.noise_args)
+    _assert_noise_args_close(accelerated.noise_args, native.noise_args)
     assert len(accelerated.noise_draws) == len(native.noise_draws)
     for candidate, expected in zip(
         accelerated.noise_draws,
