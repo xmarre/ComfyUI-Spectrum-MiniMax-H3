@@ -1545,9 +1545,29 @@ class HistoryWeightForecaster:
             for start, end, weight_scalars in normalized_segments:
                 segment_start = start * row_numel
                 segment_numel = (end - start) * row_numel
+                # One-point bootstrap / latest-exact hold is an identity copy.
+                # Avoid an entire FP32 accumulator and BF16/FP16 round-trip.
+                # Dtype-converting requests retain the previous numerical path.
+                direct_anchor = None
+                if target_dtype == self._feature_dtype:
+                    active = [
+                        i for i, scalar in enumerate(weight_scalars)
+                        if scalar != 0.0
+                    ]
+                    if len(active) == 1 and weight_scalars[active[0]] == 1.0:
+                        direct_anchor = self._history[active[0]].feature_flat
                 chunk_elements = min(self._chunk_elements(target_device), segment_numel)
                 for offset in range(0, segment_numel, chunk_elements):
                     length = min(chunk_elements, segment_numel - offset)
+                    if direct_anchor is not None:
+                        source = direct_anchor.narrow(
+                            0, source_base + segment_start + offset, length
+                        )
+                        result_flat.narrow(
+                            0, target_base + segment_start + offset, length
+                        ).copy_(source, non_blocking=False)
+                        self.last_prediction_chunk_count += 1
+                        continue
                     accumulator = torch.zeros(length, device=target_device, dtype=torch.float32)
                     for scalar, entry in zip(weight_scalars, self._history, strict=True):
                         if scalar == 0.0:

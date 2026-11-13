@@ -223,7 +223,9 @@ jobs:
             tests/test_model_aware.py \
             tests/test_native_equivalence.py \
             tests/test_er_sde_stochastic_compensation.py \
-            tests/test_sa_solver_state_conditioning.py
+            tests/test_sa_solver_state_conditioning.py \
+            tests/test_identity_hold_fastpath.py \
+            tests/test_forecast_head_budget.py
 
       - name: Run tests against native MiniMax H3
         env:
