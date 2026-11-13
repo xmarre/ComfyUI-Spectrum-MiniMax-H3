@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from .config import SpectrumH3Config
+from .prompt_tools import H3AuthoredShotFormatter
 from .minimax_h3 import install_h3_wrapper, require_native_minimax_h3
 from .objective_media_nodes import (
     NODE_CLASS_MAPPINGS as OBJECTIVE_NODE_CLASS_MAPPINGS,
@@ -399,10 +400,12 @@ class SpectrumApplyMiniMaxH3:
 
 NODE_CLASS_MAPPINGS = {
     "SpectrumApplyMiniMaxH3": SpectrumApplyMiniMaxH3,
+    "H3AuthoredShotFormatter": H3AuthoredShotFormatter,
     **OBJECTIVE_NODE_CLASS_MAPPINGS,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SpectrumApplyMiniMaxH3": "Spectrum Apply MiniMax H3",
+    "H3AuthoredShotFormatter": "H3 Authored Shot Formatter",
     **OBJECTIVE_NODE_DISPLAY_NAME_MAPPINGS,
 }
 
@@ -410,4 +413,5 @@ __all__ = [
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
     "SpectrumApplyMiniMaxH3",
+    "H3AuthoredShotFormatter",
 ]

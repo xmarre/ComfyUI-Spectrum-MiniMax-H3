@@ -1,5 +1,7 @@
 # ComfyUI Spectrum MiniMax H3
 
+> **Separate draft proposal:** H3 authored-shot formatter for prompt writers, independent of Spectrum performance changes. This helper does not analyze images, detect shots, or plan scenes. See [scope and validation](docs/H3_AUTHORED_SHOT_FORMATTER.md).
+
 A native ComfyUI MiniMax H3 implementation of **Spectrum**, the training-free spectral diffusion feature forecasting method introduced by **Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo, and Stefano Ermon** in [*Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration*](https://arxiv.org/abs/2603.01623).
 
 **Original Spectrum:** [Paper](https://arxiv.org/abs/2603.01623) · [Project page](https://hanjq17.github.io/Spectrum/) · [Official implementation](https://github.com/hanjq17/Spectrum)
