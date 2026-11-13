@@ -1,5 +1,7 @@
 # ComfyUI Spectrum MiniMax H3
 
+> **Forecast optimization proposal (PR #125):** Optional 16/32/64/128 MiB streamed FinalLayer chunks (16 MiB default) and exact-copy identity/latest holds. [Validation and benchmarks](docs/FORK_OPTIMIZATION_EXPERIMENTS.md). No GPU speedup is claimed without matched measurements.
+
 A native ComfyUI MiniMax H3 implementation of **Spectrum**, the training-free spectral diffusion feature forecasting method introduced by **Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo, and Stefano Ermon** in [*Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration*](https://arxiv.org/abs/2603.01623).
 
 **Original Spectrum:** [Paper](https://arxiv.org/abs/2603.01623) · [Project page](https://hanjq17.github.io/Spectrum/) · [Official implementation](https://github.com/hanjq17/Spectrum)
