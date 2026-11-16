@@ -51,6 +51,15 @@ jobs:
             python_version: "3.12"
             comfy_kitchen_version: "0.2.41"
             comfy_aimdo_version: "0.6.0"
+          # Reported working and failing Core releases (issue #132).
+          - comfy_ref: e6515b16ed360b01bd6548bffaca193f88f181fb  # v0.44.2
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.40"
+            comfy_aimdo_version: "0.6.0"
+          - comfy_ref: 71096d1af6c9d1c34fc42094ec4ec59768104786  # v0.45.3
+            python_version: "3.12"
+            comfy_kitchen_version: "0.2.41"
+            comfy_aimdo_version: "0.6.0"
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node

@@ -668,6 +668,10 @@ def _execute_actual(
     return result
 
 
+class _FinalLayerContractError(RuntimeError):
+    """The loaded FinalLayer cannot safely project a Spectrum forecast."""
+
+
 def _final_layer_pdd_contract(module: Any) -> str | None:
     """Identify a reviewed native FinalLayer interface without executing it."""
     final_layer_type = getattr(module, "FinalLayer", None)
@@ -675,17 +679,21 @@ def _final_layer_pdd_contract(module: Any) -> str | None:
     if forward is None:
         return None
     try:
-        parameters = inspect.signature(forward).parameters
+        signature = inspect.signature(forward)
     except (TypeError, ValueError) as exc:
-        raise RuntimeError("unable to inspect native MiniMax H3 FinalLayer.forward contract") from exc
+        raise _FinalLayerContractError(
+            "unable to inspect native MiniMax H3 FinalLayer.forward contract"
+        ) from exc
+    parameters = signature.parameters
     present = {name for name in ("sigma", "sample_sigmas", "shifts", "grids") if name in parameters}
     if present == {"sigma", "sample_sigmas", "shifts"}:
         return "shifts"
     if present == {"sigma", "sample_sigmas", "grids"}:
         return "grids"
     if present:
-        raise RuntimeError(
-            "native MiniMax H3 FinalLayer exposes an incomplete or ambiguous PDD projection contract"
+        raise _FinalLayerContractError(
+            "native MiniMax H3 FinalLayer exposes an incomplete or ambiguous PDD projection contract "
+            f"(forward={signature}; owner={getattr(forward, '__module__', 'unknown')})"
         )
     return None
 
@@ -1301,6 +1309,33 @@ def diffusion_model_wrapper(
             residual_probe,
         )
 
+    # Inspect the loaded output head before predicting: unsupported runtime
+    # patches must use the native actual path, not a guessed PDD projection.
+    # fallback_current_step also handles multistage retries and offline replay.
+    try:
+        _final_layer_pdd_contract(_native_module(inner))
+    except _FinalLayerContractError as exc:
+        runtime.fallback_current_step(
+            int(run_id),
+            int(step_id),
+            f"native MiniMax H3 forecast output-head contract is unsupported: {exc}",
+        )
+        return _execute_actual(
+            executor,
+            inner,
+            runtime,
+            int(run_id),
+            int(step_id),
+            call_id,
+            layout,
+            x,
+            timestep,
+            context,
+            options,
+            minimax_payload,
+            kwargs,
+        )
+
     if kwargs.get("denoise_mask") is not None:
         module = _native_module(inner)
         if not callable(getattr(module, "mask_row_values", None)):
@@ -1486,11 +1521,16 @@ def diffusion_model_wrapper(
             raise OfflineReplayAbort(
                 f"offline replay output-head evaluation failed: {exc}"
             ) from exc
-        if runtime.active_state_conditioned_residual:
+        if isinstance(exc, _FinalLayerContractError) or runtime.active_state_conditioned_residual:
+            reason = (
+                f"native MiniMax H3 forecast output-head contract changed during projection: {exc}"
+                if isinstance(exc, _FinalLayerContractError)
+                else f"state-conditioned residual forecast reconstruction failed: {exc}"
+            )
             runtime.fallback_current_step(
                 int(run_id),
                 int(step_id),
-                f"state-conditioned residual forecast reconstruction failed: {exc}",
+                reason,
             )
             return _execute_actual(
                 executor,

@@ -414,6 +414,11 @@ def test_state_conditioned_reconstruction_failure_falls_back_to_actual(
 
     monkeypatch.setattr(minimax_h3, "SpectrumH3Runtime", FakeRuntime)
     monkeypatch.setattr(minimax_h3, "is_native_minimax_h3", lambda inner: True)
+    monkeypatch.setattr(
+        minimax_h3,
+        "_native_module",
+        lambda inner: SimpleNamespace(FinalLayer=_RowLocalFinalLayer),
+    )
     monkeypatch.setattr(minimax_h3, "_resolve_layout", lambda *args, **kwargs: layout)
     monkeypatch.setattr(
         minimax_h3,
@@ -462,3 +467,82 @@ def test_state_conditioned_reconstruction_failure_falls_back_to_actual(
     assert "state-conditioned residual forecast reconstruction failed" in (
         runtime.fallback_reason
     )
+
+
+@pytest.mark.parametrize("state_conditioned", [False, True])
+def test_unsupported_pdd_contract_retries_actual_before_forecast(
+    monkeypatch, state_conditioned
+):
+    class IncompleteFinalLayer:
+        def forward(self, x, t_emb, video_seg, audio_seg, sigma, grids):
+            raise AssertionError("unsupported output head must not run in forecast mode")
+
+    class FakeRuntime:
+        def __init__(self):
+            self.config = SimpleNamespace(debug=False)
+            self.active_state_conditioned_residual = state_conditioned
+            self.fallback_reason = None
+            self.predict_calls = 0
+
+        def begin_model_call(self, *args, **kwargs):
+            return 3, False
+
+        def predict(self, *args, **kwargs):
+            self.predict_calls += 1
+            raise AssertionError("unsupported contract must be rejected before prediction")
+
+        def fallback_current_step(self, run_id, step_id, reason):
+            assert (run_id, step_id) == (1, 2)
+            self.fallback_reason = reason
+
+    runtime = FakeRuntime()
+    layout = SimpleNamespace(
+        segments=((0, 1, "audio"), (1, 2, "video")),
+        seq_len=2,
+    )
+    actual_result = [torch.tensor([123.0]), torch.tensor([456.0])]
+    monkeypatch.setattr(minimax_h3, "SpectrumH3Runtime", FakeRuntime)
+    monkeypatch.setattr(minimax_h3, "is_native_minimax_h3", lambda inner: True)
+    monkeypatch.setattr(minimax_h3, "_resolve_layout", lambda *args, **kwargs: layout)
+    monkeypatch.setattr(
+        minimax_h3, "topology_signature", lambda *args, **kwargs: ("fixture",)
+    )
+    monkeypatch.setattr(
+        minimax_h3,
+        "_native_module",
+        lambda inner: SimpleNamespace(FinalLayer=IncompleteFinalLayer),
+    )
+    monkeypatch.setattr(
+        minimax_h3,
+        "_execute_actual",
+        lambda *args, **kwargs: actual_result,
+    )
+    monkeypatch.setattr(
+        minimax_h3,
+        "_execute_forecast",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("forecast execution must not start")
+        ),
+    )
+    monkeypatch.setattr(
+        backend_history,
+        "prepare",
+        lambda runtime, run_id, step_id, options, layout, inner: (options, None),
+    )
+    options = {
+        minimax_h3.RUNTIME_KEY: runtime,
+        minimax_h3.RUN_ID_KEY: 1,
+        minimax_h3.STEP_ID_KEY: 2,
+    }
+    result = minimax_h3.diffusion_model_wrapper(
+        SimpleNamespace(class_obj=SimpleNamespace(hidden_size=4)),
+        [torch.zeros(1, 1, 1, 1, 1), torch.zeros(1, 1, 1, 1)],
+        torch.tensor([500.0]),
+        torch.zeros(1, 1, 4),
+        options,
+        minimax_payload={},
+    )
+    assert result is actual_result
+    assert runtime.predict_calls == 0
+    assert "incomplete or ambiguous PDD projection contract" in runtime.fallback_reason
+    assert "sigma, grids" in runtime.fallback_reason
